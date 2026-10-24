@@ -21,29 +21,30 @@ const (
 
 // BitplaneState tracks the geometry, plane pointers, palette, and cache for the bitplane viewer.
 type BitplaneState struct {
-	RowBytes       int             // Bytes per row per plane (e.g. 40 = 320 px)
-	Height         int             // Scanline height (e.g. 200, 256)
-	Planes         int             // Number of bitplanes (1..6)
-	Interleaved    bool            // True if scanlines of planes are interleaved
-	Modulo         int             // Modulo added to row stride in bytes
-	Scale          int             // Nearest-neighbor integer zoom (1..8, default 1)
-	BPL             [6]uint32       // Starting byte offset for each bitplane
-	ControlMask     uint8           // Bitmask of active planes in control selection (bit p = 1 means plane p affected)
-	VisibleMask     uint8           // Bitmask of active visible planes forming the image (bit p = 1 means plane p decoded)
-	PaletteMode     PaletteMode     // Grayscale, High-Contrast, Custom
-	Invert          bool            // Invert colors
-	Brightness      int             // Brightness bias (-4..+4)
-	CustomPalette   [32]color.RGBA  // Custom 32-color palette extracted or loaded
-	CustomPalName   string          // e.g. "Copper@+$12340"
-	HAM             bool            // Hold-And-Modify 6 mode
-	CachedEscapeSeq string          // Cached terminal pixel escape sequence
-	CachedProtocol  PixelProtocol   // Protocol used to generate CachedEscapeSeq
+	RowBytes        int            // Bytes per row per plane (e.g. 40 = 320 px)
+	Height          int            // Scanline height (e.g. 200, 256)
+	Planes          int            // Number of bitplanes (1..7, matching BPU)
+	Interleaved     bool           // True if scanlines of planes are interleaved
+	Modulo          int            // Modulo added to row stride in bytes
+	Scale           int            // Nearest-neighbor integer zoom (1..8, default 1)
+	Hires           bool           // True if 640 hires visible window mode
+	BPL             [8]uint32      // Starting byte offset for each bitplane (1..7)
+	ControlMask     uint8          // Bitmask of active planes in control selection (bit p = 1 means plane p+1 affected)
+	VisibleMask     uint8          // Bitmask of active visible planes forming the image (bit p = 1 means plane p+1 decoded)
+	PaletteMode     PaletteMode    // Grayscale, High-Contrast, Custom
+	Invert          bool           // Invert colors
+	Brightness      int            // Brightness bias (-4..+4)
+	CustomPalette   [32]color.RGBA // Custom 32-color palette extracted or loaded
+	CustomPalName   string         // e.g. "Copper@+$12340"
+	HAM             bool           // Hold-And-Modify 6 mode
+	CachedEscapeSeq string         // Cached terminal pixel escape sequence
+	CachedProtocol  PixelProtocol  // Protocol used to generate CachedEscapeSeq
 }
 
 // NewBitplaneState initializes a BitplaneState starting at byte offset base.
 func NewBitplaneState(base uint32) *BitplaneState {
 	s := &BitplaneState{
-		RowBytes:       40, // 320 px
+		RowBytes:       40, // 320 px buffer
 		Height:         200,
 		Planes:         1,
 		Interleaved:    false,
@@ -55,7 +56,11 @@ func NewBitplaneState(base uint32) *BitplaneState {
 		CachedProtocol: DetectProtocol(),
 	}
 	s.BPL[0] = base
-	s.AutoSnapPlanes()
+	// Pre-calculate all 7 bitplane pointers so they are immediately valid when enabled
+	planeSize := uint32(40 * 200)
+	for p := 0; p < 8; p++ {
+		s.BPL[p] = base + uint32(p)*planeSize
+	}
 	return s
 }
 
@@ -122,11 +127,98 @@ func (s *BitplaneState) WidthPx() int {
 	return s.RowBytes * 8
 }
 
+// BPU returns the number of active bitplanes in BPLCON0 (1..7, default 1).
+func (s *BitplaneState) BPU() int {
+	maxP := 1
+	for p := 0; p < 8; p++ {
+		if (s.VisibleMask & (1 << p)) != 0 {
+			maxP = p + 1
+		}
+	}
+	if s.Planes > maxP {
+		maxP = s.Planes
+	}
+	if maxP < 1 {
+		return 1
+	}
+	if maxP > 7 {
+		return 7
+	}
+	return maxP
+}
+
+// SetBPU updates the number of active bitplanes (1..7) and synchronizes VisibleMask.
+func (s *BitplaneState) SetBPU(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > 7 {
+		n = 7
+	}
+	s.Planes = n
+	s.VisibleMask = uint8((1 << n) - 1)
+}
+
+// EffectivePlanes returns the active bitplane count (1..7), matching BPU.
+func (s *BitplaneState) EffectivePlanes() int {
+	return s.BPU()
+}
+
+// VisibleWidth returns the human-readable visible display window width in pixels.
+// Standard Amiga display window is 320 px in Lowres or 640 px in Hires.
+func (s *BitplaneState) VisibleWidth() int {
+	maxW := 320
+	if s.Hires || s.RowBytes >= 80 {
+		maxW = 640
+	}
+	bufW := s.RowBytes * 8
+	if bufW < maxW && bufW > 0 {
+		return bufW
+	}
+	return maxW
+}
+
+// VisibleRowBytes returns the visible scanline width in bytes.
+func (s *BitplaneState) VisibleRowBytes() int {
+	return max(s.VisibleWidth()/8, 1)
+}
+
+// HardwareModulos returns the BPL1MOD and BPL2MOD register values.
+// If the buffer in RAM is wider than the visible window (320 or 640 px),
+// the extra bytes are cut and reflected in the modulo so scanlines advance cleanly.
+func (s *BitplaneState) HardwareModulos() (int, int) {
+	rowBytes := max(s.RowBytes, 1)
+	visBytes := s.VisibleRowBytes()
+	cutBytes := max(rowBytes-visBytes, 0)
+
+	if s.Interleaved {
+		bpu := max(s.BPU(), 1)
+		mod := (bpu-1)*rowBytes + cutBytes + s.Modulo
+		return mod, mod
+	}
+	mod := cutBytes + s.Modulo
+	return mod, mod
+}
+
+// BPLCON0Hex returns the raw 16-bit register value for BPLCON0 ($DFF100).
+func (s *BitplaneState) BPLCON0Hex() uint16 {
+	bpu := s.BPU()
+	val := uint16(bpu&7) << 12
+	val |= 0x0200 // COLOR burst enable
+	if s.Hires || s.RowBytes >= 80 {
+		val |= 0x8000 // HIRES
+	}
+	if s.HAM && bpu == 6 {
+		val |= 0x0800 // HAM
+	}
+	return val
+}
+
 // RowStrideBytes returns the byte stride between successive scanlines of a plane.
 func (s *BitplaneState) RowStrideBytes() int {
 	rowBytes := max(s.RowBytes, 1)
 	if s.Interleaved {
-		return rowBytes*max(s.Planes, 1) + s.Modulo
+		return rowBytes*max(s.BPU(), 1) + s.Modulo
 	}
 	return rowBytes + s.Modulo
 }
@@ -136,17 +228,16 @@ func (s *BitplaneState) RowStrideBytes() int {
 func (s *BitplaneState) AutoSnapPlanes() {
 	base := s.BPL[0]
 	rowBytes := max(s.RowBytes, 1)
-	planes := max(min(s.Planes, 6), 1)
 
 	if s.Interleaved {
-		for p := range planes {
+		for p := 0; p < 8; p++ {
 			if (s.ControlMask & (1 << p)) != 0 {
 				s.BPL[p] = base + uint32(p*rowBytes)
 			}
 		}
 	} else {
 		planeSize := uint32(s.RowStrideBytes() * max(s.Height, 1))
-		for p := range planes {
+		for p := 0; p < 8; p++ {
 			if (s.ControlMask & (1 << p)) != 0 {
 				s.BPL[p] = base + uint32(p)*planeSize
 			}
@@ -157,7 +248,7 @@ func (s *BitplaneState) AutoSnapPlanes() {
 // StepControlPlanes shifts starting pointers of all planes active in ControlMask by delta bytes.
 // Inactive planes stay fixed, enabling precise inter-plane registration and color calibration.
 func (s *BitplaneState) StepControlPlanes(delta int) {
-	for p := 0; p < s.Planes; p++ {
+	for p := 0; p < 8; p++ {
 		if (s.ControlMask & (1 << p)) != 0 {
 			newOff := int(s.BPL[p]) + delta
 			if newOff < 0 {
@@ -170,21 +261,22 @@ func (s *BitplaneState) StepControlPlanes(delta int) {
 
 // RotatePlanes shifts plane pointers cyclically (e.g., plane 1 becomes plane 2).
 func (s *BitplaneState) RotatePlanes(forward bool) {
-	if s.Planes <= 1 {
+	bpu := s.BPU()
+	if bpu <= 1 {
 		return
 	}
 	if forward {
-		last := s.BPL[s.Planes-1]
-		for p := s.Planes - 1; p > 0; p-- {
+		last := s.BPL[bpu-1]
+		for p := bpu - 1; p > 0; p-- {
 			s.BPL[p] = s.BPL[p-1]
 		}
 		s.BPL[0] = last
 	} else {
 		first := s.BPL[0]
-		for p := 0; p < s.Planes-1; p++ {
+		for p := 0; p < bpu-1; p++ {
 			s.BPL[p] = s.BPL[p+1]
 		}
-		s.BPL[s.Planes-1] = first
+		s.BPL[bpu-1] = first
 	}
 }
 
@@ -195,8 +287,9 @@ func (s *BitplaneState) ByteSpan() (uint32, uint32) {
 	stride := uint32(max(s.RowStrideBytes(), 1))
 	height := uint32(max(s.Height, 1))
 	spanPerPlane := stride * height
+	bpu := s.BPU()
 
-	for p := 0; p < s.Planes; p++ {
+	for p := 0; p < bpu; p++ {
 		start := s.BPL[p]
 		if start < minOff {
 			minOff = start
@@ -270,15 +363,33 @@ func ParseAmigaPalette(data []byte, offset uint32) ([32]color.RGBA, string, bool
 	return pal, "", false
 }
 
-// BuildDefaultPalette creates a 64-color palette based on mode, depth, invert, and brightness.
-func (s *BitplaneState) BuildDefaultPalette() [64]color.RGBA {
-	var pal [64]color.RGBA
+// BuildDefaultPalette creates a 128-color palette based on mode, depth, invert, and brightness.
+func (s *BitplaneState) BuildDefaultPalette() [128]color.RGBA {
+	var pal [128]color.RGBA
+	bpu := s.BPU()
 
 	switch s.PaletteMode {
 	case PaletteCustom:
 		copy(pal[:32], s.CustomPalette[:32])
+		// Extra Half-Brite (EHB) for planes 6 and 7 if custom palette
+		for i := 0; i < 32; i++ {
+			pal[i+32] = color.RGBA{
+				R: pal[i].R >> 1,
+				G: pal[i].G >> 1,
+				B: pal[i].B >> 1,
+				A: 255,
+			}
+		}
+		for i := 0; i < 64; i++ {
+			pal[i+64] = color.RGBA{
+				R: pal[i].R >> 1,
+				G: pal[i].G >> 1,
+				B: pal[i].B >> 1,
+				A: 255,
+			}
+		}
 	case PaletteHighContrast:
-		if s.Planes == 1 {
+		if bpu == 1 {
 			pal[0] = color.RGBA{0, 0, 0, 255}
 			pal[1] = color.RGBA{255, 255, 255, 255}
 		} else {
@@ -301,14 +412,24 @@ func (s *BitplaneState) BuildDefaultPalette() [64]color.RGBA {
 				{0x22, 0x88, 0x88, 0xFF}, {0xFF, 0xCC, 0x99, 0xFF},
 			}
 			copy(pal[:32], baseHues[:32])
+			for i := 32; i < 128; i++ {
+				base := pal[i%32]
+				factor := uint8(200 - (i/32)*40)
+				pal[i] = color.RGBA{
+					R: uint8((uint16(base.R) * uint16(factor)) / 255),
+					G: uint8((uint16(base.G) * uint16(factor)) / 255),
+					B: uint8((uint16(base.B) * uint16(factor)) / 255),
+					A: 255,
+				}
+			}
 		}
 	default: // PaletteGrayscale
-		numCols := 1 << s.Planes
+		numCols := 1 << bpu
 		if numCols <= 2 {
 			pal[0] = color.RGBA{0x00, 0x00, 0x00, 0xFF}
 			pal[1] = color.RGBA{0xFF, 0xFF, 0xFF, 0xFF}
 		} else {
-			steps := min(numCols, 32)
+			steps := min(numCols, 128)
 			for i := 0; i < steps; i++ {
 				v := uint8((i * 255) / (steps - 1))
 				pal[i] = color.RGBA{R: v, G: v, B: v, A: 255}
@@ -318,7 +439,7 @@ func (s *BitplaneState) BuildDefaultPalette() [64]color.RGBA {
 
 	// Apply Invert
 	if s.Invert {
-		numCols := min(1<<s.Planes, 32)
+		numCols := min(1<<bpu, 128)
 		for i := 0; i < numCols; i++ {
 			pal[i].R = 255 - pal[i].R
 			pal[i].G = 255 - pal[i].G
@@ -329,7 +450,7 @@ func (s *BitplaneState) BuildDefaultPalette() [64]color.RGBA {
 	// Apply Brightness bias
 	if s.Brightness != 0 {
 		bias := int16(s.Brightness) * 20
-		numCols := min(1<<s.Planes, 32)
+		numCols := min(1<<bpu, 128)
 		for i := 0; i < numCols; i++ {
 			clamp := func(val uint8) uint8 {
 				res := int16(val) + bias
@@ -348,12 +469,14 @@ func (s *BitplaneState) BuildDefaultPalette() [64]color.RGBA {
 	}
 
 	// Extra Half-Brite (EHB): 6 planes, colors 32..63 are half brightness of 0..31
-	for i := 0; i < 32; i++ {
-		pal[i+32] = color.RGBA{
-			R: pal[i].R >> 1,
-			G: pal[i].G >> 1,
-			B: pal[i].B >> 1,
-			A: 255,
+	if bpu == 6 && s.PaletteMode != PaletteGrayscale {
+		for i := 0; i < 32; i++ {
+			pal[i+32] = color.RGBA{
+				R: pal[i].R >> 1,
+				G: pal[i].G >> 1,
+				B: pal[i].B >> 1,
+				A: 255,
+			}
 		}
 	}
 
@@ -364,14 +487,11 @@ func (s *BitplaneState) BuildDefaultPalette() [64]color.RGBA {
 // If maxPxW or maxPxH are <= 0, the full native bitmap width/height is decoded.
 // Returns an *image.RGBA scaled by s.Scale via nearest-neighbor replication.
 func (s *BitplaneState) DecodeImage(data []byte, maxPxW, maxPxH int) *image.RGBA {
-	rowBytes := max(s.RowBytes, 1)
 	height := max(s.Height, 1)
-	planes := max(min(s.Planes, 6), 1)
 	stride := s.RowStrideBytes()
 	scale := max(min(s.Scale, 8), 1)
 
-	widthPx := rowBytes * 8
-	visW := widthPx
+	visW := s.VisibleWidth()
 	if maxPxW > 0 && maxPxW < visW {
 		visW = maxPxW
 	}
@@ -385,6 +505,7 @@ func (s *BitplaneState) DecodeImage(data []byte, maxPxW, maxPxH int) *image.RGBA
 
 	palette := s.BuildDefaultPalette()
 	dataLen := len(data)
+	bpu := s.BPU()
 
 	// Decode 1:1 pixels into flat slice
 	rawPixels := make([]color.RGBA, visW*visH)
@@ -398,7 +519,7 @@ func (s *BitplaneState) DecodeImage(data []byte, maxPxW, maxPxH int) *image.RGBA
 			bitShift := 7 - (x & 7)
 
 			var colorIdx int
-			for p := 0; p < planes; p++ {
+			for p := 0; p < bpu; p++ {
 				if (s.VisibleMask & (1 << p)) != 0 {
 					offset := int(s.BPL[p]) + rowOffset + byteIdx
 					if offset >= 0 && offset < dataLen {
@@ -409,7 +530,7 @@ func (s *BitplaneState) DecodeImage(data []byte, maxPxW, maxPxH int) *image.RGBA
 			}
 
 			var pxColor color.RGBA
-			if s.HAM && planes == 6 {
+			if s.HAM && bpu == 6 {
 				control := (colorIdx >> 4) & 3
 				val := colorIdx & 0x0F
 				val8 := uint8((val << 4) | val)
@@ -428,7 +549,7 @@ func (s *BitplaneState) DecodeImage(data []byte, maxPxW, maxPxH int) *image.RGBA
 					lastHAM = pxColor
 				}
 			} else {
-				pxColor = palette[colorIdx&63]
+				pxColor = palette[colorIdx&127]
 			}
 
 			rawPixels[y*visW+x] = pxColor
@@ -480,7 +601,7 @@ func (s *BitplaneState) UpdateCache(data []byte, col, row int, proto PixelProtoc
 func EncodeIFFILBM(st *BitplaneState, data []byte) ([]byte, error) {
 	width := st.WidthPx()
 	height := st.Height
-	planes := max(min(st.Planes, 6), 1)
+	planes := max(min(st.BPU(), 7), 1)
 	rowBytes := max(st.RowBytes, 1)
 	stride := st.RowStrideBytes()
 	dataLen := len(data)
@@ -503,8 +624,11 @@ func EncodeIFFILBM(st *BitplaneState, data []byte) ([]byte, error) {
 
 	// 2. CMAP chunk
 	numColors := 1 << planes
-	if numColors > 32 && !st.HAM {
+	if numColors > 32 && !st.HAM && planes <= 6 {
 		numColors = 32 // EHB stores base 32 colors in CMAP
+	}
+	if numColors > 128 {
+		numColors = 128
 	}
 	pal := st.BuildDefaultPalette()
 	cmap := make([]byte, numColors*3)

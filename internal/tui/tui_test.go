@@ -857,17 +857,32 @@ func TestBitplaneViewerInteractive(t *testing.T) {
 		t.Fatalf("expected CachedEscapeSeq to be populated")
 	}
 
-	// 2. Render UI and verify output contains Bitplanes title, both indicator groups, and CachedEscapeSeq
+	// 2. Render UI and verify output contains Bitplanes title, registers, both indicator groups, and CachedEscapeSeq
 	out := RenderUI(app)
 	plain := stripANSI(out)
 	if !strings.Contains(plain, "Bitplanes") {
 		t.Fatalf("expected Bitplanes in rendered output: %q", plain)
 	}
-	if !strings.Contains(plain, "Ctrl [1-6]:") {
-		t.Fatalf("expected Ctrl [1-6]: indicator group in rendered output: %q", plain)
+	if !strings.Contains(plain, "Synced:") {
+		t.Fatalf("expected Synced: indicator group in rendered output: %q", plain)
 	}
-	if !strings.Contains(plain, "Vis  [!-^]:") {
-		t.Fatalf("expected Vis  [!-^]: indicator group in rendered output: %q", plain)
+	if !strings.Contains(plain, "BPU:") {
+		t.Fatalf("expected BPU: indicator group in rendered output: %q", plain)
+	}
+	if !strings.Contains(plain, "BPLCON0:") {
+		t.Fatalf("expected BPLCON0: in rendered output: %q", plain)
+	}
+	if !strings.Contains(plain, "DIW:") {
+		t.Fatalf("expected DIW: in rendered output: %q", plain)
+	}
+	if !strings.Contains(plain, "DDF:") {
+		t.Fatalf("expected DDF: in rendered output: %q", plain)
+	}
+	if strings.Contains(plain, "#") || strings.Contains(plain, "0CAF5") || strings.Contains(plain, "0AF68") {
+		t.Fatalf("corrupted raw ANSI color token leaked into plain text: %q", plain)
+	}
+	if strings.Contains(out, "\x1b[#") {
+		t.Fatalf("invalid ANSI CSI sequence with # found in output: %q", out)
 	}
 	if app.Modal.PixelProtocol != ProtocolHalfBlock && !strings.Contains(out, "\x1b7") {
 		t.Fatalf("expected DEC cursor save in rendered output")
@@ -905,21 +920,44 @@ func TestBitplaneViewerInteractive(t *testing.T) {
 		t.Fatalf("armed plane 2 should advance: got %d vs %d", st.BPL[1], bpl1+2)
 	}
 
-	// Toggle plane 1 visibility off
+	// Toggle depth with direct keys (BPU 1..7)
+	// Depth 1: !
 	app.HandleKey("!")
-	if (st.VisibleMask & 1) != 0 {
-		t.Fatalf("expected plane 1 to be hidden in visible selection")
+	if st.BPU() != 1 {
+		t.Fatalf("expected BPU 1 after '!', got %d", st.BPU())
 	}
-	// Re-enable all visible planes
-	app.HandleKey(")")
-	if st.VisibleMask != 0x03 {
-		t.Fatalf("expected all planes visible after ')', got %d", st.VisibleMask)
+	// Depth 4: Nordic ¤ or US $
+	app.HandleKey("¤")
+	if st.BPU() != 4 {
+		t.Fatalf("expected BPU 4 after '¤', got %d", st.BPU())
+	}
+	// Depth 7: /
+	app.HandleKey("/")
+	if st.BPU() != 7 {
+		t.Fatalf("expected BPU 7 after '/', got %d", st.BPU())
+	}
+	if st.BPLCON0Hex() != 0x7200 {
+		t.Fatalf("expected BPLCON0 $7200 for 7 planes, got $%04X", st.BPLCON0Hex())
 	}
 
-	// Re-arm all planes in control selection
+	// Toggle 1 vs 6 with ')'
+	app.HandleKey(")")
+	if st.BPU() != 1 {
+		t.Fatalf("expected BPU 1 after first ')', got %d", st.BPU())
+	}
+	app.HandleKey(")")
+	if st.BPU() != 6 {
+		t.Fatalf("expected BPU 6 after second ')', got %d", st.BPU())
+	}
+
+	// Test '0' toggling: from all armed (0x3F) -> solo plane 1 (1) -> all armed (0x3F)
 	app.HandleKey("0")
-	if st.ControlMask != 0x03 {
-		t.Fatalf("expected all planes armed after '0', got %d", st.ControlMask)
+	if st.ControlMask != 1 {
+		t.Fatalf("expected solo plane 1 after first '0', got %d", st.ControlMask)
+	}
+	app.HandleKey("0")
+	if st.ControlMask != 0x3F {
+		t.Fatalf("expected all planes armed after second '0', got %d", st.ControlMask)
 	}
 
 	// 6. Direct Geometry Input prompt

@@ -1164,32 +1164,38 @@ func renderBitplaneModal(buf *screenBuffer, a *App, screen rect) {
 	t := &a.Theme
 	area := rect{x: 0, y: 1, w: screen.w, h: max(screen.h-2, 1)}
 
-	layoutStr := "Contiguous"
-	if st.Interleaved {
-		layoutStr = "Interleaved"
-	}
 	protoName := a.Modal.PixelProtocol.String()
 	startAddr := a.BaseAddr + st.BPL[0]
+	diwStr := fmt.Sprintf("DIW: %d×%d", st.VisibleWidth(), st.Height)
+	ddfStr := fmt.Sprintf("DDF: %d px (%d B)", st.WidthPx(), st.RowBytes)
 
 	inner := buf.drawBox(area, "", t.Border, t.BG)
 	if inner.w <= 0 || inner.h <= 0 {
 		return
 	}
 
+	accentStyle := t.BarAccent
+	labelStyle := mustParseStyle("#C0CAF5 bold")
+	labelStyle.bg = t.BG.bg
+	activeSyncStyle := mustParseStyle("#E0AF68 bold")
+	activeSyncStyle.bg = t.BG.bg
+	activeBPUStyle := mustParseStyle("#7AA2F7 bold")
+	activeBPUStyle.bg = t.BG.bg
+	dimNumStyle := mustParseStyle("#65728A")
+	dimNumStyle.bg = t.BG.bg
+
 	var titleSpans []styledSpan
-	titleSpans = append(titleSpans, styledSpan{text: " Bitplanes ", style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: " Bitplanes ", style: accentStyle})
 	titleSpans = append(titleSpans, styledSpan{text: "── ", style: t.Border})
-	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%s (+%05X) ", a.FormatAddr(startAddr), st.BPL[0]), style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%s ", a.FormatAddr(startAddr)), style: accentStyle})
 	titleSpans = append(titleSpans, styledSpan{text: "│ ", style: t.Border})
-	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%d×%d×%d (%d col) ", st.WidthPx(), st.Height, st.Planes, 1<<st.Planes), style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%s ", diwStr), style: accentStyle})
 	titleSpans = append(titleSpans, styledSpan{text: "│ ", style: t.Border})
-	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("Scale: %dx (%d×%d px) ", st.Scale, st.WidthPx()*st.Scale, st.Height*st.Scale), style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%s ", ddfStr), style: accentStyle})
 	titleSpans = append(titleSpans, styledSpan{text: "│ ", style: t.Border})
-	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%s ", layoutStr), style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("Scale: %dx ", st.Scale), style: accentStyle})
 	titleSpans = append(titleSpans, styledSpan{text: "│ ", style: t.Border})
-	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("Mod: %+d ", st.Modulo), style: t.BarAccent})
-	titleSpans = append(titleSpans, styledSpan{text: "│ ", style: t.Border})
-	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%s ", protoName), style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%s ", protoName), style: accentStyle})
 
 	curX := area.x + 1
 	for _, sp := range titleSpans {
@@ -1201,66 +1207,52 @@ func renderBitplaneModal(buf *screenBuffer, a *App, screen rect) {
 		curX += n
 	}
 
-	// Line 0 of inner: Control Selection Group (Affected by pointer/width adjustments)
-	var ctrlSpans []styledSpan
-	ctrlSpans = append(ctrlSpans, styledSpan{text: " Ctrl [1-6]: ", style: t.BarAccent})
-	for p := 0; p < st.Planes; p++ {
-		if (st.ControlMask & (1 << p)) != 0 {
-			ctrlSpans = append(ctrlSpans, styledSpan{
-				text:  fmt.Sprintf("[%d:+$%05X]* ", p+1, st.BPL[p]),
-				style: t.BarAccent,
-			})
-		} else {
-			ctrlSpans = append(ctrlSpans, styledSpan{
-				text:  fmt.Sprintf("(%d:+$%05X)  ", p+1, st.BPL[p]),
-				style: t.Border,
-			})
-		}
-	}
-	var activeCtrl []string
-	for p := 0; p < st.Planes; p++ {
-		if (st.ControlMask & (1 << p)) != 0 {
-			activeCtrl = append(activeCtrl, fmt.Sprintf("%d", p+1))
-		}
-	}
-	ctrlSummary := "None"
-	if len(activeCtrl) == st.Planes {
-		ctrlSummary = "All synced"
-	} else if len(activeCtrl) > 0 {
-		ctrlSummary = fmt.Sprintf("Synced: %s", strings.Join(activeCtrl, ","))
-	}
-	ctrlSpans = append(ctrlSpans, styledSpan{text: fmt.Sprintf("│ %s", ctrlSummary), style: t.Flow})
-	buf.putSpansRow(inner.x, inner.y, inner.w, ctrlSpans, t.BG.bg, nil)
+	// Line 0 of inner: Custom Chipset Registers
+	bpl1mod, bpl2mod := st.HardwareModulos()
+	bplcon0Hex := fmt.Sprintf("$%04X", st.BPLCON0Hex())
 
-	// Line 1 of inner: Visible Bitmaps Group & Palette (Active visible bitmaps forming the image)
-	var visSpans []styledSpan
-	visSpans = append(visSpans, styledSpan{text: " Vis  [!-^]: ", style: t.BarAccent})
-	for p := 0; p < st.Planes; p++ {
-		if (st.VisibleMask & (1 << p)) != 0 {
-			visSpans = append(visSpans, styledSpan{
-				text:  fmt.Sprintf("[● %d] ", p+1),
-				style: t.BarAccent,
-			})
+	var regSpans []styledSpan
+	regSpans = append(regSpans, styledSpan{text: " BPLCON0: ", style: labelStyle})
+	regSpans = append(regSpans, styledSpan{text: fmt.Sprintf("%s ", bplcon0Hex), style: accentStyle})
+	regSpans = append(regSpans, styledSpan{text: "│ BPL1MOD: ", style: labelStyle})
+	regSpans = append(regSpans, styledSpan{text: fmt.Sprintf("%d ", bpl1mod), style: accentStyle})
+	regSpans = append(regSpans, styledSpan{text: "BPL2MOD: ", style: labelStyle})
+	regSpans = append(regSpans, styledSpan{text: fmt.Sprintf("%d ", bpl2mod), style: accentStyle})
+	regSpans = append(regSpans, styledSpan{text: "│ BPLxPT: ", style: labelStyle})
+
+	maxPlanesToShow := max(st.BPU(), 6)
+	for p := 0; p < maxPlanesToShow; p++ {
+		pNum := p + 1
+		pText := fmt.Sprintf("%d:$%05X ", pNum, st.BPL[p])
+		if (st.ControlMask & (1 << p)) != 0 {
+			regSpans = append(regSpans, styledSpan{text: pText, style: accentStyle})
 		} else {
-			visSpans = append(visSpans, styledSpan{
-				text:  fmt.Sprintf("[○ %d] ", p+1),
-				style: t.Border,
-			})
+			regSpans = append(regSpans, styledSpan{text: pText, style: dimNumStyle})
 		}
 	}
-	var activeVis []string
-	for p := 0; p < st.Planes; p++ {
-		if (st.VisibleMask & (1 << p)) != 0 {
-			activeVis = append(activeVis, fmt.Sprintf("%d", p+1))
+	buf.putSpansRow(inner.x, inner.y, inner.w, regSpans, t.BG.bg, nil)
+
+	// Line 1 of inner: Indicators and Palette
+	bpu := st.BPU()
+	var indSpans []styledSpan
+	indSpans = append(indSpans, styledSpan{text: " BPU:     ", style: labelStyle})
+	for p := 1; p <= 7; p++ {
+		pStr := fmt.Sprintf(" %d ", p)
+		if p <= bpu {
+			indSpans = append(indSpans, styledSpan{text: pStr, style: activeBPUStyle})
+		} else {
+			indSpans = append(indSpans, styledSpan{text: pStr, style: dimNumStyle})
 		}
 	}
-	visSummary := "None"
-	if len(activeVis) == st.Planes {
-		visSummary = "All visible"
-	} else if len(activeVis) > 0 {
-		visSummary = fmt.Sprintf("Visible: %s", strings.Join(activeVis, ","))
+	indSpans = append(indSpans, styledSpan{text: "│ Synced: ", style: labelStyle})
+	for p := 1; p <= 7; p++ {
+		pStr := fmt.Sprintf(" %d ", p)
+		if (st.ControlMask & (1 << (p - 1))) != 0 {
+			indSpans = append(indSpans, styledSpan{text: pStr, style: activeSyncStyle})
+		} else {
+			indSpans = append(indSpans, styledSpan{text: pStr, style: dimNumStyle})
+		}
 	}
-	visSpans = append(visSpans, styledSpan{text: fmt.Sprintf("│ %s ", visSummary), style: t.Flow})
 
 	palName := "Grayscale"
 	switch st.PaletteMode {
@@ -1273,19 +1265,19 @@ func renderBitplaneModal(buf *screenBuffer, a *App, screen rect) {
 			palName = "Custom"
 		}
 	}
-	visSpans = append(visSpans, styledSpan{text: fmt.Sprintf("│ Pal: %s ", palName), style: t.Bar})
+	indSpans = append(indSpans, styledSpan{text: fmt.Sprintf("│ Pal: %s ", palName), style: labelStyle})
 	pal := st.BuildDefaultPalette()
-	swatchCount := min(1<<st.Planes, 8)
+	swatchCount := min(1<<bpu, 8)
 	for i := 0; i < swatchCount; i++ {
 		c := pal[i]
 		stFG := fmt.Sprintf("38;2;%d;%d;%d", c.R, c.G, c.B)
 		stBG := t.BG.bg
-		visSpans = append(visSpans, styledSpan{
+		indSpans = append(indSpans, styledSpan{
 			text:  "█",
 			style: cellStyle{fg: stFG, bg: stBG},
 		})
 	}
-	buf.putSpansRow(inner.x, inner.y+1, inner.w, visSpans, t.BG.bg, nil)
+	buf.putSpansRow(inner.x, inner.y+1, inner.w, indSpans, t.BG.bg, nil)
 
 	// Line 2 of inner: Divider
 	if inner.h > 2 {

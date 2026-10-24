@@ -901,15 +901,10 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 					modal.Bitplane.RowBytes = max(w/8, 1)
 					modal.Bitplane.Height = max(h, 1)
 					if n == 3 {
-						modal.Bitplane.Planes = max(min(d, 6), 1)
-						validMask := uint8((1 << modal.Bitplane.Planes) - 1)
-						modal.Bitplane.ControlMask &= validMask
+						modal.Bitplane.SetBPU(d)
+						modal.Bitplane.ControlMask &= uint8((1 << modal.Bitplane.BPU()) - 1)
 						if modal.Bitplane.ControlMask == 0 {
-							modal.Bitplane.ControlMask = validMask
-						}
-						modal.Bitplane.VisibleMask &= validMask
-						if modal.Bitplane.VisibleMask == 0 {
-							modal.Bitplane.VisibleMask = validMask
+							modal.Bitplane.ControlMask = uint8((1 << modal.Bitplane.BPU()) - 1)
 						}
 					}
 					modal.Bitplane.AutoSnapPlanes()
@@ -1025,24 +1020,16 @@ func (a *App) handleBitplaneKey(modal Modal, key string) bool {
 		return true
 
 	case "+":
-		st.Planes = min(st.Planes+1, 6)
-		st.ControlMask |= (1 << (st.Planes - 1))
-		st.VisibleMask |= (1 << (st.Planes - 1))
-		st.AutoSnapPlanes()
-		a.refreshBitplaneCache()
+		if st.BPU() < 7 {
+			st.SetBPU(st.BPU() + 1)
+			st.ControlMask |= (1 << (st.BPU() - 1))
+			a.refreshBitplaneCache()
+		}
 	case "-":
-		st.Planes = max(st.Planes-1, 1)
-		validMask := uint8((1 << st.Planes) - 1)
-		st.ControlMask &= validMask
-		if st.ControlMask == 0 {
-			st.ControlMask = validMask
+		if st.BPU() > 1 {
+			st.SetBPU(st.BPU() - 1)
+			a.refreshBitplaneCache()
 		}
-		st.VisibleMask &= validMask
-		if st.VisibleMask == 0 {
-			st.VisibleMask = validMask
-		}
-		st.AutoSnapPlanes()
-		a.refreshBitplaneCache()
 
 	case "m":
 		st.Modulo -= 2
@@ -1079,65 +1066,56 @@ func (a *App) handleBitplaneKey(modal Modal, key string) bool {
 	case "J":
 		a.stepBitplanes(32768)
 
-	case "1", "2", "3", "4", "5", "6":
+	case "1", "2", "3", "4", "5", "6", "7":
 		pIdx := int(key[0] - '1')
-		if pIdx < st.Planes {
-			st.ControlMask ^= (1 << pIdx)
-			a.refreshBitplaneCache()
-		}
-	case "0":
-		allMask := uint8((1 << st.Planes) - 1)
-		if st.ControlMask == allMask {
+		st.ControlMask ^= (1 << pIdx)
+		a.refreshBitplaneCache()
+	case "0", " ":
+		activeMask := uint8((1 << st.BPU()) - 1)
+		if st.ControlMask == activeMask {
 			st.ControlMask = 1 // Solo plane 1
 		} else {
-			st.ControlMask = allMask // Arm all
-		}
-		a.refreshBitplaneCache()
-	case " ":
-		allMask := uint8((1 << st.Planes) - 1)
-		if st.ControlMask == allMask {
-			st.ControlMask = 1
-		} else {
-			st.ControlMask = allMask
+			st.ControlMask = activeMask // Arm all active planes
 		}
 		a.refreshBitplaneCache()
 
-	case "!", "shift+1", "alt+1":
-		if st.Planes >= 1 {
-			st.VisibleMask ^= 1
-			a.refreshBitplaneCache()
-		}
-	case "@", "shift+2", "alt+2":
-		if st.Planes >= 2 {
-			st.VisibleMask ^= (1 << 1)
-			a.refreshBitplaneCache()
-		}
-	case "#", "shift+3", "alt+3":
-		if st.Planes >= 3 {
-			st.VisibleMask ^= (1 << 2)
-			a.refreshBitplaneCache()
-		}
-	case "$", "shift+4", "alt+4":
-		if st.Planes >= 4 {
-			st.VisibleMask ^= (1 << 3)
-			a.refreshBitplaneCache()
-		}
-	case "%", "shift+5", "alt+5":
-		if st.Planes >= 5 {
-			st.VisibleMask ^= (1 << 4)
-			a.refreshBitplaneCache()
-		}
-	case "^", "shift+6", "alt+6":
-		if st.Planes >= 6 {
-			st.VisibleMask ^= (1 << 5)
-			a.refreshBitplaneCache()
-		}
-	case ")", "shift+0", "alt+0":
-		allMask := uint8((1 << st.Planes) - 1)
-		if st.VisibleMask == allMask {
-			st.VisibleMask = 1 // Solo plane 1
+	// Direct bitplane depth selection (BPU 1..7)
+	// Supports US, UK, Scandinavian, German, French, and international keyboards:
+	case "!", "shift+1":
+		st.SetBPU(1)
+		st.ControlMask = 1
+		a.refreshBitplaneCache()
+	case "@", "\"", "shift+2":
+		st.SetBPU(2)
+		st.ControlMask |= (1 << 1)
+		a.refreshBitplaneCache()
+	case "#", "£", "§", "shift+3":
+		st.SetBPU(3)
+		st.ControlMask |= (1 << 2)
+		a.refreshBitplaneCache()
+	case "$", "¤", "shift+4":
+		st.SetBPU(4)
+		st.ControlMask |= (1 << 3)
+		a.refreshBitplaneCache()
+	case "%", "shift+5":
+		st.SetBPU(5)
+		st.ControlMask |= (1 << 4)
+		a.refreshBitplaneCache()
+	case "^", "&", "shift+6":
+		st.SetBPU(6)
+		st.ControlMask |= (1 << 5)
+		a.refreshBitplaneCache()
+	case "/", "shift+7":
+		st.SetBPU(7)
+		st.ControlMask |= (1 << 6)
+		a.refreshBitplaneCache()
+	case ")", "=", "shift+0":
+		if st.BPU() > 1 {
+			st.SetBPU(1)
+			st.ControlMask = 1
 		} else {
-			st.VisibleMask = allMask // Show all
+			st.SetBPU(6)
+			st.ControlMask = 0x3F
 		}
 		a.refreshBitplaneCache()
 

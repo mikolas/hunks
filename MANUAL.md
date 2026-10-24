@@ -511,9 +511,13 @@ Instructions that jump/call across hunks or through a register jump-vector table
 
 Pressing `B` in the Disassembly view opens the integrated, keyboard-driven Bitplane Image Viewer directly inside the terminal. It renders true high-resolution Amiga bitmaps using modern terminal pixel graphics (Kitty Graphics Protocol, iTerm2 inline images, or Sixel) with zero-dependency Unicode Half-Block (`▀`) fallback.
 
-The viewer manages a single image at a time with up to 6 bitplanes. The HUD features two dedicated, high-contrast indicator groups:
-1. **Control Selection group (`Ctrl [1-6]`):** Shows which bitplanes are currently armed in the sync group to receive pointer stepping and geometry adjustments (`[1:+$00000]*` when armed, `(1:+$00000)` when unarmed) along with a sync status summary (`All synced` / `Synced: 1,2`).
-2. **Visible Bitmaps group (`Vis [!-^]`):** Shows which bitplanes are actively contributing to the rendered image (`[● 1]` when lit/visible, `[○ 1]` when muted/hidden) along with color palette mode and live color swatches.
+The viewer manages a single image at a time with up to 7 bitplanes (including AGA / special test mode). The status panel displays the exact Amiga custom chipset registers and human-readable geometry:
+- **Top Border**: Base cursor address, display window (`DIW: 320×200`), data fetch/buffer stride (`DDF: 384 px (48 B)`), integer zoom factor, and pixel graphics protocol. If the buffer in RAM is wider than the native visible window (320 in Lores, 640 in Hires), the viewer automatically cuts the extra margin so the visible window displays distortion-free.
+- **Register Statusline**: `BPLCON0` raw hex word, `BPL1MOD` & `BPL2MOD` line modulos (accounting for contiguous buffer cuts and interleaved multi-plane strides), and active bitplane starting pointers (`BPLxPT: 1:$04000 2:$05F40 ...`).
+- **Indicators Statusline**:
+  1. **`BPU:        1  2  3  4  5  6  7`**: Sequential active bitplane count in `BPLCON0` (bits 14–12). Digits $1..BPU$ are highlighted in bright cyan (`#7AA2F7 bold`); inactive digits in legible slate gray (`#65728A`).
+  2. **`Synced:     1  2  3  4  5  6  7`**: Independent pointer adjustment group (`BPL1PT`–`BPL7PT`). Armed numbers are rendered in bright warm gold (`#E0AF68 bold`); unarmed numbers in legible slate gray (`#65728A`).
+  3. **`Pal`**: Active color mode and live truecolor RGB swatches.
 
 The viewer queries the kernel for exact terminal window pixel dimensions (`TIOCGWINSZ`) and screen DRM modes to automatically select the optimal integer scaling factor ($1\times..8\times$) on launch, ensuring native Amiga bitmaps (320×200, 320×256, 640×512) comfortably fill the screen with crisp, square device pixels on modern high-DPI displays.
 
@@ -525,19 +529,18 @@ The viewer queries the kernel for exact terminal window pixel dimensions (`TIOCG
 | `s` / `S` | Adjust scanline height by $\mp 1$ line |
 | `h` / `H` | Adjust scanline height by $\mp 8$ lines |
 | `g` | Direct geometry input dialog (e.g. `320x200` or `320x200x4`) |
-| `+` / `-` | Increase / decrease bitplane depth ($1..6$ planes) |
+| `+` / `-` | Increase / decrease active bitplane depth ($BPU = 1..7$) |
+| `1`–`7` | Toggle bitplane $N$ in **Synced Selection** (arm/disarm pointer for stepping) |
+| `0` / `Space` | Toggle all active planes armed vs. plane 1 soloed in Synced Selection |
+| `!` / `"` / `#` / `¤` / `%` / `&` / `/` | Direct depth jump to $BPU$ 1..7 (international/Nordic/US layout friendly; `Shift+1`..`Shift+7`) |
+| `)` / `=` / `Shift+0` | Toggle 1 plane vs. full 6 planes |
 | `m` / `M` | Adjust scanline row modulo by $\mp 2$ bytes |
 | `Tab` | Toggle layout: Contiguous vs. Interleaved scanlines |
-| `,` / `.` | Step starting pointers of armed control planes by $\mp 2$ bytes |
-| `l` / `L` | Step starting pointers of armed control planes by $\mp 1$ scanline stride |
-| `↑` / `↓` | Step starting pointers of armed control planes by $\mp 1$ row |
+| `,` / `.` | Step starting pointers of armed Synced planes by $\mp 2$ bytes |
+| `l` / `L` | Step starting pointers of armed Synced planes by $\mp 1$ scanline stride |
+| `↑` / `↓` | Step starting pointers of armed Synced planes by $\mp 1$ row |
 | `z` / `x` | Coarse step starting pointers by $\mp 1$ KB ($\mp 1024$ bytes) |
 | `u` / `J` | Large step starting pointers by $\mp 32$ KB ($\mp 32768$ bytes) |
-| `1`–`6` | Toggle bitplane $N$ in **Control Selection** (arm/disarm plane for pointer & geometry adjustments) |
-| `0` | Arm all planes / solo plane 1 in Control Selection |
-| `Space` | Toggle all planes armed vs. plane 1 soloed in Control Selection |
-| `Shift+1`..`6` (`!`..`^`, `Alt+1`..`6`) | Toggle bitplane $N$ in **Visible Bitmaps** (solo / mask plane in rendered image) |
-| `Shift+0` (`)`, `Alt+0`) | Enable all planes in Visible Bitmaps |
 | `r` / `R` | Rotate plane assignments cyclically forward / backward |
 | `c` | Cycle palette mode: Grayscale $\rightarrow$ High-Contrast $\rightarrow$ Custom |
 | `i` | Invert palette colors |
