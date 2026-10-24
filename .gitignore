@@ -1,0 +1,66 @@
+# Built binaries & test outputs
+/hunks
+*.exe
+*.out
+*.test
+*.prof
+*.cov
+coverage.out
+coverage.html
+
+# hunks working & output artifacts (generated per project, never committed)
+work/
+assets/
+build/
+target/
+disasm/
+src/
+doc/
+docs/
+*.bin
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+project.json
+theme.json
+out.s
+*.s
+*.asm
+*.i
+
+# Copyrighted Amiga binaries, disk images, ROMs, and music modules
+*.adf
+*.dms
+*.ipf
+*.slave
+*.rom
+*.kick
+*.mod
+*.xm
+*.lha
+*.lzx
+
+# Local module test corpus — real modules are composers' copyrighted works
+testdata/*
+!testdata/README.md
+
+# Local working specs & personal notes
+ROADMAP.md
+*_SPEC.md
+NOTES.md
+TODO.md
+
+# Editor, OS & agent directories
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.kiro/
+.claude/
+.cursor/
+.gemini/
