@@ -164,6 +164,9 @@ const (
 	ModalSegmentManager
 	ModalFileBrowser
 	ModalSegmentForm
+	ModalBitplane
+	ModalBitplaneGeometry
+	ModalBitplanePalette
 )
 
 // SearchHit represents a single search result row.
@@ -266,8 +269,10 @@ type Modal struct {
 	StructState StructEditorState
 	CarveStart  uint32
 	CarveEnd    uint32
-	FileBrowser FileBrowserState
-	SegmentForm SegmentFormState
+	FileBrowser   FileBrowserState
+	SegmentForm   SegmentFormState
+	Bitplane      *BitplaneState
+	PixelProtocol PixelProtocol
 }
 
 // UndoKind identifies the kind of undo entry.

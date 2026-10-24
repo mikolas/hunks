@@ -503,8 +503,53 @@ Instructions that jump/call across hunks or through a register jump-vector table
 | `t` | Struct editor (`n` = new struct, `Enter` = edit struct fields, `a` = add field, `d` = delete, `Esc` = back) |
 | `a` | Register alias editor (maps a base register to a struct for automatic `d16(An)` field substitution) |
 | `Ctrl-z` | Undo last type-marking action |
+| `B` | Open interactive Bitplane Image Viewer at cursor address |
 | `?` | Help popup |
 | `q` | Quit |
+
+### Interactive Bitplane Image Viewer (`B`)
+
+Pressing `B` in the Disassembly view opens the integrated, keyboard-driven Bitplane Image Viewer directly inside the terminal. It renders true high-resolution Amiga bitmaps using modern terminal pixel graphics (Kitty Graphics Protocol, iTerm2 inline images, or Sixel) with zero-dependency Unicode Half-Block (`▀`) fallback.
+
+The viewer manages a single image at a time with up to 6 bitplanes. The HUD features two dedicated, high-contrast indicator groups:
+1. **Control Selection group (`Ctrl [1-6]`):** Shows which bitplanes are currently armed in the sync group to receive pointer stepping and geometry adjustments (`[1:+$00000]*` when armed, `(1:+$00000)` when unarmed) along with a sync status summary (`All synced` / `Synced: 1,2`).
+2. **Visible Bitmaps group (`Vis [!-^]`):** Shows which bitplanes are actively contributing to the rendered image (`[● 1]` when lit/visible, `[○ 1]` when muted/hidden) along with color palette mode and live color swatches.
+
+The viewer queries the kernel for exact terminal window pixel dimensions (`TIOCGWINSZ`) and screen DRM modes to automatically select the optimal integer scaling factor ($1\times..8\times$) on launch, ensuring native Amiga bitmaps (320×200, 320×256, 640×512) comfortably fill the screen with crisp, square device pixels on modern high-DPI displays.
+
+| Key | Action |
+|-----|--------|
+| `←` / `→` | Adjust bitmap width by $\mp 1$ word ($\mp 16$ px / $\mp 2$ bytes) |
+| `a` / `d` | Adjust bitmap width by $\mp 1$ byte ($\mp 8$ px) |
+| `A` / `D` | Adjust bitmap width by $\mp 16$ bytes ($\mp 128$ px) |
+| `s` / `S` | Adjust scanline height by $\mp 1$ line |
+| `h` / `H` | Adjust scanline height by $\mp 8$ lines |
+| `g` | Direct geometry input dialog (e.g. `320x200` or `320x200x4`) |
+| `+` / `-` | Increase / decrease bitplane depth ($1..6$ planes) |
+| `m` / `M` | Adjust scanline row modulo by $\mp 2$ bytes |
+| `Tab` | Toggle layout: Contiguous vs. Interleaved scanlines |
+| `,` / `.` | Step starting pointers of armed control planes by $\mp 2$ bytes |
+| `l` / `L` | Step starting pointers of armed control planes by $\mp 1$ scanline stride |
+| `↑` / `↓` | Step starting pointers of armed control planes by $\mp 1$ row |
+| `z` / `x` | Coarse step starting pointers by $\mp 1$ KB ($\mp 1024$ bytes) |
+| `u` / `J` | Large step starting pointers by $\mp 32$ KB ($\mp 32768$ bytes) |
+| `1`–`6` | Toggle bitplane $N$ in **Control Selection** (arm/disarm plane for pointer & geometry adjustments) |
+| `0` | Arm all planes / solo plane 1 in Control Selection |
+| `Space` | Toggle all planes armed vs. plane 1 soloed in Control Selection |
+| `Shift+1`..`6` (`!`..`^`, `Alt+1`..`6`) | Toggle bitplane $N$ in **Visible Bitmaps** (solo / mask plane in rendered image) |
+| `Shift+0` (`)`, `Alt+0`) | Enable all planes in Visible Bitmaps |
+| `r` / `R` | Rotate plane assignments cyclically forward / backward |
+| `c` | Cycle palette mode: Grayscale $\rightarrow$ High-Contrast $\rightarrow$ Custom |
+| `i` | Invert palette colors |
+| `b` / `B` | Adjust palette brightness bias ($-4..+4$) |
+| `e` | Toggle Hold-And-Modify 6 (HAM6) decoding (when planes = 6) |
+| `p` | Prompt for Copper list or raw $\$0RGB$ palette address/offset in binary |
+| `o` / `O` | Zoom out / Zoom in nearest-neighbor integer scaling ($1\times..8\times$) |
+| `v` | Cycle terminal graphics protocol (`Kitty` $\rightarrow$ `iTerm2` $\rightarrow$ `Sixel` $\rightarrow$ `Half-Block`) |
+| `w` | Export unscaled bitmap as standard PNG to `assets/<seg>_<addr>_<WxHxD>.png` |
+| `W` | Export bitmap as standard Commodore Amiga `FORM ILBM` file to `assets/` |
+| `K` | Carve bitplane byte range in database as Data (`DAT`) with label `gfx_<W>x<H>x<D>` |
+| `Esc` / `q` | Close viewer and return immediately to disassembly listing |
 
 ### Theme Customization (`~/.config/hunks/theme.json`)
 

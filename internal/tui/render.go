@@ -330,14 +330,46 @@ func RenderUI(a *App) string {
 	renderStatusBar(buf, a, statusArea)
 	renderModal(buf, a, rect{x: 0, y: 0, w: width, h: height})
 
-	return buf.render()
+	rendered := buf.render()
+	if a.Modal.Kind == ModalBitplane && a.Modal.Bitplane != nil {
+		st := a.Modal.Bitplane
+		if st.CachedEscapeSeq != "" {
+			rendered += st.CachedEscapeSeq
+		}
+	}
+	return rendered
 }
 
 func renderMenuBar(buf *screenBuffer, a *App, area rect) {
 	t := &a.Theme
 	btnStyle := t.MenuBtn
 	gapStyle := t.Bar
-	spans := []styledSpan{
+
+	var spans []styledSpan
+	if a.Modal.Kind == ModalBitplane {
+		protoName := a.Modal.PixelProtocol.String()
+		spans = []styledSpan{
+			{text: " [?]Help ", style: btnStyle},
+			{text: " ", style: gapStyle},
+			{text: " [w]Save PNG ", style: btnStyle},
+			{text: " ", style: gapStyle},
+			{text: " [W]Save IFF ", style: btnStyle},
+			{text: " ", style: gapStyle},
+			{text: " [K]Carve ", style: btnStyle},
+			{text: " ", style: gapStyle},
+			{text: " [g]Geometry ", style: btnStyle},
+			{text: " ", style: gapStyle},
+			{text: " [p]Palette ", style: btnStyle},
+			{text: " ", style: gapStyle},
+			{text: fmt.Sprintf(" [v]Proto:%s ", protoName), style: btnStyle},
+			{text: " ", style: gapStyle},
+			{text: " [Esc]Close ", style: btnStyle},
+		}
+		buf.putSpansRow(area.x, area.y, area.w, spans, t.Bar.bg, nil)
+		return
+	}
+
+	spans = []styledSpan{
 		{text: " [?]Help ", style: btnStyle},
 		{text: " ", style: gapStyle},
 		{text: " [S]Segments ", style: btnStyle},
@@ -360,6 +392,12 @@ func renderMenuBar(buf *screenBuffer, a *App, area rect) {
 func renderStatusBar(buf *screenBuffer, a *App, area rect) {
 	t := &a.Theme
 	buf.clearRect(area, t.Bar)
+	if a.Modal.Kind == ModalBitplane {
+		buf.putString(area.x, area.y, area.w,
+			" [←/→]Word [a/d]Byte [s/h]Height [1-6]Planes [Space]Lock [c]Pal [i]Inv [o/O]Zoom [Tab]Layout [w]PNG [Esc]Exit",
+			t.Bar)
+		return
+	}
 	if a.StatusMsg != "" {
 		buf.putString(area.x, area.y, area.w, a.StatusMsg, t.BarAccent)
 		return
@@ -1108,6 +1146,187 @@ func renderModal(buf *screenBuffer, a *App, screen rect) {
 		}
 		for i := 0; i < len(fields) && i < inner.h; i++ {
 			buf.putString(inner.x, inner.y+i, inner.w, fields[i], cellStyle{fg: fgWhite})
+		}
+	case ModalBitplane:
+		renderBitplaneModal(buf, a, screen)
+	case ModalBitplaneGeometry:
+		renderInputModal(buf, screen, " Bitmap Geometry (WxH or WxHxD) ", &m.Input, fgCyan)
+	case ModalBitplanePalette:
+		renderInputModal(buf, screen, " Set Palette Address / Offset ", &m.Input, fgCyan)
+	}
+}
+
+func renderBitplaneModal(buf *screenBuffer, a *App, screen rect) {
+	st := a.Modal.Bitplane
+	if st == nil {
+		return
+	}
+	t := &a.Theme
+	area := rect{x: 0, y: 1, w: screen.w, h: max(screen.h-2, 1)}
+
+	layoutStr := "Contiguous"
+	if st.Interleaved {
+		layoutStr = "Interleaved"
+	}
+	protoName := a.Modal.PixelProtocol.String()
+	startAddr := a.BaseAddr + st.BPL[0]
+
+	inner := buf.drawBox(area, "", t.Border, t.BG)
+	if inner.w <= 0 || inner.h <= 0 {
+		return
+	}
+
+	var titleSpans []styledSpan
+	titleSpans = append(titleSpans, styledSpan{text: " Bitplanes ", style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: "── ", style: t.Border})
+	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%s (+%05X) ", a.FormatAddr(startAddr), st.BPL[0]), style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: "│ ", style: t.Border})
+	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%d×%d×%d (%d col) ", st.WidthPx(), st.Height, st.Planes, 1<<st.Planes), style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: "│ ", style: t.Border})
+	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("Scale: %dx (%d×%d px) ", st.Scale, st.WidthPx()*st.Scale, st.Height*st.Scale), style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: "│ ", style: t.Border})
+	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%s ", layoutStr), style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: "│ ", style: t.Border})
+	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("Mod: %+d ", st.Modulo), style: t.BarAccent})
+	titleSpans = append(titleSpans, styledSpan{text: "│ ", style: t.Border})
+	titleSpans = append(titleSpans, styledSpan{text: fmt.Sprintf("%s ", protoName), style: t.BarAccent})
+
+	curX := area.x + 1
+	for _, sp := range titleSpans {
+		if curX >= area.x+area.w-1 {
+			break
+		}
+		rem := (area.x + area.w - 1) - curX
+		n := buf.putString(curX, area.y, rem, sp.text, sp.style)
+		curX += n
+	}
+
+	// Line 0 of inner: Control Selection Group (Affected by pointer/width adjustments)
+	var ctrlSpans []styledSpan
+	ctrlSpans = append(ctrlSpans, styledSpan{text: " Ctrl [1-6]: ", style: t.BarAccent})
+	for p := 0; p < st.Planes; p++ {
+		if (st.ControlMask & (1 << p)) != 0 {
+			ctrlSpans = append(ctrlSpans, styledSpan{
+				text:  fmt.Sprintf("[%d:+$%05X]* ", p+1, st.BPL[p]),
+				style: t.BarAccent,
+			})
+		} else {
+			ctrlSpans = append(ctrlSpans, styledSpan{
+				text:  fmt.Sprintf("(%d:+$%05X)  ", p+1, st.BPL[p]),
+				style: t.Border,
+			})
+		}
+	}
+	var activeCtrl []string
+	for p := 0; p < st.Planes; p++ {
+		if (st.ControlMask & (1 << p)) != 0 {
+			activeCtrl = append(activeCtrl, fmt.Sprintf("%d", p+1))
+		}
+	}
+	ctrlSummary := "None"
+	if len(activeCtrl) == st.Planes {
+		ctrlSummary = "All synced"
+	} else if len(activeCtrl) > 0 {
+		ctrlSummary = fmt.Sprintf("Synced: %s", strings.Join(activeCtrl, ","))
+	}
+	ctrlSpans = append(ctrlSpans, styledSpan{text: fmt.Sprintf("│ %s", ctrlSummary), style: t.Flow})
+	buf.putSpansRow(inner.x, inner.y, inner.w, ctrlSpans, t.BG.bg, nil)
+
+	// Line 1 of inner: Visible Bitmaps Group & Palette (Active visible bitmaps forming the image)
+	var visSpans []styledSpan
+	visSpans = append(visSpans, styledSpan{text: " Vis  [!-^]: ", style: t.BarAccent})
+	for p := 0; p < st.Planes; p++ {
+		if (st.VisibleMask & (1 << p)) != 0 {
+			visSpans = append(visSpans, styledSpan{
+				text:  fmt.Sprintf("[● %d] ", p+1),
+				style: t.BarAccent,
+			})
+		} else {
+			visSpans = append(visSpans, styledSpan{
+				text:  fmt.Sprintf("[○ %d] ", p+1),
+				style: t.Border,
+			})
+		}
+	}
+	var activeVis []string
+	for p := 0; p < st.Planes; p++ {
+		if (st.VisibleMask & (1 << p)) != 0 {
+			activeVis = append(activeVis, fmt.Sprintf("%d", p+1))
+		}
+	}
+	visSummary := "None"
+	if len(activeVis) == st.Planes {
+		visSummary = "All visible"
+	} else if len(activeVis) > 0 {
+		visSummary = fmt.Sprintf("Visible: %s", strings.Join(activeVis, ","))
+	}
+	visSpans = append(visSpans, styledSpan{text: fmt.Sprintf("│ %s ", visSummary), style: t.Flow})
+
+	palName := "Grayscale"
+	switch st.PaletteMode {
+	case PaletteHighContrast:
+		palName = "High-Contrast"
+	case PaletteCustom:
+		if st.CustomPalName != "" {
+			palName = st.CustomPalName
+		} else {
+			palName = "Custom"
+		}
+	}
+	visSpans = append(visSpans, styledSpan{text: fmt.Sprintf("│ Pal: %s ", palName), style: t.Bar})
+	pal := st.BuildDefaultPalette()
+	swatchCount := min(1<<st.Planes, 8)
+	for i := 0; i < swatchCount; i++ {
+		c := pal[i]
+		stFG := fmt.Sprintf("38;2;%d;%d;%d", c.R, c.G, c.B)
+		stBG := t.BG.bg
+		visSpans = append(visSpans, styledSpan{
+			text:  "█",
+			style: cellStyle{fg: stFG, bg: stBG},
+		})
+	}
+	buf.putSpansRow(inner.x, inner.y+1, inner.w, visSpans, t.BG.bg, nil)
+
+	// Line 2 of inner: Divider
+	if inner.h > 2 {
+		sepStyle := cellStyle{fg: t.Border.fg, bg: t.BG.bg}
+		for x := inner.x; x < inner.x+inner.w; x++ {
+			buf.setCell(x, inner.y+2, '─', 1, sepStyle)
+		}
+	}
+
+	// Canvas rows: inner.y+3 .. inner.y+inner.h-1
+	canvasH := inner.h - 3
+	if canvasH <= 0 {
+		return
+	}
+
+	if a.Modal.PixelProtocol == ProtocolHalfBlock {
+		// Half-block ▀ fallback rendering into screenBuffer
+		halfBlockPxH := canvasH * 2
+		img := st.DecodeImage(a.BinaryData, inner.w, halfBlockPxH)
+		for cy := 0; cy < canvasH; cy++ {
+			screenY := inner.y + 3 + cy
+			for cx := 0; cx < inner.w; cx++ {
+				topC := img.RGBAAt(cx, cy*2)
+				botC := img.RGBAAt(cx, cy*2+1)
+				topSGR := fmt.Sprintf("38;2;%d;%d;%d", topC.R, topC.G, topC.B)
+				botSGR := fmt.Sprintf("48;2;%d;%d;%d", botC.R, botC.G, botC.B)
+				buf.setCell(inner.x+cx, screenY, '▀', 1, cellStyle{
+					fg: topSGR,
+					bg: botSGR,
+				})
+			}
+		}
+	} else {
+		// In true pixel graphics mode (Kitty, Sixel, iTerm2), keep the canvas area
+		// completely clear (empty spaces with background) so that the terminal graphics
+		// overlay is never overwritten by character cells.
+		for cy := 0; cy < canvasH; cy++ {
+			screenY := inner.y + 3 + cy
+			for cx := 0; cx < inner.w; cx++ {
+				buf.setCell(inner.x+cx, screenY, ' ', 1, t.BG)
+			}
 		}
 	}
 }

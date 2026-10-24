@@ -2,6 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"image/png"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -291,3 +294,165 @@ func (a *App) CycleOperandFormat() {
 	a.Proj.SyncDBScope(a.DB)
 	a.ReloadAtCursor()
 }
+
+// CalculateBitplaneScale calculates the optimal integer scale factor (1x..8x)
+// to fit the native Amiga bitmap inside the terminal canvas using exact pixel resolution.
+func (a *App) CalculateBitplaneScale(srcW, srcH int) int {
+	if srcW <= 0 {
+		srcW = 320
+	}
+	if srcH <= 0 {
+		srcH = 200
+	}
+
+	if a.PixelWidth > 0 && a.PixelHeight > 0 && a.Width > 0 && a.Height > 0 {
+		cellW := a.CellWidth
+		if cellW <= 0 {
+			cellW = a.PixelWidth / a.Width
+		}
+		cellH := a.CellHeight
+		if cellH <= 0 {
+			cellH = a.PixelHeight / a.Height
+		}
+
+		canvasCols := max(a.Width-2, 10)
+		canvasRows := max(a.Height-6, 5)
+
+		canvasPxW := canvasCols * cellW
+		canvasPxH := canvasRows * cellH
+
+		scaleW := canvasPxW / srcW
+		scaleH := canvasPxH / srcH
+		scale := min(scaleW, scaleH)
+		if scale < 1 {
+			scale = 1
+		}
+		if scale > 8 {
+			scale = 8
+		}
+		return scale
+	}
+
+	return DetectOptimalScale(srcW, srcH)
+}
+
+// OpenBitplaneViewer initializes and launches the bitplane image viewer modal
+// at the current cursor address.
+func (a *App) OpenBitplaneViewer() {
+	a.UpdateTermPixelSize()
+
+	addr := a.BaseAddr
+	if cur, ok := a.CursorAddr(); ok {
+		addr = cur
+	}
+	var baseOff uint32
+	if addr >= a.BaseAddr {
+		baseOff = addr - a.BaseAddr
+	}
+	st := NewBitplaneState(baseOff)
+	proto := DetectProtocol()
+
+	// Scale to fit the terminal window canvas using exact pixel measurements
+	st.Scale = a.CalculateBitplaneScale(st.WidthPx(), st.Height)
+
+	st.UpdateCache(a.BinaryData, 2, 5, proto)
+
+	a.Modal = Modal{
+		Kind:          ModalBitplane,
+		Bitplane:      st,
+		PixelProtocol: proto,
+	}
+}
+
+func (a *App) refreshBitplaneCache() {
+	if a.Modal.Kind != ModalBitplane || a.Modal.Bitplane == nil {
+		return
+	}
+	st := a.Modal.Bitplane
+	// Row 6: Line 1 (bar) + Area top border (Line 2) + Line 0 (Line 3) + Line 1 (Line 4) + Divider (Line 5) -> Canvas starts at Line 6
+	st.UpdateCache(a.BinaryData, 2, 6, a.Modal.PixelProtocol)
+}
+
+// SaveBitplanePNG saves the full bitmap to assets/<seg>_<addr>_<W>x<H>x<D>.png.
+func (a *App) SaveBitplanePNG() {
+	st := a.Modal.Bitplane
+	if st == nil {
+		return
+	}
+	oldScale := st.Scale
+	st.Scale = 1
+	img := st.DecodeImage(a.BinaryData, st.WidthPx(), st.Height)
+	st.Scale = oldScale
+
+	dir := "assets"
+	_ = os.MkdirAll(dir, 0755)
+
+	segName := "seg"
+	if a.Proj != nil && a.Proj.CurrentSegment() != nil {
+		segName = a.Proj.CurrentSegment().Name
+	}
+	filename := fmt.Sprintf("%s_%05X_%dx%dx%d.png", segName, st.BPL[0], st.WidthPx(), st.Height, st.Planes)
+	outPath := filepath.Join(dir, filename)
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		a.StatusMsg = fmt.Sprintf("PNG write error: %v", err)
+		return
+	}
+	defer f.Close()
+
+	if err := png.Encode(f, img); err != nil {
+		a.StatusMsg = fmt.Sprintf("PNG encode error: %v", err)
+		return
+	}
+	a.StatusMsg = fmt.Sprintf("Saved PNG: %s", outPath)
+}
+
+// SaveBitplaneIFF saves the bitmap to assets/<seg>_<addr>_<W>x<H>x<D>.ilbm.
+func (a *App) SaveBitplaneIFF() {
+	st := a.Modal.Bitplane
+	if st == nil {
+		return
+	}
+	iffBytes, err := EncodeIFFILBM(st, a.BinaryData)
+	if err != nil {
+		a.StatusMsg = fmt.Sprintf("IFF encode error: %v", err)
+		return
+	}
+
+	dir := "assets"
+	_ = os.MkdirAll(dir, 0755)
+
+	segName := "seg"
+	if a.Proj != nil && a.Proj.CurrentSegment() != nil {
+		segName = a.Proj.CurrentSegment().Name
+	}
+	filename := fmt.Sprintf("%s_%05X_%dx%dx%d.ilbm", segName, st.BPL[0], st.WidthPx(), st.Height, st.Planes)
+	outPath := filepath.Join(dir, filename)
+
+	if err := os.WriteFile(outPath, iffBytes, 0644); err != nil {
+		a.StatusMsg = fmt.Sprintf("IFF write error: %v", err)
+		return
+	}
+	a.StatusMsg = fmt.Sprintf("Saved IFF ILBM: %s", outPath)
+}
+
+// CarveBitplaneRange carves the memory region spanned by the current bitplanes.
+func (a *App) CarveBitplaneRange() {
+	st := a.Modal.Bitplane
+	if st == nil {
+		return
+	}
+	startOff, endOff := st.ByteSpan()
+	startAddr := a.BaseAddr + startOff
+	length := endOff - startOff
+	if length == 0 {
+		return
+	}
+
+	label := fmt.Sprintf("gfx_%dx%dx%d", st.WidthPx(), st.Height, st.Planes)
+	_ = a.DB.DeleteCellsInRange(startAddr, startAddr+length)
+	_ = a.DB.SetLabel(startAddr, label, db.LabelDat, true)
+	a.StatusMsg = fmt.Sprintf("Carved bitplane range +$%05X..+$%05X (%s)", startOff, endOff, label)
+}
+

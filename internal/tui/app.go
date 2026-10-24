@@ -2,11 +2,13 @@ package tui
 
 import (
 	"fmt"
+	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mikolas/hunks/internal/db"
 	"github.com/mikolas/hunks/internal/m68k"
 	"github.com/mikolas/hunks/internal/project"
+	"golang.org/x/sys/unix"
 )
 
 // App holds the full interactive TUI state and implements tea.Model.
@@ -31,6 +33,10 @@ type App struct {
 	Width           int
 	Height          int
 	LastWidth       int
+	PixelWidth      int
+	PixelHeight     int
+	CellWidth       int
+	CellHeight      int
 	activeDBPath    string
 	ownsDB          bool
 }
@@ -113,6 +119,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		a.Width = m.Width
 		a.Height = m.Height
+		a.UpdateTermPixelSize()
+		if a.Modal.Kind == ModalBitplane && a.Modal.Bitplane != nil {
+			a.refreshBitplaneCache()
+		}
 		if max(a.Width, 80) != a.LastWidth {
 			anchorAddr, ok := a.CursorAddr()
 			_ = a.LoadData()
@@ -345,4 +355,19 @@ func (a *App) GetStatusLine() string {
 		padOrTruncate(sizePart, 16),
 		padOrTruncate(timing.String(), 19),
 		pct)
+}
+
+// UpdateTermPixelSize queries the kernel via TIOCGWINSZ ioctl for the exact
+// terminal window pixel dimensions (ws_xpixel, ws_ypixel) supported by Kitty.
+func (a *App) UpdateTermPixelSize() {
+	if ws, err := unix.IoctlGetWinsize(int(os.Stdout.Fd()), unix.TIOCGWINSZ); err == nil && ws.Xpixel > 0 && ws.Ypixel > 0 {
+		a.PixelWidth = int(ws.Xpixel)
+		a.PixelHeight = int(ws.Ypixel)
+		if a.Width > 0 {
+			a.CellWidth = a.PixelWidth / a.Width
+		}
+		if a.Height > 0 {
+			a.CellHeight = a.PixelHeight / a.Height
+		}
+	}
 }

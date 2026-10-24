@@ -808,3 +808,150 @@ func TestThemeLoadAndTokenization(t *testing.T) {
 	}
 }
 
+func TestBitplaneViewerInteractive(t *testing.T) {
+	tmpDir := t.TempDir()
+	proj := project.New(filepath.Join(tmpDir, "project.json"))
+	proj.Data.Segments = append(proj.Data.Segments, project.Segment{
+		Name:        "seg0",
+		AllocSize:   4096,
+		Base:        0x1000,
+		Relocatable: false,
+	})
+	proj.ActiveSegmentName = "seg0"
+
+	dbCtrl, err := db.New(filepath.Join(tmpDir, "project.db"))
+	if err != nil {
+		t.Fatalf("failed to create db: %v", err)
+	}
+	defer dbCtrl.Close()
+	proj.SyncDBScope(dbCtrl)
+
+	app, err := NewApp(proj, dbCtrl)
+	if err != nil {
+		t.Fatalf("failed to create app: %v", err)
+	}
+	app.Width = 100
+	app.Height = 30
+	app.BaseAddr = 0x1000
+	app.BinaryData = make([]byte, 4096)
+	for i := 0; i < 4096; i++ {
+		app.BinaryData[i] = byte(i)
+	}
+
+	// 1. Press B to open bitplane viewer
+	app.HandleKey("B")
+	if app.Modal.Kind != ModalBitplane {
+		t.Fatalf("expected ModalBitplane, got %v", app.Modal.Kind)
+	}
+	st := app.Modal.Bitplane
+	if st == nil {
+		t.Fatalf("expected Bitplane state to be non-nil")
+	}
+	if st.Planes != 1 {
+		t.Fatalf("expected initial Planes 1, got %d", st.Planes)
+	}
+	if st.Scale < 1 {
+		t.Fatalf("expected initial Scale >= 1, got %d", st.Scale)
+	}
+	if st.CachedEscapeSeq == "" && app.Modal.PixelProtocol != ProtocolHalfBlock {
+		t.Fatalf("expected CachedEscapeSeq to be populated")
+	}
+
+	// 2. Render UI and verify output contains Bitplanes title, both indicator groups, and CachedEscapeSeq
+	out := RenderUI(app)
+	plain := stripANSI(out)
+	if !strings.Contains(plain, "Bitplanes") {
+		t.Fatalf("expected Bitplanes in rendered output: %q", plain)
+	}
+	if !strings.Contains(plain, "Ctrl [1-6]:") {
+		t.Fatalf("expected Ctrl [1-6]: indicator group in rendered output: %q", plain)
+	}
+	if !strings.Contains(plain, "Vis  [!-^]:") {
+		t.Fatalf("expected Vis  [!-^]: indicator group in rendered output: %q", plain)
+	}
+	if app.Modal.PixelProtocol != ProtocolHalfBlock && !strings.Contains(out, "\x1b7") {
+		t.Fatalf("expected DEC cursor save in rendered output")
+	}
+
+	// 3. Adjust geometry: increase width (+1 word = +16 px = +2 bytes)
+	origBytes := st.RowBytes
+	app.HandleKey("right")
+	if st.RowBytes != origBytes+2 {
+		t.Fatalf("expected RowBytes %d, got %d", origBytes+2, st.RowBytes)
+	}
+
+	// 4. Adjust planes: increase to 2 planes
+	app.HandleKey("+")
+	if st.Planes != 2 {
+		t.Fatalf("expected Planes 2, got %d", st.Planes)
+	}
+
+	// 5. Plane control selection and visibility groups
+	// Toggle plane 1 out of control selection
+	app.HandleKey("1")
+	if (st.ControlMask & 1) != 0 {
+		t.Fatalf("expected plane 1 to be unarmed from control selection")
+	}
+	if (st.ControlMask & 2) == 0 {
+		t.Fatalf("expected plane 2 to remain armed in control selection")
+	}
+	bpl0 := st.BPL[0]
+	bpl1 := st.BPL[1]
+	app.HandleKey(".") // Step control-selected planes by +2
+	if st.BPL[0] != bpl0 {
+		t.Fatalf("unarmed plane 1 should not move: got %d vs %d", st.BPL[0], bpl0)
+	}
+	if st.BPL[1] != bpl1+2 {
+		t.Fatalf("armed plane 2 should advance: got %d vs %d", st.BPL[1], bpl1+2)
+	}
+
+	// Toggle plane 1 visibility off
+	app.HandleKey("!")
+	if (st.VisibleMask & 1) != 0 {
+		t.Fatalf("expected plane 1 to be hidden in visible selection")
+	}
+	// Re-enable all visible planes
+	app.HandleKey(")")
+	if st.VisibleMask != 0x03 {
+		t.Fatalf("expected all planes visible after ')', got %d", st.VisibleMask)
+	}
+
+	// Re-arm all planes in control selection
+	app.HandleKey("0")
+	if st.ControlMask != 0x03 {
+		t.Fatalf("expected all planes armed after '0', got %d", st.ControlMask)
+	}
+
+	// 6. Direct Geometry Input prompt
+	app.HandleKey("g")
+	if app.Modal.Kind != ModalBitplaneGeometry {
+		t.Fatalf("expected ModalBitplaneGeometry, got %v", app.Modal.Kind)
+	}
+	// Type 640x256x4 and press enter
+	app.Modal.Input = NewTextInput("640x256x4")
+	app.HandleKey("enter")
+	if app.Modal.Kind != ModalBitplane {
+		t.Fatalf("expected return to ModalBitplane, got %v", app.Modal.Kind)
+	}
+	if st.WidthPx() != 640 || st.Height != 256 || st.Planes != 4 {
+		t.Fatalf("expected 640x256x4, got %dx%dx%d", st.WidthPx(), st.Height, st.Planes)
+	}
+
+	// 7. Save PNG and IFF
+	t.Cleanup(func() { _ = os.RemoveAll("assets") })
+	app.HandleKey("w")
+	if !strings.Contains(app.StatusMsg, "Saved PNG") {
+		t.Fatalf("expected Saved PNG status msg, got %q", app.StatusMsg)
+	}
+	app.HandleKey("W")
+	if !strings.Contains(app.StatusMsg, "Saved IFF") {
+		t.Fatalf("expected Saved IFF status msg, got %q", app.StatusMsg)
+	}
+
+	// 8. Exit bitplane viewer with esc
+	app.HandleKey("esc")
+	if app.Modal.Kind != ModalNone {
+		t.Fatalf("expected ModalNone after esc, got %v", app.Modal.Kind)
+	}
+}
+
