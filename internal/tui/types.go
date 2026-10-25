@@ -7,7 +7,6 @@ import (
 	"github.com/mikolas/hunks/internal/db"
 	"github.com/mikolas/hunks/internal/m68k"
 	"github.com/mikolas/hunks/internal/modules"
-	"github.com/mikolas/hunks/internal/project"
 )
 
 // SubRowKind identifies the visual sub-row category in the TUI listing engine.
@@ -317,7 +316,6 @@ type UndoEntry struct {
 	Addr         uint32
 	OldStr       *string
 	Key          string
-	OldCarves    []project.Carve
 	OldLabels    []db.Label
 	DeletedLabel bool
 }

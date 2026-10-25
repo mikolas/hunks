@@ -269,14 +269,22 @@ func (a *App) MarkSelection(cellType db.CellType, unitSize uint32) {
 	}
 	count := (end-start)/unitSize + 1
 	size := count * unitSize
-	a.pushUndoForRegion(start, size)
-	if cellType == db.CellStr {
-		_ = a.DB.MarkData(start, size, db.CellStr)
-	} else {
-		for i := range count {
-			_ = a.DB.MarkData(start+i*unitSize, unitSize, cellType)
-		}
+	if a.rangeOverlapsIncbin(start, size) {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
 	}
+	a.pushUndoForRegion(start, size)
+	_ = a.DB.WithTransaction(func() error {
+		if cellType == db.CellStr {
+			return a.DB.MarkData(start, size, db.CellStr)
+		}
+		for i := range count {
+			if err := a.DB.MarkData(start+i*unitSize, unitSize, cellType); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	a.SelectionStart = nil
 	a.ReloadAtCursor()
 	a.StatusMsg = fmt.Sprintf("Marked %d bytes as %s at %s", size, cellType.AsStr(), a.FormatAddr(start))

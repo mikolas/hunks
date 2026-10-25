@@ -1788,17 +1788,21 @@ func main() {
 			segBytes := seg.LoadBinaryData()
 			off := int(startVal - seg.Base)
 			endOff := int(endVal - seg.Base)
-			if endOff > len(segBytes) {
+			if off < 0 || endOff > len(segBytes) {
 				return fmt.Errorf("carve range exceeds segment payload")
 			}
-			raw := slices.Clone(segBytes[off:endOff])
 
 			label := carveName
+			isAuto := false
 			if label == "" {
 				label = proj.AutoLabel(startVal)
+				isAuto = true
 			}
 			sidecar := carveFile
-			if sidecar == "" {
+			var opStr *string
+			if sidecar != "" {
+				opStr = &sidecar
+			} else {
 				sidecar = fmt.Sprintf("assets/%s.bin", label)
 			}
 
@@ -1815,27 +1819,15 @@ func main() {
 					Size:       endVal - startVal,
 					Type:       db.CellIncbin,
 					Confidence: 255,
-					RawBytes:   raw,
+					OpStr:      opStr,
 				}); err != nil {
 					return err
 				}
-				return ctrl.SetLabel(startVal, label, db.LabelDat, false)
+				return ctrl.SetLabel(startVal, label, db.LabelDat, isAuto)
 			}); err != nil {
 				return err
 			}
 
-			proj.Data.Carves = slices.DeleteFunc(proj.Data.Carves, func(c project.Carve) bool {
-				return c.Start == startVal
-			})
-			proj.Data.Carves = append(proj.Data.Carves, project.Carve{
-				Start: startVal,
-				End:   endVal,
-				File:  sidecar,
-				Name:  label,
-			})
-			if err := proj.Save(); err != nil {
-				return err
-			}
 			fmt.Printf("Carved [%#X..%#X] (%d bytes) in '%s' -> %s (label %s)\n",
 				startVal, endVal, endVal-startVal, seg.Name, sidecar, label)
 			return nil
@@ -1862,17 +1854,6 @@ func main() {
 			if err != nil {
 				return err
 			}
-			var foundCarve *project.Carve
-			for i := range proj.Data.Carves {
-				if proj.Data.Carves[i].Start == startVal {
-					foundCarve = &proj.Data.Carves[i]
-					break
-				}
-			}
-			if foundCarve == nil {
-				return fmt.Errorf("no carve starts at $%X", startVal)
-			}
-			carve := *foundCarve
 			seg := proj.SegmentAtAddr(startVal)
 			if seg == nil {
 				return fmt.Errorf("no segment owns address $%X", startVal)
@@ -1884,17 +1865,24 @@ func main() {
 			defer ctrl.Close()
 			proj.ActiveSegmentName = seg.Name
 			proj.SyncDBScope(ctrl)
-			if err := ctrl.DeleteCellsInRange(carve.Start, carve.End); err != nil {
-				return err
+			cell, err := ctrl.GetCell(startVal)
+			if err != nil || cell == nil || cell.Type != db.CellIncbin || cell.Size == 0 {
+				return fmt.Errorf("no carve starts at $%X", startVal)
 			}
-			proj.Data.Carves = slices.DeleteFunc(proj.Data.Carves, func(c project.Carve) bool {
-				return c.Start == startVal
-			})
-			if err := proj.Save(); err != nil {
+			carveEnd := cell.Addr + cell.Size
+			if err := ctrl.WithTransaction(func() error {
+				if err := ctrl.DeleteCellsInRange(cell.Addr, carveEnd); err != nil {
+					return err
+				}
+				if err := ctrl.DeleteLabelAt(cell.Addr); err != nil {
+					return err
+				}
+				return ctrl.UpdateBlockComment(cell.Addr, "")
+			}); err != nil {
 				return err
 			}
 			fmt.Printf("Uncarved [%#X..%#X] in '%s'. Run `hunks analyze` to reclassify the range.\n",
-				carve.Start, carve.End, seg.Name)
+				cell.Addr, carveEnd, seg.Name)
 			return nil
 		},
 	}

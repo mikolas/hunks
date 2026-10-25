@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -246,17 +245,40 @@ func TestTUICarveGuardAndRoundtrip(t *testing.T) {
 
 	app.CarveRange(0x2002, 0x2005, "FlatBlob", "Header description\nLine 2")
 	cell, err := app.DB.GetCell(0x2002)
-	if err != nil || cell == nil || cell.Type != db.CellIncbin || cell.Size != 4 || !bytes.Equal(cell.RawBytes, []byte{0x33, 0x44, 0x55, 0x66}) {
+	if err != nil || cell == nil || cell.Type != db.CellIncbin || cell.Size != 4 {
 		t.Fatalf("unexpected carved cell: %+v", cell)
-	}
-	if len(app.Proj.Data.Carves) != 1 || app.Proj.Data.Carves[0].File != "assets/FlatBlob.bin" {
-		t.Fatalf("unexpected project carves: %+v", app.Proj.Data.Carves)
 	}
 	if lbl, ok, _ := app.DB.GetLabel(0x2002); !ok || lbl != "FlatBlob" {
 		t.Fatalf("expected label 'FlatBlob', got %q", lbl)
 	}
 	if bc := app.DB.GetAddressComment(0x2002).BlockComment; bc != "Header description\nLine 2" {
 		t.Fatalf("expected block comment, got %q", bc)
+	}
+
+	// Pressing 'w' or 'l' on a folded incbin must be refused without destroying the incbin.
+	app.GotoAddress(0x2002)
+	app.HandleKey("w")
+	if !strings.Contains(app.StatusMsg, "Folded incbin") {
+		t.Fatalf("expected Folded incbin refusal on 'w', got %q", app.StatusMsg)
+	}
+	if cCheck, _ := app.DB.GetCell(0x2002); cCheck == nil || cCheck.Type != db.CellIncbin {
+		t.Fatalf("expected CellIncbin intact after refused 'w', got %+v", cCheck)
+	}
+
+	// Pressing 'b' on a folded incbin unfolds it back into bytes (deletes the CellIncbin), and Ctrl+Z folds it back.
+	app.HandleKey("b")
+	if cAfterB, _ := app.DB.GetCell(0x2002); cAfterB != nil && cAfterB.Type == db.CellIncbin {
+		t.Fatalf("expected CellIncbin unfolded after 'b', got %+v", cAfterB)
+	}
+	// Pressing 'K' on the now-unfolded dc.b data row must refuse ("No carve at cursor") and not crash.
+	app.HandleKey("K")
+	if app.StatusMsg != "No carve at cursor" {
+		t.Fatalf("expected 'No carve at cursor' when pressing K on dc.b row, got %q", app.StatusMsg)
+	}
+	// Undo the 'b' unfold -> restores CellIncbin
+	app.Undo()
+	if cRestoredB, _ := app.DB.GetCell(0x2002); cRestoredB == nil || cRestoredB.Type != db.CellIncbin {
+		t.Fatalf("expected CellIncbin restored after undoing 'b' unfold, got %+v", cRestoredB)
 	}
 
 	// TUI reload must NOT write the incbin sidecar to disk.
@@ -280,9 +302,6 @@ func TestTUICarveGuardAndRoundtrip(t *testing.T) {
 	if remnant, _ := app.DB.GetCell(0x2001); remnant != nil {
 		t.Fatalf("expected no remnant cell at 0x2001 after undo, got %+v", remnant)
 	}
-	if len(app.Proj.Data.Carves) != 0 {
-		t.Fatalf("expected Carves restored to empty after undo, got %+v", app.Proj.Data.Carves)
-	}
 	if lbl, ok, _ := app.DB.GetLabel(0x2002); ok && lbl != "" {
 		t.Fatalf("expected label gone after undoing carve, got %q", lbl)
 	}
@@ -293,15 +312,15 @@ func TestTUICarveGuardAndRoundtrip(t *testing.T) {
 	// Re-carve to test overlapping re-carve (0x2000..0x2005 replacing 0x2002..0x2005) and its undo
 	app.CarveRange(0x2002, 0x2005, "FlatBlob", "Header description\nLine 2")
 	app.CarveRange(0x2000, 0x2005, "WiderBlob", "Wider header")
-	if len(app.Proj.Data.Carves) != 1 || app.Proj.Data.Carves[0].Start != 0x2000 || app.Proj.Data.Carves[0].Name != "WiderBlob" {
-		t.Fatalf("expected single replaced carve at 0x2000, got %+v", app.Proj.Data.Carves)
+	if wider, _ := app.DB.GetCell(0x2000); wider == nil || wider.Type != db.CellIncbin || wider.Size != 6 {
+		t.Fatalf("expected single replaced CellIncbin at 0x2000, got %+v", wider)
 	}
 	if lbl, ok, _ := app.DB.GetLabel(0x2002); ok && lbl != "" {
 		t.Fatalf("expected interior overlapped label at 0x2002 cleaned up, got %q", lbl)
 	}
 	app.Undo()
-	if len(app.Proj.Data.Carves) != 1 || app.Proj.Data.Carves[0].Start != 0x2002 || app.Proj.Data.Carves[0].Name != "FlatBlob" {
-		t.Fatalf("expected previous carve at 0x2002 restored after undo, got %+v", app.Proj.Data.Carves)
+	if prev, _ := app.DB.GetCell(0x2002); prev == nil || prev.Type != db.CellIncbin || prev.Size != 4 {
+		t.Fatalf("expected previous CellIncbin at 0x2002 restored after undo, got %+v", prev)
 	}
 	if lbl, ok, _ := app.DB.GetLabel(0x2002); !ok || lbl != "FlatBlob" {
 		t.Fatalf("expected label 'FlatBlob' at 0x2002 restored after undo, got %q", lbl)
@@ -311,9 +330,6 @@ func TestTUICarveGuardAndRoundtrip(t *testing.T) {
 	after, _ := app.DB.GetCell(0x2002)
 	if after != nil && after.Type == db.CellIncbin {
 		t.Fatalf("INCBIN cell must be gone after uncarve")
-	}
-	if len(app.Proj.Data.Carves) != 0 {
-		t.Fatalf("expected carves empty after uncarve")
 	}
 	if lbl, ok, _ := app.DB.GetLabel(0x2002); ok && lbl != "" {
 		t.Fatalf("expected label gone after uncarve, got %q", lbl)
@@ -327,9 +343,6 @@ func TestTUICarveGuardAndRoundtrip(t *testing.T) {
 	cellReRestored, _ := app.DB.GetCell(0x2002)
 	if cellReRestored == nil || cellReRestored.Type != db.CellIncbin {
 		t.Fatalf("expected CellIncbin restored after undoing uncarve")
-	}
-	if len(app.Proj.Data.Carves) != 1 || app.Proj.Data.Carves[0].Name != "FlatBlob" {
-		t.Fatalf("expected Carves restored after undoing uncarve, got %+v", app.Proj.Data.Carves)
 	}
 	if lbl, ok, _ := app.DB.GetLabel(0x2002); !ok || lbl != "FlatBlob" {
 		t.Fatalf("expected label 'FlatBlob' restored after undoing uncarve, got %q", lbl)
@@ -368,7 +381,7 @@ func TestTUICarveGuardAndRoundtrip(t *testing.T) {
 	app2.BinaryData = make([]byte, 8)
 	_ = app2.LoadData()
 	app2.CarveRange(0x3000, 0x3005, "ShouldRefuse", "")
-	if len(app2.Proj.Data.Carves) != 0 {
+	if refused, _ := app2.DB.GetCell(0x3000); refused != nil && refused.Type == db.CellIncbin {
 		t.Fatalf("carve over interior reloc must be refused")
 	}
 }
@@ -1207,9 +1220,6 @@ func TestMusicRipperModalAndCarve(t *testing.T) {
 	if cur, ok := app.CursorAddr(); !ok || cur != uint32(0x10000+modOffset) {
 		t.Fatalf("expected cursor to jump to carved start 0x%X, got 0x%X (ok=%v)", 0x10000+modOffset, cur, ok)
 	}
-	if len(app.Proj.Data.Carves) != 1 {
-		t.Fatalf("expected 1 project carve, got %+v", app.Proj.Data.Carves)
-	}
 	cell, err := app.DB.GetCell(uint32(0x10000 + modOffset))
 	if err != nil || cell == nil || cell.Type != db.CellIncbin {
 		t.Fatalf("expected CellIncbin at carve start, got %+v", cell)
@@ -1221,9 +1231,6 @@ func TestMusicRipperModalAndCarve(t *testing.T) {
 
 	// 5. Undo carve with 'ctrl+z'
 	app.HandleKey("ctrl+z")
-	if len(app.Proj.Data.Carves) != 0 {
-		t.Fatalf("expected carves empty after undo, got %+v", app.Proj.Data.Carves)
-	}
 	cellAfter, _ := app.DB.GetCell(uint32(0x10000 + modOffset))
 	if cellAfter != nil && cellAfter.Type == db.CellIncbin {
 		t.Fatalf("expected CellIncbin gone after undo")

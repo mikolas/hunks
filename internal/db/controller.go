@@ -1861,14 +1861,15 @@ func (c *Controller) ClearOverlaps(addr, size uint32) error {
 	end := addr + size
 
 	type partialCell struct {
-		addr uint32
-		size uint32
-		raw  []byte
-		conf uint8
+		addr    uint32
+		size    uint32
+		typeStr string
+		raw     []byte
+		conf    uint8
 	}
 	var partials []partialCell
 	rows, err := c.conn.Query(
-		"SELECT addr, size, raw_bytes, confidence FROM cells WHERE seg = ?1 AND addr < ?3 AND addr + size > ?2",
+		"SELECT addr, size, type, raw_bytes, confidence FROM cells WHERE seg = ?1 AND addr < ?3 AND addr + size > ?2",
 		seg, addr, end,
 	)
 	if err != nil {
@@ -1876,7 +1877,7 @@ func (c *Controller) ClearOverlaps(addr, size uint32) error {
 	}
 	for rows.Next() {
 		var p partialCell
-		if err := rows.Scan(&p.addr, &p.size, &p.raw, &p.conf); err != nil {
+		if err := rows.Scan(&p.addr, &p.size, &p.typeStr, &p.raw, &p.conf); err != nil {
 			_ = rows.Close()
 			return err
 		}
@@ -1901,11 +1902,14 @@ func (c *Controller) ClearOverlaps(addr, size uint32) error {
 		return err
 	}
 
-	// Remnant head/tail bytes are reinserted as individual DATA_B cells (one per byte) to
-	// preserve exact emission/label boundaries. ClearOverlaps is called both standalone
-	// (TUI) and inside an outer transaction (stage2, CLI pointer hints), so it must not open
-	// its own transaction here — doing so would nest BEGIN on the single SQLite connection.
+	// For small cells (<= 16 bytes, non-INCBIN), remnant head/tail bytes are reinserted as
+	// individual DATA_B cells to preserve exact emission/label boundaries. Large cells
+	// (INCBIN, multi-KB DATA_ZERO, long STRING) are never shattered into thousands of 1-byte
+	// rows; their unmapped remnants fall through naturally to BinaryData.
 	for _, p := range partials {
+		if p.typeStr == CellIncbin.AsStr() || p.size > 16 {
+			continue
+		}
 		cEnd := p.addr + p.size
 		if p.addr < addr {
 			for bAddr := p.addr; bAddr < addr; bAddr++ {

@@ -5,13 +5,11 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/mikolas/hunks/internal/analyzer"
 	"github.com/mikolas/hunks/internal/db"
 	"github.com/mikolas/hunks/internal/modules"
-	"github.com/mikolas/hunks/internal/project"
 )
 
 func (a *App) pushUndo(entry UndoEntry) {
@@ -19,16 +17,6 @@ func (a *App) pushUndo(entry UndoEntry) {
 	if len(a.UndoStack) > 50 {
 		a.UndoStack = a.UndoStack[1:]
 	}
-}
-
-func (a *App) snapshotCarves() []project.Carve {
-	if a.Proj == nil {
-		return nil
-	}
-	if len(a.Proj.Data.Carves) == 0 {
-		return []project.Carve{}
-	}
-	return slices.Clone(a.Proj.Data.Carves)
 }
 
 func (a *App) pushUndoForRegion(addr, size uint32) {
@@ -45,8 +33,48 @@ func (a *App) pushUndoForRegion(addr, size uint32) {
 		Cells:        cells,
 		Comments:     comments,
 		OldLabels:    oldLabels,
-		OldCarves:    a.snapshotCarves(),
 	})
+}
+
+// incbinCellAtCursor returns the INCBIN cell if and only if the cursor is currently
+// positioned on an INCBIN row in DisasmRows (and backed by a CellIncbin in the DB).
+// It never matches dc.x (SubRowData), CODE, or other non-incbin rows.
+func (a *App) incbinCellAtCursor() *db.Cell {
+	if len(a.DisasmRows) > 0 {
+		idx := min(max(a.SelectedIdx, 0), len(a.DisasmRows)-1)
+		row := a.DisasmRows[idx]
+		if row.Kind == SubRowData || row.CellType != "INCBIN" {
+			return nil
+		}
+		if row.Addr != nil {
+			if cell, err := a.DB.GetCell(*row.Addr); err == nil && cell != nil && cell.Type == db.CellIncbin && cell.Size > 0 {
+				return cell
+			}
+		}
+		return nil
+	}
+	addr, ok := a.CursorAddr()
+	if !ok {
+		return nil
+	}
+	if cell, err := a.DB.GetCell(addr); err == nil && cell != nil && cell.Type == db.CellIncbin && cell.Size > 0 {
+		return cell
+	}
+	return nil
+}
+
+// rangeOverlapsIncbin returns true if [start, start+size) overlaps any CellIncbin in the DB.
+func (a *App) rangeOverlapsIncbin(start, size uint32) bool {
+	cells, err := a.DB.CellsOverlapping(start, size)
+	if err != nil {
+		return false
+	}
+	for i := range cells {
+		if cells[i].Type == db.CellIncbin {
+			return true
+		}
+	}
+	return false
 }
 
 // Undo reverts the most recent user edit from UndoStack.
@@ -121,10 +149,6 @@ func (a *App) Undo() {
 			a.StatusMsg = fmt.Sprintf("Undo failed: %v", err)
 			return
 		}
-		if entry.OldCarves != nil && a.Proj != nil {
-			a.Proj.Data.Carves = slices.Clone(entry.OldCarves)
-			_ = a.Proj.Save()
-		}
 	case UndoLabelChange:
 		if entry.OldStr != nil {
 			_ = a.DB.RenameLabelAt(entry.Addr, *entry.OldStr)
@@ -156,6 +180,10 @@ func (a *App) Undo() {
 
 // MarkString marks a NUL-terminated or printable ASCII string starting at the cursor.
 func (a *App) MarkString() {
+	if a.incbinCellAtCursor() != nil {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
+	}
 	addr, ok := a.CursorAddr()
 	if !ok {
 		return
@@ -186,31 +214,59 @@ func (a *App) MarkString() {
 	if size == 0 {
 		return
 	}
+	if a.rangeOverlapsIncbin(addr, size) {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
+	}
 	a.pushUndoForRegion(addr, size)
-	_ = a.DB.MarkData(addr, size, db.CellStr)
+	_ = a.DB.WithTransaction(func() error {
+		return a.DB.MarkData(addr, size, db.CellStr)
+	})
 	a.ReloadAtCursor()
 	a.StatusMsg = fmt.Sprintf("Marked %d byte string at %s", size, a.FormatAddr(addr))
 }
 
-// MarkType marks size bytes at the cursor as cellType.
+// MarkType marks size bytes at the cursor as cellType (or unfolds an incbin when pressing 'b').
 func (a *App) MarkType(cellType db.CellType, size uint32) {
+	if a.incbinCellAtCursor() != nil {
+		if cellType == db.CellDataB {
+			a.UncarveAtCursor()
+		} else {
+			a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		}
+		return
+	}
 	addr, ok := a.CursorAddr()
 	if !ok {
 		return
 	}
+	if a.rangeOverlapsIncbin(addr, size) {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
+	}
 	a.pushUndoForRegion(addr, size)
-	_ = a.DB.MarkData(addr, size, cellType)
+	_ = a.DB.WithTransaction(func() error {
+		return a.DB.MarkData(addr, size, cellType)
+	})
 	a.ReloadAtCursor()
 	a.StatusMsg = fmt.Sprintf("Marked %s at %s", cellType.AsStr(), a.FormatAddr(addr))
 }
 
 // MarkCode marks the word-aligned cursor address as a code entry point and runs incremental analysis.
 func (a *App) MarkCode() {
+	if a.incbinCellAtCursor() != nil {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
+	}
 	rawAddr, ok := a.CursorAddr()
 	if !ok {
 		return
 	}
 	addr := rawAddr &^ 1
+	if a.rangeOverlapsIncbin(addr, 2) {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
+	}
 	a.pushUndoForRegion(addr, 2)
 	if _, err := analyzer.ApplyCodeHint(a.Proj, a.DB, addr); err != nil {
 		a.StatusMsg = fmt.Sprintf("Analyze failed: %v", err)
@@ -264,15 +320,12 @@ func (a *App) CarveRange(start, endIncl uint32, name, blockComment string) {
 		oldLabels = append(oldLabels, *lbl)
 		hadStartLabel = true
 	}
-	oldCarves := a.snapshotCarves()
 	var interiorOverlappedStarts []uint32
-	if a.Proj != nil {
-		for _, c := range a.Proj.Data.Carves {
-			if c.Start > start && c.Start < end {
-				interiorOverlappedStarts = append(interiorOverlappedStarts, c.Start)
-				if lbl, _ := a.DB.GetLabelFull(c.Start); lbl != nil {
-					oldLabels = append(oldLabels, *lbl)
-				}
+	for _, c := range cells {
+		if c.Type == db.CellIncbin && c.Addr > start && c.Addr < end {
+			interiorOverlappedStarts = append(interiorOverlappedStarts, c.Addr)
+			if lbl, _ := a.DB.GetLabelFull(c.Addr); lbl != nil {
+				oldLabels = append(oldLabels, *lbl)
 			}
 		}
 	}
@@ -306,7 +359,6 @@ func (a *App) CarveRange(start, endIncl uint32, name, blockComment string) {
 			Size:       end - start,
 			Type:       db.CellIncbin,
 			Confidence: 255,
-			RawBytes:   a.BinaryData[off:endOff],
 		}); err != nil {
 			return err
 		}
@@ -332,19 +384,8 @@ func (a *App) CarveRange(start, endIncl uint32, name, blockComment string) {
 		Comments:     comments,
 		OldLabels:    oldLabels,
 		DeletedLabel: !hadStartLabel,
-		OldCarves:    oldCarves,
 	})
 
-	a.Proj.Data.Carves = slices.DeleteFunc(a.Proj.Data.Carves, func(c project.Carve) bool {
-		return c.Start < end && c.End > start
-	})
-	a.Proj.Data.Carves = append(a.Proj.Data.Carves, project.Carve{
-		Start: start,
-		End:   end,
-		File:  sidecar,
-		Name:  label,
-	})
-	_ = a.Proj.Save()
 	a.SelectionStart = nil
 	a.ReloadAtCursor()
 	// Move the disassembly cursor to the carved incbin's start address (intentional TUI UX
@@ -353,40 +394,30 @@ func (a *App) CarveRange(start, endIncl uint32, name, blockComment string) {
 	a.StatusMsg = fmt.Sprintf("Carved %d bytes at %s -> %s", end-start, a.FormatAddr(start), sidecar)
 }
 
-// UncarveAtCursor removes the carve whose range contains the cursor address.
+// UncarveAtCursor unfolds the INCBIN cell at the cursor row back into bytes.
+// It refuses to act if the cursor is on a dc.x data row or any non-INCBIN row.
 func (a *App) UncarveAtCursor() {
-	addr, ok := a.CursorAddr()
-	if !ok {
-		return
-	}
-	idx := -1
-	var carve project.Carve
-	for i, c := range a.Proj.Data.Carves {
-		if addr >= c.Start && addr < c.End {
-			idx = i
-			carve = c
-			break
-		}
-	}
-	if idx < 0 {
+	cell := a.incbinCellAtCursor()
+	if cell == nil {
 		a.StatusMsg = "No carve at cursor"
 		return
 	}
-	cells, _ := a.DB.CellsOverlapping(carve.Start, carve.End-carve.Start)
-	comments, _ := a.DB.GetCommentsInRange(carve.Start, carve.End)
+	carveStart := cell.Addr
+	carveEnd := cell.Addr + cell.Size
+	cells, _ := a.DB.CellsOverlapping(carveStart, cell.Size)
+	comments, _ := a.DB.GetCommentsInRange(carveStart, carveEnd)
 	var oldLabels []db.Label
-	if lbl, _ := a.DB.GetLabelFull(carve.Start); lbl != nil {
+	if lbl, _ := a.DB.GetLabelFull(carveStart); lbl != nil {
 		oldLabels = append(oldLabels, *lbl)
 	}
-	oldCarves := a.snapshotCarves()
 	if err := a.DB.WithTransaction(func() error {
-		if err := a.DB.DeleteCellsInRange(carve.Start, carve.End); err != nil {
+		if err := a.DB.DeleteCellsInRange(carveStart, carveEnd); err != nil {
 			return err
 		}
-		if err := a.DB.DeleteLabelAt(carve.Start); err != nil {
+		if err := a.DB.DeleteLabelAt(carveStart); err != nil {
 			return err
 		}
-		if err := a.DB.UpdateBlockComment(carve.Start, ""); err != nil {
+		if err := a.DB.UpdateBlockComment(carveStart, ""); err != nil {
 			return err
 		}
 		return nil
@@ -396,27 +427,31 @@ func (a *App) UncarveAtCursor() {
 	}
 	a.pushUndo(UndoEntry{
 		Kind:         UndoCellDelete,
-		ClearedStart: carve.Start,
-		ClearedLen:   carve.End - carve.Start,
+		ClearedStart: carveStart,
+		ClearedLen:   cell.Size,
 		Cells:        cells,
 		Comments:     comments,
 		OldLabels:    oldLabels,
-		OldCarves:    oldCarves,
 	})
-	a.Proj.Data.Carves = append(a.Proj.Data.Carves[:idx], a.Proj.Data.Carves[idx+1:]...)
-	_ = a.Proj.Save()
 	a.ReloadAtCursor()
-	a.StatusMsg = fmt.Sprintf("Uncarved %s — press 'r' to reclassify", a.FormatAddr(carve.Start))
+	a.StatusMsg = fmt.Sprintf("Uncarved %s — press 'r' to reclassify", a.FormatAddr(carveStart))
 }
 
-// Undefine deletes the cell and control edges at the cursor address.
+// Undefine deletes the cell and control edges at the cursor address (or unfolds an INCBIN).
 func (a *App) Undefine() {
+	if a.incbinCellAtCursor() != nil {
+		a.UncarveAtCursor()
+		return
+	}
 	addr, ok := a.CursorAddr()
 	if !ok {
 		return
 	}
 	targetAddr := addr
 	if cell, err := a.DB.GetCellContaining(addr); err == nil && cell != nil {
+		if cell.Type == db.CellIncbin {
+			return
+		}
 		targetAddr = cell.Addr
 		a.pushUndoForRegion(targetAddr, max(cell.Size, 1))
 	}

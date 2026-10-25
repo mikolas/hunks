@@ -159,7 +159,7 @@ Expected:
 - (b) carve over an interior reloc in a relocatable hunk **exits non-zero** with
   a clean refusal (no panic).
 - (c) carve on the flat part succeeds (guard does not apply to non-relocatable parts).
-- (d) `uncarve` empties `project.json` `carves`.
+- (d) `uncarve` removes the `INCBIN` cell, label, and block comment from `project.db`.
 
 ### Carve byte-neutrality on relocatable hunks
 Carve a **reloc-free DATA range**, emit, re-assemble, confirm load-image parity:

@@ -590,14 +590,27 @@ func (a *App) OpenAliasEditor() {
 
 // MarkPointerTable marks count consecutive 32-bit pointers starting at the cursor.
 func (a *App) MarkPointerTable(count uint32) {
+	if a.incbinCellAtCursor() != nil {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
+	}
 	addr, ok := a.CursorAddr()
 	if !ok {
 		return
 	}
-	a.pushUndoForRegion(addr, count*4)
-	for i := range count {
-		_ = a.DB.MarkData(addr+i*4, 4, db.CellPointer)
+	if a.rangeOverlapsIncbin(addr, count*4) {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
 	}
+	a.pushUndoForRegion(addr, count*4)
+	_ = a.DB.WithTransaction(func() error {
+		for i := range count {
+			if err := a.DB.MarkData(addr+i*4, 4, db.CellPointer); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	a.ReloadAtCursor()
 	a.StatusMsg = fmt.Sprintf("Marked %d pointers at %s", count, a.FormatAddr(addr))
 }

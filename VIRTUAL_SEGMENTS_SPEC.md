@@ -12,13 +12,13 @@
    - The underlying segment binary is **never** physically split, truncated, or modified on disk.
 4. **Zero New Schema — Built on Existing Primitives (`CellIncbin` + `Label` + `BlockComment`):**
    - Every carved-out virtual segment is represented at `startAddr` by:
-     1. **`db.CellIncbin`** (`Confidence = 255`, `Size = endAddr - startAddr`) + `project.Carve` (`File: "assets/<label>.bin"`).
-     2. **User Label** (`db.SetLabel(startAddr, label, db.LabelDat, true)`).
+     1. **`db.CellIncbin`** (`Confidence = 255`, `Size = endAddr - startAddr`) in `project.db`.
+     2. **User Label** (`db.SetLabel(startAddr, label, db.LabelDat, isAuto)`).
      3. **Optional Block Comment (`db.UpdateBlockComment`)** rendered directly above the label in both the TUI listing (`SubRowBlockComment`) and emitted `.asm` source.
 5. **100% Bit-for-Bit Reassembly Parity:**
    - On `emit` (`hunks emit` or TUI `e`), `Emitter` writes `BinaryData[startOff:endOff]` to `assets/<label>.bin` and emits the block comment, label, and `incbin "assets/<label>.bin"`, assembling back via `vasmm68k_mot` to a 100% bit-for-bit identical binary.
-6. **Atomic & 100% Reversible (`Ctrl-z` Undo & `K` Uncarve):**
-   - Carving and uncarving keep `project.db` (`CellIncbin`, `Label`, `BlockComment`) and `project.json` (`Carves`) strictly in sync across both `K` (`UncarveAtCursor`) and `Ctrl-z` (`Undo`).
+6. **Atomic & 100% Reversible (`Ctrl-z` Undo & `b`/`u`/`K` Uncarve):**
+   - Carving and uncarving live 100% in `project.db` (`CellIncbin`, `Label`, `BlockComment`) across `b`/`u`/`K` (`UncarveAtCursor`) and `Ctrl-z` (`Undo`).
 
 ---
 
@@ -32,11 +32,10 @@
 3. **Carve (`K`):**
    - Pressing `K` opens `ModalCarveName` (`Carve Label (for incbin)`).
    - Confirming (`Enter`) calls `CarveRange(start, endIncl, label, "")`, which:
-     - Pushes an `UndoEntry` snapshot (`pushUndoForRegion` + `Carves` state) so `Ctrl-z` undoes the carve.
+     - Pushes an `UndoEntry` snapshot (`Cells`, `Comments`, `OldLabels`) so `Ctrl-z` undoes the carve.
      - Inserts `db.CellIncbin` (`Confidence = 255`) and `label` in a single SQLite transaction.
-     - Records `project.Carve{Start: start, End: end, File: "assets/<label>.bin", Name: label}` in `project.json`.
-4. **Uncarve (`K` with no selection on an `INCBIN` row):**
-   - Pressing `K` when the cursor is on an existing `incbin` row calls `UncarveAtCursor()`, removing the `CellIncbin` and `project.Carve` entry (also undoable via `Ctrl-z`).
+4. **Uncarve (`b`, `u`, or `K` with no selection on an `INCBIN` row):**
+   - Pressing `b`, `u`, or `K` when the cursor is on an existing `incbin` row calls `UncarveAtCursor()`, unfolding the `CellIncbin` back into coalesced 16-byte `dc.b` rows (also undoable via `Ctrl-z`). Refuses to uncarve on `dc.x` data rows or non-`INCBIN` rows.
 
 ### 2.2 Bitplane Image Viewer (`K` in `ModalBitplane`)
 1. **Prompt for Label Name (`ModalCarveName`):**
@@ -75,7 +74,7 @@
        mod_title_theme:
            incbin  "assets/mod_title_theme.bin"
        ```
-     - Confirming (`Enter`) invokes `CarveRange` to create the `db.CellIncbin`, user label, `BlockComment`, and `project.Carve` entry (or `Esc` returns to `ModalMusicRipper`).
+      - Confirming (`Enter`) invokes `CarveRange` to create the `db.CellIncbin`, user label, and `BlockComment` in `project.db` (or `Esc` returns to `ModalMusicRipper`).
 
 ---
 
@@ -83,12 +82,12 @@
 
 1. **`CarveRange` (`internal/tui/actions.go`):**
    - Accept `blockComment string` parameter (`CarveRange(start, endIncl uint32, name, blockComment string)`).
-   - Snapshot previous cells, comments (`Comment`, `BlockComment`, `AutoComment`), label at `start`, and `a.Proj.Data.Carves` into `UndoEntry` before mutating so `Ctrl-z` (`Undo()`) restores `project.db` and `project.json` completely.
+   - Snapshot previous cells, comments (`Comment`, `BlockComment`, `AutoComment`), and labels into `UndoEntry` before mutating so `Ctrl-z` (`Undo()`) restores `project.db` completely.
    - Set `isAuto = (strings.TrimSpace(name) == "")` when calling `a.DB.SetLabel(start, label, db.LabelDat, isAuto)`.
    - Write `a.DB.UpdateBlockComment(start, blockComment)` inside the transaction when `blockComment != ""`.
 2. **`UncarveAtCursor` (`internal/tui/actions.go`):**
-   - Push an `UndoEntry` snapshot before uncarving so `Ctrl-z` restores the `CellIncbin`, `project.Carve`, label, and `BlockComment`.
-   - Clean up the carve's label and `BlockComment` at `carve.Start` on uncarve.
+   - Push an `UndoEntry` snapshot before uncarving so `Ctrl-z` restores the `CellIncbin`, label, and `BlockComment`.
+   - Clean up the carve's label and `BlockComment` at `carveStart` on uncarve.
 3. **Bitplane Viewer `K` (`internal/tui/keys.go` & `internal/tui/actions.go`):**
    - Refuse carving if `seg.IsRelocatable()` (`Flat Binaries Only for Asset Viewers`).
    - Clear Kitty graphics placements if active, pre-populate `ModalCarveName` with `gfx_<W>x<H>x<BPU>[i][h][ham]` and the formatted bitmap `BlockComment`, and on `Enter` call `CarveRange`.
