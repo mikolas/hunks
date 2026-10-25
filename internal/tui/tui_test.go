@@ -1009,4 +1009,3 @@ func TestBitplaneViewerInteractive(t *testing.T) {
 		t.Fatalf("expected Undone after 'ctrl+z', got %q", app.StatusMsg)
 	}
 }
-

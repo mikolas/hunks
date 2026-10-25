@@ -25,13 +25,13 @@ func buildSyntheticHunkExecutable() []byte {
 
 	// HUNK_HEADER: 3 hunks (CODE public 28B, DATA chip 8B on disk / 16B alloc, BSS chip 32B)
 	push(hunk.HunkHeader)
-	push(0)              // resident libs
-	push(3)              // table_size = 3
-	push(0)              // first_hunk = 0
-	push(2)              // last_hunk = 2
-	push(7)              // hunk0: 7 longs (28B) CODE public
-	push((1 << 30) | 4)  // hunk1: 4 longs (16B alloc) DATA chip
-	push((1 << 30) | 8)  // hunk2: 8 longs (32B alloc) BSS chip
+	push(0)             // resident libs
+	push(3)             // table_size = 3
+	push(0)             // first_hunk = 0
+	push(2)             // last_hunk = 2
+	push(7)             // hunk0: 7 longs (28B) CODE public
+	push((1 << 30) | 4) // hunk1: 4 longs (16B alloc) DATA chip
+	push((1 << 30) | 8) // hunk2: 8 longs (32B alloc) BSS chip
 
 	// Hunk 0: CODE (28 bytes = 7 longs)
 	//   +0x00: 48 E7 40 20          movem.l d1/a2,-(a7)

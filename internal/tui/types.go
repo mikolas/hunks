@@ -259,16 +259,16 @@ type StructEditorState struct {
 
 // Modal holds the state of the currently active modal dialog.
 type Modal struct {
-	Kind        ModalKind
-	Input       TextInput
-	SearchHits  []SearchHit
-	Xrefs       []XrefItem
-	Filter      string
-	AllFuncs    []FuncItem
-	ListSelect  int
-	StructState StructEditorState
-	CarveStart  uint32
-	CarveEnd    uint32
+	Kind          ModalKind
+	Input         TextInput
+	SearchHits    []SearchHit
+	Xrefs         []XrefItem
+	Filter        string
+	AllFuncs      []FuncItem
+	ListSelect    int
+	StructState   StructEditorState
+	CarveStart    uint32
+	CarveEnd      uint32
 	FileBrowser   FileBrowserState
 	SegmentForm   SegmentFormState
 	Bitplane      *BitplaneState

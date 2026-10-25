@@ -487,4 +487,3 @@ func TestExhaustiveAll65536OpcodesHaveNonZeroTiming(t *testing.T) {
 		t.Fatalf("expected >40000 valid M68000 opcodes, got %d", validCount)
 	}
 }
-

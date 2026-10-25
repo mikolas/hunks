@@ -109,10 +109,10 @@ const (
 )
 
 const (
-	copperMaxSteps      = 1024
+	copperMaxSteps        = 1024
 	HPosPerLine    uint32 = 227
 	VPosPerFrame   uint32 = 313
-	CyclesPerLine  uint32 = HPosPerLine * 2            // 454 CPU cycles
+	CyclesPerLine  uint32 = HPosPerLine * 2              // 454 CPU cycles
 	CyclesPerFrame uint32 = VPosPerFrame * CyclesPerLine // 142,102 CPU cycles
 
 	dsksyncPeriodCycles uint32 = 12800
