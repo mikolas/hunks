@@ -478,7 +478,7 @@ Instructions that jump/call across hunks or through a register jump-vector table
 | `p` | Mark as `POINTER` (4-byte address, resolves target label) |
 | `P` | Mark pointer table (prompts for entry count) |
 | `s` | Mark as null-terminated ASCII `STRING` |
-| `K` | Carve v-selection into an `incbin` block (prompts for a name); with no selection, uncarve the carved range at the cursor. Refuses interior relocations in relocatable segments |
+| `K` | Carve v-selection into an `incbin` block (prompts for a label name and jumps cursor to the carve start); with no selection, uncarve the carved range at the cursor (undoable via `Ctrl-z`). Refuses interior relocations in relocatable segments |
 | `u` | Undefine cell(s) (revert to raw unmapped bytes) |
 
 ### Annotation Keys
@@ -502,8 +502,9 @@ Instructions that jump/call across hunks or through a register jump-vector table
 | `m` | Memory map region editor (`d` to delete region) |
 | `t` | Struct editor (`n` = new struct, `Enter` = edit struct fields, `a` = add field, `d` = delete, `Esc` = back) |
 | `a` | Register alias editor (maps a base register to a struct for automatic `d16(An)` field substitution) |
-| `Ctrl-z` | Undo last type-marking action |
+| `Ctrl-z` | Undo last edit (type-marking, carve/uncarve, rename, inline/block comment) |
 | `B` | Open interactive Bitplane Image Viewer at cursor address |
+| `M` | Open interactive Music Module Ripper (scan, browse, jump, rip, carve) |
 | `?` | Help popup |
 | `q` | Quit |
 
@@ -550,8 +551,23 @@ The viewer queries the terminal text area pixel dimensions at startup via the cr
 | `v` | Cycle terminal graphics protocol (`Kitty` $\rightarrow$ `iTerm2` $\rightarrow$ `Sixel` $\rightarrow$ `Half-Block`) |
 | `w` | Export unscaled bitmap as standard PNG to `assets/<seg>_<addr>_<WxHxD>.png` |
 | `W` | Export bitmap as standard Commodore Amiga `FORM ILBM` file to `assets/<seg>_<addr>_<WxHxD>.ilbm` |
-| `K` | Carve bitplane byte range in database as Data (`DAT`) with label `gfx_<W>x<H>x<D>` (undoable via `Ctrl-z`) |
+| `K` | Carve bitplane byte range as `incbin` Virtual Segment (prompts for `gfx_<W>x<H>x<BPU>[i][h][ham]` label, writes `; Bitmap:` / `; Span:` / `; Regs:` / `; Planes:` / `; Pal:` block comment above the label; round-trips geometry, modulo, `VIS`/`SYNC` masks, plane pointers, and palette/invert/bias on `B`; flat binaries only; undoable via `Ctrl-z`) |
 | `Esc` / `q` | Close viewer and return immediately to disassembly listing |
+
+### Interactive Music Module Ripper (`M`)
+
+Pressing `M` in the Disassembly view scans the active segment using the zero-dependency recognizer engine (`modules.Scan`) for embedded tracker and sound driver modules across 7 supported formats (ProTracker, SoundTracker 2.6, Old SoundTracker, Future Composer, David Whittaker, Delta Music 1.0, Final Music System).
+
+If modules are detected, `ModalMusicRipper` displays all found songs and companion regions (e.g. StarTrekker sample banks) with format, variant, offset, and size:
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` or `↓` / `↑` | Select detected module region |
+| `PgUp` / `PgDn` / `Home` / `End` | Page / jump through detected module regions |
+| `Enter` | Jump disassembly cursor directly to the module's start address |
+| `w` | Rip / export the selected module directly to `assets/<slug>_<offset>.mod` (or `.bin`, keyed on format ID) |
+| `K` | Carve module byte range as `incbin` Virtual Segment (prompts for `mod_<slug>_<offset>` label, writes `; Music:` / `; Span:` block comment above the label; flat binaries only; undoable via `Ctrl-z`) |
+| `Esc` / `q` | Close ripper and return to disassembly listing |
 
 ### Theme Customization (`~/.config/hunks/theme.json`)
 

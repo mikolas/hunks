@@ -64,6 +64,19 @@ func (m *Match) TotalLen() int {
 	return total
 }
 
+// FileExtForFormatID returns the canonical file extension ("mod" or "bin") for a FormatID and RegionRole.
+func FileExtForFormatID(formatID uint32, role RegionRole) string {
+	if role != RegionPrimary {
+		return "bin"
+	}
+	switch formatID {
+	case 22, 23, 42: // SoundTracker 2.6, ProTracker, Old SoundTracker
+		return "mod"
+	default:
+		return "bin"
+	}
+}
+
 // Recognizer is a single-format detector. Pure: inspects data at/around offset and returns
 // a Match iff a valid module of this format is present.
 type Recognizer interface {

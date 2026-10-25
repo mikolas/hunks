@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"image"
 	"image/color"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/term"
+	"github.com/mikolas/hunks/internal/project"
 	"github.com/muesli/cancelreader"
 )
 
@@ -281,6 +283,258 @@ func (s *BitplaneState) BPLCON0Hex() uint16 {
 		val |= 0x0800 // HAM
 	}
 	return val
+}
+
+// FormatBlockComment generates a multi-line metadata comment for the bitmap.
+func (s *BitplaneState) FormatBlockComment(baseAddr uint32) string {
+	bpu := s.BPU()
+	w := s.WidthPx()
+	h := s.Height
+	layout := "Planar"
+	if s.Interleaved {
+		layout = "Interleaved"
+	}
+	res := "Lowres"
+	if s.Hires || s.RowBytes >= 80 {
+		res = "Hires"
+	}
+	colorsDesc := fmt.Sprintf("%d colors", 1<<bpu)
+	if s.HAM && bpu == 6 {
+		colorsDesc = "HAM6 (4096 colors)"
+	}
+
+	startOff, endOff := s.ByteSpan()
+	startAddr := baseAddr + startOff
+	endAddr := baseAddr + endOff
+	spanBytes := endOff - startOff
+
+	bplcon0 := s.BPLCON0Hex()
+	bpl1mod, bpl2mod := s.HardwareModulos()
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Bitmap: %dx%dx%d (%s, %s, %s)\n", w, h, bpu, layout, res, colorsDesc)
+	fmt.Fprintf(&sb, "Span:   $%06X..$%06X (%d bytes)\n", startAddr, endAddr, spanBytes)
+	fmt.Fprintf(&sb, "Regs:   BPLCON0=$%04X BPL1MOD=$%04X BPL2MOD=$%04X DDF=%dpx(%dB)",
+		bplcon0, uint16(bpl1mod), uint16(bpl2mod), w, s.RowBytes)
+	fullMask := uint8((1 << bpu) - 1)
+	if s.VisibleMask != fullMask || s.ControlMask != fullMask {
+		fmt.Fprintf(&sb, " VIS=$%02X SYNC=$%02X", s.VisibleMask, s.ControlMask)
+	}
+	sb.WriteByte('\n')
+
+	sb.WriteString("Planes:")
+	for p := 0; p < bpu; p++ {
+		fmt.Fprintf(&sb, " %d:$%06X", p+1, baseAddr+s.BPL[p])
+	}
+	sb.WriteByte('\n')
+
+	pal := "Grayscale"
+	switch {
+	case s.PaletteMode == PaletteCustom && s.CustomPalName != "":
+		pal = s.CustomPalName
+	case s.PaletteMode == PaletteHighContrast:
+		pal = "High-Contrast"
+	}
+	fmt.Fprintf(&sb, "Pal:    %s", pal)
+	if s.Invert {
+		sb.WriteString(" inv")
+	}
+	if s.Brightness != 0 {
+		fmt.Fprintf(&sb, " bias=%+d", s.Brightness)
+	}
+	return sb.String()
+}
+
+// ParseBitplaneBlockComment parses a bitmap BlockComment or label to reconstruct a BitplaneState.
+// baseOff is used as the initial Plane 1 offset when no explicit "Planes:" line is present in blockComment,
+// so a genuinely parsed Plane 1 offset of 0 is never confused with an uninitialized offset.
+func ParseBitplaneBlockComment(blockComment, label string, baseAddr, baseOff uint32, binData []byte) (*BitplaneState, bool) {
+	var w, h, bpu int
+	var interleaved, hires, ham bool
+	var hasGeom bool
+
+	if blockComment != "" {
+		for _, line := range strings.Split(blockComment, "\n") {
+			line = strings.TrimSpace(line)
+			line = strings.TrimPrefix(line, ";")
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Bitmap:") {
+				rest := strings.TrimSpace(strings.TrimPrefix(line, "Bitmap:"))
+				var geomStr string
+				if idx := strings.IndexByte(rest, ' '); idx > 0 {
+					geomStr = rest[:idx]
+					sub := rest[idx:]
+					if strings.Contains(sub, "Interleaved") {
+						interleaved = true
+					}
+					if strings.Contains(sub, "Hires") {
+						hires = true
+					}
+					if strings.Contains(sub, "HAM") {
+						ham = true
+					}
+				} else {
+					geomStr = rest
+				}
+				if n, _ := fmt.Sscanf(geomStr, "%dx%dx%d", &w, &h, &bpu); n == 3 {
+					hasGeom = true
+				}
+			}
+		}
+	}
+
+	if !hasGeom && label != "" {
+		clean := strings.TrimPrefix(label, "gfx_")
+		clean = strings.TrimPrefix(clean, "GFX_")
+		var suf string
+		if n, _ := fmt.Sscanf(clean, "%dx%dx%d%s", &w, &h, &bpu, &suf); n >= 3 {
+			hasGeom = true
+			if strings.Contains(suf, "i") {
+				interleaved = true
+			}
+			if strings.Contains(suf, "h") {
+				hires = true
+			}
+			if strings.Contains(suf, "ham") {
+				ham = true
+			}
+		}
+	}
+
+	if !hasGeom || w <= 0 || h <= 0 || bpu <= 0 || bpu > 8 {
+		return nil, false
+	}
+
+	st := NewBitplaneState(baseOff)
+	st.RowBytes = max(w/8, 1)
+	st.Height = h
+	st.SetBPU(bpu)
+	st.Interleaved = interleaved
+	st.Hires = hires
+	st.HAM = ham
+	st.ControlMask = uint8((1 << bpu) - 1)
+	st.VisibleMask = uint8((1 << bpu) - 1)
+
+	var parsedPlanes bool
+	if blockComment != "" {
+		for _, line := range strings.Split(blockComment, "\n") {
+			line = strings.TrimSpace(line)
+			line = strings.TrimPrefix(line, ";")
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Regs:") {
+				fields := strings.Fields(strings.TrimPrefix(line, "Regs:"))
+				var hasBpl1Mod bool
+				var bpl1mod int
+				for _, f := range fields {
+					if strings.HasPrefix(f, "BPL1MOD=$") {
+						if v, err := project.ParseHex(strings.TrimPrefix(f, "BPL1MOD=$")); err == nil {
+							bpl1mod = int(int16(uint16(v)))
+							hasBpl1Mod = true
+						}
+					} else if strings.HasPrefix(f, "DDF=") {
+						var ddfW, ddfB int
+						if n, _ := fmt.Sscanf(f, "DDF=%dpx(%dB)", &ddfW, &ddfB); n == 2 && ddfB > 0 {
+							st.RowBytes = ddfB
+						}
+					} else if strings.HasPrefix(f, "VIS=$") {
+						if v, err := project.ParseHex(strings.TrimPrefix(f, "VIS=$")); err == nil {
+							st.VisibleMask = uint8(v)
+						}
+					} else if strings.HasPrefix(f, "SYNC=$") {
+						if v, err := project.ParseHex(strings.TrimPrefix(f, "SYNC=$")); err == nil {
+							st.ControlMask = uint8(v)
+						}
+					}
+				}
+				if hasBpl1Mod {
+					rowBytes := max(st.RowBytes, 1)
+					cutBytes := max(rowBytes-st.VisibleRowBytes(), 0)
+					if st.Interleaved {
+						st.Modulo = bpl1mod - (max(st.BPU(), 1)-1)*rowBytes - cutBytes
+					} else {
+						st.Modulo = bpl1mod - cutBytes
+					}
+				}
+			} else if strings.HasPrefix(line, "Planes:") {
+				parts := strings.Fields(strings.TrimPrefix(line, "Planes:"))
+				for _, part := range parts {
+					idxStr, addrStr, ok := strings.Cut(part, ":$")
+					if !ok {
+						continue
+					}
+					p, err := strconv.Atoi(idxStr)
+					if err != nil || p < 1 || p > 8 {
+						continue
+					}
+					hexLen := 0
+					for hexLen < len(addrStr) {
+						c := addrStr[hexLen]
+						if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+							hexLen++
+						} else {
+							break
+						}
+					}
+					if hexLen > 0 {
+						if addrVal, err := project.ParseHex(addrStr[:hexLen]); err == nil && addrVal >= baseAddr {
+							st.BPL[p-1] = addrVal - baseAddr
+							parsedPlanes = true
+						}
+					}
+				}
+			} else if strings.HasPrefix(line, "Pal:") {
+				fields := strings.Fields(strings.TrimPrefix(line, "Pal:"))
+				if len(fields) > 0 {
+					palToken := fields[0]
+					switch {
+					case palToken == "Grayscale":
+						st.PaletteMode = PaletteGrayscale
+					case palToken == "High-Contrast":
+						st.PaletteMode = PaletteHighContrast
+					case strings.Contains(palToken, "@+$"):
+						idx := strings.Index(palToken, "@+$")
+						offStr := palToken[idx+len("@+$"):]
+						if offVal, err := project.ParseHex(offStr); err == nil && len(binData) > 0 {
+							if pal, name, ok := ParseAmigaPalette(binData, offVal); ok {
+								st.CustomPalette = pal
+								st.CustomPalName = fmt.Sprintf("%s@+$%05X", name, offVal)
+								st.PaletteMode = PaletteCustom
+							}
+						}
+					case strings.Contains(palToken, "@$"):
+						idx := strings.Index(palToken, "@$")
+						addrStr := palToken[idx+len("@$"):]
+						if addrVal, err := project.ParseHex(addrStr); err == nil && len(binData) > 0 {
+							offVal := addrVal
+							if addrVal >= baseAddr {
+								offVal = addrVal - baseAddr
+							}
+							if pal, name, ok := ParseAmigaPalette(binData, offVal); ok {
+								st.CustomPalette = pal
+								st.CustomPalName = fmt.Sprintf("%s@+$%05X", name, offVal)
+								st.PaletteMode = PaletteCustom
+							}
+						}
+					}
+					for _, f := range fields[1:] {
+						if f == "inv" {
+							st.Invert = true
+						} else if strings.HasPrefix(f, "bias=") {
+							if b, err := strconv.Atoi(strings.TrimPrefix(f, "bias=")); err == nil {
+								st.Brightness = b
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if !parsedPlanes {
+		st.AutoSnapPlanes()
+	}
+
+	return st, true
 }
 
 // RowStrideBytes returns the byte stride between successive scanlines of a plane.

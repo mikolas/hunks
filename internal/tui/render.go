@@ -7,6 +7,7 @@ import (
 
 	"github.com/mattn/go-runewidth"
 	"github.com/mikolas/hunks/internal/hunk"
+	"github.com/mikolas/hunks/internal/modules"
 	"github.com/mikolas/hunks/internal/project"
 )
 
@@ -976,7 +977,7 @@ func renderModal(buf *screenBuffer, a *App, screen rect) {
 		}
 		renderListModal(buf, area, " Memory Regions (d=delete, Esc=close) ", fgMagenta, rows, m.ListSelect)
 	case ModalHelp:
-		area := centeredRect(58, 22, screen)
+		area := centeredRect(64, 22, screen)
 		inner := buf.drawBox(area, " Help (? to close) ", cellStyle{fg: fgWhite}, cellStyle{})
 		helpLines := []string{
 			"Navigation:",
@@ -997,7 +998,7 @@ func renderModal(buf *screenBuffer, a *App, screen rect) {
 			"",
 			"Other:",
 			"  e Export  r Re-analyze  m Memory map  Ctrl-z Undo",
-			"  B Bitplanes  t Structs  a Aliases  ? Help  q Quit",
+			"  B Bitplanes  M Music  t Structs  a Aliases  ? Help  q Quit",
 			"",
 			"Mouse: Scroll=navigate, Right-click=context menu",
 		}
@@ -1157,6 +1158,31 @@ func renderModal(buf *screenBuffer, a *App, screen rect) {
 		renderInputModal(buf, screen, " Bitmap Geometry (WxH or WxHxD) ", &m.Input, fgCyan)
 	case ModalBitplanePalette:
 		renderInputModal(buf, screen, " Set Palette Address / Offset ", &m.Input, fgCyan)
+	case ModalMusicRipper:
+		st := &m.MusicRipper
+		h := min(len(st.Items)+4, 18)
+		area := centeredRect(70, max(h, 6), screen)
+		rows := make([][]styledSpan, len(st.Items))
+		for i, it := range st.Items {
+			marker := "  "
+			if i == st.Selected {
+				marker = "▸ "
+			}
+			addr := a.BaseAddr + uint32(it.Start)
+			roleTag := ""
+			if it.Role != modules.RegionPrimary {
+				roleTag = fmt.Sprintf(" [%s]", it.Role)
+			}
+			rows[i] = []styledSpan{
+				{text: marker, style: cellStyle{fg: fgCyan, bold: true}},
+				{text: fmt.Sprintf("%-18s", it.Name), style: cellStyle{fg: fgWhite, bold: true}},
+				{text: fmt.Sprintf(" (%-8s)", it.Variant), style: cellStyle{fg: fgDarkGray}},
+				{text: fmt.Sprintf(" +$%05X ($%05X)", it.Start, addr), style: cellStyle{fg: fgCyan}},
+				{text: fmt.Sprintf(" %6d B%s", it.Len, roleTag), style: cellStyle{fg: fgYellow}},
+			}
+		}
+		title := " Music Ripper (Enter=Jump, w=Rip, K=Carve, Esc=Close) "
+		renderListModal(buf, area, title, fgCyan, rows, st.Selected)
 	}
 }
 

@@ -124,6 +124,7 @@ Verify:
 - `/` search; `f` Functions; `x` XREFs (`Enter` jumps to caller).
 - `Enter` follows branches, cross-hunk refs (`⇢`), and jump-vector hints; `-`/`Bksp` returns.
 - `←`/`→` moves the byte cursor on `DATA` rows or cycles caller badges on `; XREF` rows; `s`/`b`/`w`/`l`/`p`/`c`/`u` mark cells; `K` carve/uncarve; `Ctrl-z` undo.
+- `B` opens the Bitplane Image Viewer (`K` carves as `incbin` with metadata block comment and round-trips on `B`); `M` opens the Music Module Ripper (`Enter` jumps, `w` rips to `assets/`, `K` carves as `incbin`).
 - `?` Help; `q` quit.
 
 ---
