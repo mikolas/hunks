@@ -1035,13 +1035,12 @@ func (a *App) handleBitplaneKey(modal Modal, key string) bool {
 
 	case "+":
 		if st.BPU() < 7 {
-			st.SetBPU(st.BPU() + 1)
-			st.ControlMask |= (1 << (st.BPU() - 1))
+			st.ChangeBPU(st.BPU() + 1)
 			a.refreshBitplaneCache()
 		}
 	case "-":
 		if st.BPU() > 1 {
-			st.SetBPU(st.BPU() - 1)
+			st.ChangeBPU(st.BPU() - 1)
 			a.refreshBitplaneCache()
 		}
 
@@ -1092,40 +1091,33 @@ func (a *App) handleBitplaneKey(modal Modal, key string) bool {
 	// Direct bitplane depth selection (BPU 1..7)
 	// Supports US, UK, Scandinavian, German, French, and international keyboards:
 	case "!", "shift+1":
-		st.SetBPU(1)
+		st.ChangeBPU(1)
 		st.ControlMask = 1
 		a.refreshBitplaneCache()
 	case "@", "\"", "shift+2":
-		st.SetBPU(2)
-		st.ControlMask |= (1 << 1)
+		st.ChangeBPU(2)
 		a.refreshBitplaneCache()
 	case "#", "£", "§", "shift+3":
-		st.SetBPU(3)
-		st.ControlMask |= (1 << 2)
+		st.ChangeBPU(3)
 		a.refreshBitplaneCache()
 	case "$", "¤", "shift+4":
-		st.SetBPU(4)
-		st.ControlMask |= (1 << 3)
+		st.ChangeBPU(4)
 		a.refreshBitplaneCache()
 	case "%", "shift+5":
-		st.SetBPU(5)
-		st.ControlMask |= (1 << 4)
+		st.ChangeBPU(5)
 		a.refreshBitplaneCache()
 	case "^", "&", "shift+6":
-		st.SetBPU(6)
-		st.ControlMask |= (1 << 5)
+		st.ChangeBPU(6)
 		a.refreshBitplaneCache()
 	case "/", "shift+7":
-		st.SetBPU(7)
-		st.ControlMask |= (1 << 6)
+		st.ChangeBPU(7)
 		a.refreshBitplaneCache()
 	case ")", "=", "shift+0":
 		if st.BPU() > 1 {
-			st.SetBPU(1)
+			st.ChangeBPU(1)
 			st.ControlMask = 1
 		} else {
-			st.SetBPU(6)
-			st.ControlMask = 0x3F
+			st.ChangeBPU(6)
 		}
 		a.refreshBitplaneCache()
 

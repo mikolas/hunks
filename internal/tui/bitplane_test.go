@@ -461,3 +461,45 @@ func TestParseTextAreaPixelsResponse(t *testing.T) {
 		t.Fatalf("expected zero height to return ok=false")
 	}
 }
+
+func TestAddPlanesConsecutiveAfterSteppingPlane1(t *testing.T) {
+	app := &App{}
+	st := NewBitplaneState(0x0000)
+	st.RowBytes = 40
+	st.Height = 200
+	app.Modal = Modal{
+		Kind:          ModalBitplane,
+		Bitplane:      st,
+		PixelProtocol: ProtocolHalfBlock,
+	}
+
+	// 1. User steps Plane 1 (BPU=1, ControlMask=0x01) forward by 2 KB to find bitplane 1
+	app.HandleKey("x") // +1024
+	app.HandleKey("x") // +1024 -> BPL[0] = 0x0800
+	if st.BPL[0] != 0x0800 {
+		t.Fatalf("expected BPL[0] at 0x0800, got 0x%X", st.BPL[0])
+	}
+
+	// 2. User presses '+' to add Plane 2 and '+' again to add Plane 3
+	planeSize := uint32(40 * 200) // 8000 bytes
+	app.HandleKey("+")
+	if st.BPU() != 2 || st.BPL[1] != 0x0800+planeSize {
+		t.Fatalf("expected BPL[1] at 0x%X after '+', got 0x%X", 0x0800+planeSize, st.BPL[1])
+	}
+	app.HandleKey("+")
+	if st.BPU() != 3 || st.BPL[2] != 0x0800+2*planeSize {
+		t.Fatalf("expected BPL[2] at 0x%X after second '+', got 0x%X", 0x0800+2*planeSize, st.BPL[2])
+	}
+
+	// 3. Direct jump from BPU=1 to BPU=3 via '#' also snaps Planes 2 and 3 consecutively
+	app.HandleKey("!") // Back to BPU=1
+	app.HandleKey("x") // Step Plane 1 to 0x0C00
+	app.HandleKey("#") // Jump to BPU=3
+	if st.BPU() != 3 || st.ControlMask != 0x07 {
+		t.Fatalf("expected BPU=3 ControlMask=0x07 after '#', got BPU=%d mask=0x%02X", st.BPU(), st.ControlMask)
+	}
+	if st.BPL[1] != 0x0C00+planeSize || st.BPL[2] != 0x0C00+2*planeSize {
+		t.Fatalf("expected consecutive BPL[1]=0x%X BPL[2]=0x%X, got 0x%X 0x%X",
+			0x0C00+planeSize, 0x0C00+2*planeSize, st.BPL[1], st.BPL[2])
+	}
+}

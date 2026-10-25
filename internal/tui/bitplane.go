@@ -307,21 +307,42 @@ func (s *BitplaneState) AutoSnapPlanes() {
 	}
 
 	base := s.BPL[anchorP]
-	rowBytes := max(s.RowBytes, 1)
-
+	step := uint32(s.RowStrideBytes() * max(s.Height, 1))
 	if s.Interleaved {
-		for p := anchorP; p < 8; p++ {
-			if (s.ControlMask & (1 << p)) != 0 {
-				s.BPL[p] = base + uint32((p-anchorP)*rowBytes)
+		step = uint32(max(s.RowBytes, 1))
+	}
+	for p := anchorP + 1; p < 8; p++ {
+		if (s.ControlMask & (1 << p)) != 0 {
+			s.BPL[p] = base + uint32(p-anchorP)*step
+		}
+	}
+}
+
+// ChangeBPU updates BPU to newBPU (1..7), arms any newly enabled planes in ControlMask,
+// and snaps newly added planes consecutively after the preceding plane.
+func (s *BitplaneState) ChangeBPU(newBPU int) {
+	if newBPU < 1 {
+		newBPU = 1
+	}
+	if newBPU > 7 {
+		newBPU = 7
+	}
+	oldBPU := s.BPU()
+	s.SetBPU(newBPU)
+	if newBPU > oldBPU {
+		step := uint32(s.RowStrideBytes() * max(s.Height, 1))
+		if s.Interleaved {
+			step = uint32(max(s.RowBytes, 1))
+		}
+		for p := oldBPU; p < newBPU; p++ {
+			s.ControlMask |= (1 << p)
+			if p > 0 {
+				s.BPL[p] = s.BPL[p-1] + step
 			}
 		}
-	} else {
-		planeSize := uint32(s.RowStrideBytes() * max(s.Height, 1))
-		for p := anchorP; p < 8; p++ {
-			if (s.ControlMask & (1 << p)) != 0 {
-				s.BPL[p] = base + uint32(p-anchorP)*planeSize
-			}
-		}
+		s.AutoSnapPlanes()
+	} else if s.Interleaved {
+		s.AutoSnapPlanes()
 	}
 }
 
