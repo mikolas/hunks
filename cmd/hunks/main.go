@@ -22,6 +22,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var version = "dev"
+
 func parseHex(val string) (uint32, error) {
 	return project.ParseUint32(val)
 }
@@ -271,6 +273,7 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:          "hunks",
 		Short:        "hunks — Amiga M68k Reverse Engineering System",
+		Version:      version,
 		SilenceUsage: true,
 	}
 	rootCmd.PersistentFlags().StringVarP(&workspacePath, "path", "p", ".", "Workspace root directory (defaults to current working directory)")
