@@ -37,6 +37,7 @@ out.s
 *.rom
 *.kick
 *.mod
+!go.mod
 *.xm
 *.lha
 *.lzx
