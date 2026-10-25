@@ -32,7 +32,8 @@ internal/
   db/                  controller.go (Controller + DTOs), types.go (domain enums)
   amiga/               hardware equates / vectors
   tui/                 Bubble Tea + 2D screenBuffer TUI (app, listing, keys,
-                       actions, nav, render, theme, popups, types)
+                       actions, nav, render, theme, popups, bitplane, pixelgfx,
+                       types)
 ```
 
 Core model: a project owns a flat pool of `Segment`s; a `Space` is a named,

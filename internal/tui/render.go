@@ -997,7 +997,7 @@ func renderModal(buf *screenBuffer, a *App, screen rect) {
 			"",
 			"Other:",
 			"  e Export  r Re-analyze  m Memory map  Ctrl-z Undo",
-			"  t Structs  a Aliases  ? Help  q Quit",
+			"  B Bitplanes  t Structs  a Aliases  ? Help  q Quit",
 			"",
 			"Mouse: Scroll=navigate, Right-click=context menu",
 		}

@@ -87,6 +87,8 @@ internal/
     ├── nav.go              Cursor, byte-offset (`←`/`→`), & automatic cross-hunk / jump-vector reference navigation
     ├── popups.go           XREFs (`x`), Functions (`f`), Search (`/`), Structs (`t`), and Segment/Space popups
     ├── keys.go             Keyboard/mouse event handling
+    ├── bitplane.go         Interactive Amiga Bitplane Image Viewer (`B`), `BPLCON0`/modulo geometry, planar/EHB/HAM6 decoder, `FORM ILBM` encoder, & `XTWINOPS` (`\x1b[14t`) pixel sizing
+    ├── pixelgfx.go         Terminal pixel graphics encoders (`Kitty`, `iTerm2`, `Sixel`, Unicode `Half-Block`)
     ├── theme.go            Configurable truecolor `Theme`, `LoadTheme`, and per-token operand/comment styling
     └── render.go           Fixed-grid 2D `screenBuffer` compositor, scrollbars, floating modals
 ```

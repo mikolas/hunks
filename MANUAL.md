@@ -519,7 +519,7 @@ The viewer manages a single image at a time with up to 7 bitplanes (including AG
   2. **`Synced:     1  2  3  4  5  6  7`**: Independent pointer adjustment group (`BPL1PT`–`BPL7PT`). Armed numbers are rendered in bright warm gold (`#E0AF68 bold`); unarmed numbers in legible slate gray (`#65728A`).
   3. **`Pal`**: Active color mode and live truecolor RGB swatches.
 
-The viewer queries the kernel for exact terminal window pixel dimensions (`TIOCGWINSZ`) and screen DRM modes to automatically select the optimal integer scaling factor ($1\times..8\times$) on launch, ensuring native Amiga bitmaps (320×200, 320×256, 640×512) comfortably fill the screen with crisp, square device pixels on modern high-DPI displays.
+The viewer queries the terminal text area pixel dimensions at startup via the cross-platform `XTWINOPS` escape sequence (`\x1b[14t` $\rightarrow$ `\x1b[4;<height>;<width>t`) to automatically select the optimal integer scaling factor ($1\times..8\times$) and clip oversized bitmaps to the canvas, ensuring native Amiga bitmaps (320×200, 320×256, 640×512) fit cleanly with crisp, square device pixels on Linux, macOS, and Windows.
 
 | Key | Action |
 |-----|--------|
@@ -532,26 +532,25 @@ The viewer queries the kernel for exact terminal window pixel dimensions (`TIOCG
 | `+` / `-` | Increase / decrease active bitplane depth ($BPU = 1..7$) |
 | `1`–`7` | Toggle bitplane $N$ in **Synced Selection** (arm/disarm pointer for stepping) |
 | `0` / `Space` | Toggle all active planes armed vs. plane 1 soloed in Synced Selection |
-| `!` / `"` / `#` / `¤` / `%` / `&` / `/` | Direct depth jump to $BPU$ 1..7 (international/Nordic/US layout friendly; `Shift+1`..`Shift+7`) |
-| `)` / `=` / `Shift+0` | Toggle 1 plane vs. full 6 planes |
+| `!` / `"` / `#` / `¤` (`$`) / `%` / `&` / `/` | Direct depth jump to $BPU$ 1..7 (international/Nordic/US layout friendly; `Shift+1`..`Shift+7`) |
+| `)` / `=` / `Shift+0` | Toggle 1 plane ($BPU=1$) vs. full 6 planes ($BPU=6$) |
 | `m` / `M` | Adjust scanline row modulo by $\mp 2$ bytes |
 | `Tab` | Toggle layout: Contiguous vs. Interleaved scanlines |
-| `,` / `.` | Step starting pointers of armed Synced planes by $\mp 2$ bytes |
-| `l` / `L` | Step starting pointers of armed Synced planes by $\mp 1$ scanline stride |
-| `↑` / `↓` | Step starting pointers of armed Synced planes by $\mp 1$ row |
+| `,` / `.` | Step starting pointers of armed Synced planes by $\mp 1$ word ($\mp 2$ bytes / $\mp 16$ px horizontally) |
+| `↑` / `↓` or `l` / `L` | Step starting pointers of armed Synced planes by $\mp 1$ scanline row stride (vertical line scroll) |
 | `z` / `x` | Coarse step starting pointers by $\mp 1$ KB ($\mp 1024$ bytes) |
 | `u` / `J` | Large step starting pointers by $\mp 32$ KB ($\mp 32768$ bytes) |
 | `r` / `R` | Rotate plane assignments cyclically forward / backward |
 | `c` | Cycle palette mode: Grayscale $\rightarrow$ High-Contrast $\rightarrow$ Custom |
 | `i` | Invert palette colors |
 | `b` / `B` | Adjust palette brightness bias ($-4..+4$) |
-| `e` | Toggle Hold-And-Modify 6 (HAM6) decoding (when planes = 6) |
-| `p` | Prompt for Copper list or raw $\$0RGB$ palette address/offset in binary |
+| `e` | Toggle Hold-And-Modify 6 (HAM6) decoding (when $BPU = 6$) |
+| `p` | Prompt for Copper list or raw $\$0RGB$ palette address or `+$offset` in binary |
 | `o` / `O` | Zoom out / Zoom in nearest-neighbor integer scaling ($1\times..8\times$) |
 | `v` | Cycle terminal graphics protocol (`Kitty` $\rightarrow$ `iTerm2` $\rightarrow$ `Sixel` $\rightarrow$ `Half-Block`) |
 | `w` | Export unscaled bitmap as standard PNG to `assets/<seg>_<addr>_<WxHxD>.png` |
-| `W` | Export bitmap as standard Commodore Amiga `FORM ILBM` file to `assets/` |
-| `K` | Carve bitplane byte range in database as Data (`DAT`) with label `gfx_<W>x<H>x<D>` |
+| `W` | Export bitmap as standard Commodore Amiga `FORM ILBM` file to `assets/<seg>_<addr>_<WxHxD>.ilbm` |
+| `K` | Carve bitplane byte range in database as Data (`DAT`) with label `gfx_<W>x<H>x<D>` (undoable via `Ctrl-z`) |
 | `Esc` / `q` | Close viewer and return immediately to disassembly listing |
 
 ### Theme Customization (`~/.config/hunks/theme.json`)
