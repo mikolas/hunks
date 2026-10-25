@@ -353,15 +353,15 @@ func (a *App) OpenBitplaneViewer() {
 	proto := DetectProtocol()
 
 	// Scale to fit the terminal window canvas using exact pixel measurements
-	st.Scale = a.CalculateBitplaneScale(st.WidthPx(), st.Height)
-
-	st.UpdateCache(a.BinaryData, 2, 5, proto)
+	st.Scale = a.CalculateBitplaneScale(st.VisibleWidth(), st.Height)
 
 	a.Modal = Modal{
 		Kind:          ModalBitplane,
 		Bitplane:      st,
 		PixelProtocol: proto,
 	}
+	a.StatusMsg = ""
+	a.refreshBitplaneCache()
 }
 
 func (a *App) refreshBitplaneCache() {
@@ -369,8 +369,17 @@ func (a *App) refreshBitplaneCache() {
 		return
 	}
 	st := a.Modal.Bitplane
+
+	var maxOutPxW, maxOutPxH int
+	if a.CellWidth > 0 && a.CellHeight > 0 && a.Width > 0 && a.Height > 0 {
+		canvasCols := max(a.Width-2, 10)
+		canvasRows := max(a.Height-7, 5)
+		maxOutPxW = canvasCols * a.CellWidth
+		maxOutPxH = canvasRows * a.CellHeight
+	}
+
 	// Row 6: Line 1 (bar) + Area top border (Line 2) + Line 0 (Line 3) + Line 1 (Line 4) + Divider (Line 5) -> Canvas starts at Line 6
-	st.UpdateCache(a.BinaryData, 2, 6, a.Modal.PixelProtocol)
+	st.UpdateCacheClipped(a.BinaryData, 2, 6, a.Modal.PixelProtocol, maxOutPxW, maxOutPxH)
 }
 
 // SaveBitplanePNG saves the full bitmap to assets/<seg>_<addr>_<W>x<H>x<D>.png.
@@ -381,7 +390,7 @@ func (a *App) SaveBitplanePNG() {
 	}
 	oldScale := st.Scale
 	st.Scale = 1
-	img := st.DecodeImage(a.BinaryData, st.WidthPx(), st.Height)
+	img := st.DecodeImage(a.BinaryData, 0, 0)
 	st.Scale = oldScale
 
 	dir := "assets"
@@ -391,7 +400,7 @@ func (a *App) SaveBitplanePNG() {
 	if a.Proj != nil && a.Proj.CurrentSegment() != nil {
 		segName = a.Proj.CurrentSegment().Name
 	}
-	filename := fmt.Sprintf("%s_%05X_%dx%dx%d.png", segName, st.BPL[0], st.WidthPx(), st.Height, st.Planes)
+	filename := fmt.Sprintf("%s_%05X_%dx%dx%d.png", segName, st.BPL[0], img.Bounds().Dx(), img.Bounds().Dy(), st.BPU())
 	outPath := filepath.Join(dir, filename)
 
 	f, err := os.Create(outPath)
@@ -427,7 +436,7 @@ func (a *App) SaveBitplaneIFF() {
 	if a.Proj != nil && a.Proj.CurrentSegment() != nil {
 		segName = a.Proj.CurrentSegment().Name
 	}
-	filename := fmt.Sprintf("%s_%05X_%dx%dx%d.ilbm", segName, st.BPL[0], st.WidthPx(), st.Height, st.Planes)
+	filename := fmt.Sprintf("%s_%05X_%dx%dx%d.ilbm", segName, st.BPL[0], st.VisibleWidth(), st.Height, st.BPU())
 	outPath := filepath.Join(dir, filename)
 
 	if err := os.WriteFile(outPath, iffBytes, 0644); err != nil {
@@ -440,19 +449,34 @@ func (a *App) SaveBitplaneIFF() {
 // CarveBitplaneRange carves the memory region spanned by the current bitplanes.
 func (a *App) CarveBitplaneRange() {
 	st := a.Modal.Bitplane
-	if st == nil {
+	if st == nil || a.DB == nil {
 		return
 	}
 	startOff, endOff := st.ByteSpan()
-	startAddr := a.BaseAddr + startOff
-	length := endOff - startOff
-	if length == 0 {
+	if len(a.BinaryData) > 0 && endOff > uint32(len(a.BinaryData)) {
+		endOff = uint32(len(a.BinaryData))
+	}
+	if endOff <= startOff {
 		return
 	}
+	startAddr := a.BaseAddr + startOff
+	length := endOff - startOff
 
-	label := fmt.Sprintf("gfx_%dx%dx%d", st.WidthPx(), st.Height, st.Planes)
-	_ = a.DB.DeleteCellsInRange(startAddr, startAddr+length)
-	_ = a.DB.SetLabel(startAddr, label, db.LabelDat, true)
+	label := fmt.Sprintf("gfx_%dx%dx%d", st.VisibleWidth(), st.Height, st.BPU())
+	a.pushUndoForRegion(startAddr, length)
+	if err := a.DB.WithTransaction(func() error {
+		if err := a.DB.ClearOverlaps(startAddr, length); err != nil {
+			return err
+		}
+		if err := a.DB.MarkData(startAddr, length, db.CellDataB); err != nil {
+			return err
+		}
+		return a.DB.SetLabel(startAddr, label, db.LabelDat, true)
+	}); err != nil {
+		a.StatusMsg = fmt.Sprintf("Carve failed: %v", err)
+		return
+	}
+	a.ReloadAtCursor()
 	a.StatusMsg = fmt.Sprintf("Carved bitplane range +$%05X..+$%05X (%s)", startOff, endOff, label)
 }
 

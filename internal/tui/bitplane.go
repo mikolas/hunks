@@ -1,13 +1,17 @@
 package tui
 
 import (
+	"bytes"
 	"encoding/binary"
-	"fmt"
 	"image"
 	"image/color"
 	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/charmbracelet/x/term"
+	"github.com/muesli/cancelreader"
 )
 
 // PaletteMode represents the palette coloring mode.
@@ -65,7 +69,7 @@ func NewBitplaneState(base uint32) *BitplaneState {
 }
 
 // DetectOptimalScale calculates the optimal integer scaling factor (1x..8x)
-// to display a native Amiga bitmap scaled against the physical screen resolution.
+// to display a native Amiga bitmap scaled against the terminal text area resolution.
 func DetectOptimalScale(srcW, srcH int) int {
 	if srcW <= 0 {
 		srcW = 320
@@ -88,12 +92,8 @@ func DetectOptimalScale(srcW, srcH int) int {
 		return scale
 	}
 
-	// Target the bitmap to comfortably occupy roughly half the physical screen
-	targetW := screenW / 2
-	targetH := screenH / 2
-
-	scaleW := targetW / srcW
-	scaleH := targetH / srcH
+	scaleW := screenW / srcW
+	scaleH := (screenH * 4 / 5) / srcH
 	scale := min(scaleW, scaleH)
 	if scale < 1 {
 		scale = 1
@@ -104,19 +104,88 @@ func DetectOptimalScale(srcW, srcH int) int {
 	return scale
 }
 
+var (
+	cachedScreenW int
+	cachedScreenH int
+)
+
 func detectScreenResolution() (int, int) {
-	matches, _ := filepath.Glob("/sys/class/drm/*/modes")
-	for _, m := range matches {
-		data, err := os.ReadFile(m)
-		if err == nil && len(data) > 0 {
-			lines := strings.Split(string(data), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				var w, h int
-				if n, _ := fmt.Sscanf(line, "%dx%d", &w, &h); n == 2 && w > 0 && h > 0 {
-					return w, h
-				}
+	return cachedScreenW, cachedScreenH
+}
+
+// ParseTextAreaPixelsResponse parses an XTWINOPS \x1b[4;<height>;<width>t terminal reply.
+func ParseTextAreaPixelsResponse(data []byte) (width, height int, ok bool) {
+	const prefix = "\x1b[4;"
+	start := bytes.Index(data, []byte(prefix))
+	if start < 0 {
+		return 0, 0, false
+	}
+	rest := data[start+len(prefix):]
+	end := bytes.IndexByte(rest, 't')
+	if end < 0 {
+		return 0, 0, false
+	}
+	parts := strings.Split(string(rest[:end]), ";")
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	w, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || w <= 0 || h <= 0 {
+		return 0, 0, false
+	}
+	return w, h, true
+}
+
+// QueryTextAreaPixels queries the terminal text area size in pixels by sending
+// \x1b[14t to stdout in raw mode and parsing the \x1b[4;<height>;<width>t reply
+// from stdin. Must be called at startup before Bubble Tea takes ownership of stdin.
+func QueryTextAreaPixels() (width, height int) {
+	if !term.IsTerminal(os.Stdin.Fd()) || !term.IsTerminal(os.Stdout.Fd()) {
+		return 0, 0
+	}
+
+	oldState, err := term.MakeRaw(os.Stdin.Fd())
+	if err != nil {
+		return 0, 0
+	}
+	defer func() {
+		_ = term.Restore(os.Stdin.Fd(), oldState)
+	}()
+
+	cr, err := cancelreader.NewReader(os.Stdin)
+	if err != nil {
+		return 0, 0
+	}
+	defer func() {
+		_ = cr.Close()
+	}()
+
+	if _, err := os.Stdout.WriteString("\x1b[14t"); err != nil {
+		return 0, 0
+	}
+
+	timer := time.AfterFunc(100*time.Millisecond, func() {
+		cr.Cancel()
+	})
+	defer timer.Stop()
+
+	var resp []byte
+	var buf [64]byte
+	for len(resp) < 128 {
+		n, readErr := cr.Read(buf[:])
+		if n > 0 {
+			resp = append(resp, buf[:n]...)
+			if w, h, ok := ParseTextAreaPixelsResponse(resp); ok {
+				cachedScreenW, cachedScreenH = w, h
+				return w, h
 			}
+			if bytes.IndexByte(resp, 't') >= 0 {
+				break
+			}
+		}
+		if readErr != nil {
+			break
 		}
 	}
 	return 0, 0
@@ -223,23 +292,34 @@ func (s *BitplaneState) RowStrideBytes() int {
 	return rowBytes + s.Modulo
 }
 
-// AutoSnapPlanes recalibrates starting pointers for all planes armed in ControlMask.
-// Unarmed planes stay fixed, preserving manual alignment offsets.
+// AutoSnapPlanes recalibrates starting pointers for all planes armed in ControlMask
+// relative to the lowest armed plane, keeping unarmed planes and soloed offsets intact.
 func (s *BitplaneState) AutoSnapPlanes() {
-	base := s.BPL[0]
+	anchorP := -1
+	for p := 0; p < 8; p++ {
+		if (s.ControlMask & (1 << p)) != 0 {
+			anchorP = p
+			break
+		}
+	}
+	if anchorP < 0 {
+		return
+	}
+
+	base := s.BPL[anchorP]
 	rowBytes := max(s.RowBytes, 1)
 
 	if s.Interleaved {
-		for p := 0; p < 8; p++ {
+		for p := anchorP; p < 8; p++ {
 			if (s.ControlMask & (1 << p)) != 0 {
-				s.BPL[p] = base + uint32(p*rowBytes)
+				s.BPL[p] = base + uint32((p-anchorP)*rowBytes)
 			}
 		}
 	} else {
 		planeSize := uint32(s.RowStrideBytes() * max(s.Height, 1))
-		for p := 0; p < 8; p++ {
+		for p := anchorP; p < 8; p++ {
 			if (s.ControlMask & (1 << p)) != 0 {
-				s.BPL[p] = base + uint32(p)*planeSize
+				s.BPL[p] = base + uint32(p-anchorP)*planeSize
 			}
 		}
 	}
@@ -284,9 +364,9 @@ func (s *BitplaneState) RotatePlanes(forward bool) {
 func (s *BitplaneState) ByteSpan() (uint32, uint32) {
 	minOff := s.BPL[0]
 	maxOff := s.BPL[0]
+	rowBytes := uint32(max(s.RowBytes, 1))
 	stride := uint32(max(s.RowStrideBytes(), 1))
 	height := uint32(max(s.Height, 1))
-	spanPerPlane := stride * height
 	bpu := s.BPU()
 
 	for p := 0; p < bpu; p++ {
@@ -294,7 +374,12 @@ func (s *BitplaneState) ByteSpan() (uint32, uint32) {
 		if start < minOff {
 			minOff = start
 		}
-		end := start + spanPerPlane
+		var end uint32
+		if s.Interleaved {
+			end = start + (height-1)*stride + rowBytes
+		} else {
+			end = start + height*stride
+		}
 		if end > maxOff {
 			maxOff = end
 		}
@@ -437,6 +522,18 @@ func (s *BitplaneState) BuildDefaultPalette() [128]color.RGBA {
 		}
 	}
 
+	// Extra Half-Brite (EHB): 6 planes, colors 32..63 are half brightness of 0..31
+	if bpu == 6 && s.PaletteMode != PaletteGrayscale {
+		for i := 0; i < 32; i++ {
+			pal[i+32] = color.RGBA{
+				R: pal[i].R >> 1,
+				G: pal[i].G >> 1,
+				B: pal[i].B >> 1,
+				A: 255,
+			}
+		}
+	}
+
 	// Apply Invert
 	if s.Invert {
 		numCols := min(1<<bpu, 128)
@@ -465,18 +562,6 @@ func (s *BitplaneState) BuildDefaultPalette() [128]color.RGBA {
 			pal[i].R = clamp(pal[i].R)
 			pal[i].G = clamp(pal[i].G)
 			pal[i].B = clamp(pal[i].B)
-		}
-	}
-
-	// Extra Half-Brite (EHB): 6 planes, colors 32..63 are half brightness of 0..31
-	if bpu == 6 && s.PaletteMode != PaletteGrayscale {
-		for i := 0; i < 32; i++ {
-			pal[i+32] = color.RGBA{
-				R: pal[i].R >> 1,
-				G: pal[i].G >> 1,
-				B: pal[i].B >> 1,
-				A: 255,
-			}
 		}
 	}
 
@@ -586,23 +671,37 @@ func (s *BitplaneState) DecodeImage(data []byte, maxPxW, maxPxH int) *image.RGBA
 // UpdateCache pre-decodes the image and builds the terminal escape sequence.
 // Called in Init() or Update() when parameters mutate—never inside View().
 func (s *BitplaneState) UpdateCache(data []byte, col, row int, proto PixelProtocol) {
+	s.UpdateCacheClipped(data, col, row, proto, 0, 0)
+}
+
+// UpdateCacheClipped pre-decodes the image clipped to maxOutPxW x maxOutPxH
+// and builds the terminal escape sequence.
+func (s *BitplaneState) UpdateCacheClipped(data []byte, col, row int, proto PixelProtocol, maxOutPxW, maxOutPxH int) {
 	s.CachedProtocol = proto
 	if proto == ProtocolHalfBlock {
 		s.CachedEscapeSeq = ""
 		return
 	}
 
-	// Decode the FULL native Amiga bitmap scaled by integer Scale
-	img := s.DecodeImage(data, 0, 0)
+	scale := max(min(s.Scale, 8), 1)
+	var maxSrcW, maxSrcH int
+	if maxOutPxW > 0 {
+		maxSrcW = max(maxOutPxW/scale, 1)
+	}
+	if maxOutPxH > 0 {
+		maxSrcH = max(maxOutPxH/scale, 1)
+	}
+
+	img := s.DecodeImage(data, maxSrcW, maxSrcH)
 	s.CachedEscapeSeq = EncodeEscapeSeq(img, proto, col, row)
 }
 
 // EncodeIFFILBM encodes the bitplane data into a standard Amiga IFF ILBM binary file.
 func EncodeIFFILBM(st *BitplaneState, data []byte) ([]byte, error) {
-	width := st.WidthPx()
+	width := st.VisibleWidth()
 	height := st.Height
 	planes := max(min(st.BPU(), 7), 1)
-	rowBytes := max(st.RowBytes, 1)
+	rowBytes := st.VisibleRowBytes()
 	stride := st.RowStrideBytes()
 	dataLen := len(data)
 

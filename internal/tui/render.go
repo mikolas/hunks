@@ -331,6 +331,10 @@ func RenderUI(a *App) string {
 	renderModal(buf, a, rect{x: 0, y: 0, w: width, h: height})
 
 	rendered := buf.render()
+	if a.PendingEscapeSeq != "" {
+		rendered += a.PendingEscapeSeq
+		a.PendingEscapeSeq = ""
+	}
 	if a.Modal.Kind == ModalBitplane && a.Modal.Bitplane != nil {
 		st := a.Modal.Bitplane
 		if st.CachedEscapeSeq != "" {
@@ -392,14 +396,14 @@ func renderMenuBar(buf *screenBuffer, a *App, area rect) {
 func renderStatusBar(buf *screenBuffer, a *App, area rect) {
 	t := &a.Theme
 	buf.clearRect(area, t.Bar)
-	if a.Modal.Kind == ModalBitplane {
-		buf.putString(area.x, area.y, area.w,
-			" [←/→]Word [a/d]Byte [s/h]Height [1-6]Planes [Space]Lock [c]Pal [i]Inv [o/O]Zoom [Tab]Layout [w]PNG [Esc]Exit",
-			t.Bar)
-		return
-	}
 	if a.StatusMsg != "" {
 		buf.putString(area.x, area.y, area.w, a.StatusMsg, t.BarAccent)
+		return
+	}
+	if a.Modal.Kind == ModalBitplane {
+		buf.putString(area.x, area.y, area.w,
+			" [←/→]Width [,/.;↑/↓]Move [s/h]Height [+/-]BPU [1-7]Sync [Space]All [c]Pal [i]Inv [o/O]Zoom [Tab]Layout [w]PNG [Esc]Exit",
+			t.Bar)
 		return
 	}
 	status := a.GetStatusLine()
@@ -1156,6 +1160,13 @@ func renderModal(buf *screenBuffer, a *App, screen rect) {
 	}
 }
 
+var (
+	bitplaneLabelBase      = mustParseStyle("#C0CAF5 bold")
+	bitplaneActiveSyncBase = mustParseStyle("#E0AF68 bold")
+	bitplaneActiveBPUBase  = mustParseStyle("#7AA2F7 bold")
+	bitplaneDimNumBase     = mustParseStyle("#65728A")
+)
+
 func renderBitplaneModal(buf *screenBuffer, a *App, screen rect) {
 	st := a.Modal.Bitplane
 	if st == nil {
@@ -1175,13 +1186,13 @@ func renderBitplaneModal(buf *screenBuffer, a *App, screen rect) {
 	}
 
 	accentStyle := t.BarAccent
-	labelStyle := mustParseStyle("#C0CAF5 bold")
+	labelStyle := bitplaneLabelBase
 	labelStyle.bg = t.BG.bg
-	activeSyncStyle := mustParseStyle("#E0AF68 bold")
+	activeSyncStyle := bitplaneActiveSyncBase
 	activeSyncStyle.bg = t.BG.bg
-	activeBPUStyle := mustParseStyle("#7AA2F7 bold")
+	activeBPUStyle := bitplaneActiveBPUBase
 	activeBPUStyle.bg = t.BG.bg
-	dimNumStyle := mustParseStyle("#65728A")
+	dimNumStyle := bitplaneDimNumBase
 	dimNumStyle.bg = t.BG.bg
 
 	var titleSpans []styledSpan

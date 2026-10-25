@@ -390,3 +390,74 @@ func TestBPUHardwareRegistersAndNordicKeys(t *testing.T) {
 		t.Fatalf("expected plane 7 to be re-armed after second '7'")
 	}
 }
+
+func TestAutoSnapPreservesSoloedPlaneAndInterleavedStep(t *testing.T) {
+	app := &App{}
+	st := NewBitplaneState(0x1000)
+	st.RowBytes = 40
+	st.Height = 200
+	st.SetBPU(3)
+	st.ControlMask = 0x07
+	st.AutoSnapPlanes()
+
+	// Solo plane 2 only (bit 1 = 0x02), step it to a custom offset 0x5000
+	st.ControlMask = 0x02
+	st.BPL[1] = 0x5000
+
+	// Adjusting height should NOT snap plane 2 back to BPL[0] (0x1000)
+	app.Modal = Modal{
+		Kind:          ModalBitplane,
+		Bitplane:      st,
+		PixelProtocol: ProtocolHalfBlock,
+	}
+	app.HandleKey("S") // Height + 1
+	if st.BPL[1] != 0x5000 {
+		t.Fatalf("expected soloed BPL[1] to stay at 0x5000, got 0x%X", st.BPL[1])
+	}
+
+	// Arm planes 2 and 3 (0x06): plane 2 is anchor (0x5000), plane 3 snaps relative to plane 2
+	st.ControlMask = 0x06
+	st.AutoSnapPlanes()
+	expectedBPL2 := uint32(0x5000 + 40*201)
+	if st.BPL[2] != expectedBPL2 {
+		t.Fatalf("expected BPL[2] to snap relative to BPL[1] (0x%X), got 0x%X", expectedBPL2, st.BPL[2])
+	}
+
+	// Interleaved up/down stepping uses RowStrideBytes (40 * 3 = 120)
+	st.Interleaved = true
+	st.ControlMask = 0x07
+	st.BPL[0] = 0x1000
+	st.AutoSnapPlanes()
+	app.HandleKey("down")
+	if st.BPL[0] != 0x1000+120 {
+		t.Fatalf("expected down in 3-plane interleaved mode to advance by 120 bytes, got 0x%X", st.BPL[0])
+	}
+
+	// ByteSpan in interleaved mode: 201 rows * 120 bytes = 24120 bytes total from BPL[0]
+	minOff, maxOff := st.ByteSpan()
+	if maxOff-minOff != uint32(201*120) {
+		t.Fatalf("expected interleaved ByteSpan length %d, got %d", 201*120, maxOff-minOff)
+	}
+}
+
+func TestParseTextAreaPixelsResponse(t *testing.T) {
+	// Standard XTWINOPS \x1b[4;<height>;<width>t response
+	w, h, ok := ParseTextAreaPixelsResponse([]byte("\x1b[4;1080;1920t"))
+	if !ok || w != 1920 || h != 1080 {
+		t.Fatalf("expected 1920x1080 ok=true, got %dx%d ok=%v", w, h, ok)
+	}
+
+	// Response preceded by stray bytes
+	w, h, ok = ParseTextAreaPixelsResponse([]byte("noise\x1b[4;1440;2560ttrailing"))
+	if !ok || w != 2560 || h != 1440 {
+		t.Fatalf("expected 2560x1440 ok=true, got %dx%d ok=%v", w, h, ok)
+	}
+
+	// Incomplete or invalid responses
+	if _, _, ok := ParseTextAreaPixelsResponse([]byte("\x1b[4;1080;1920")); ok {
+		t.Fatalf("expected incomplete response without 't' to return ok=false")
+	}
+	if _, _, ok := ParseTextAreaPixelsResponse([]byte("\x1b[4;0;1920t")); ok {
+		t.Fatalf("expected zero height to return ok=false")
+	}
+}

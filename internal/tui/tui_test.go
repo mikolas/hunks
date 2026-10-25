@@ -884,8 +884,8 @@ func TestBitplaneViewerInteractive(t *testing.T) {
 	if strings.Contains(out, "\x1b[#") {
 		t.Fatalf("invalid ANSI CSI sequence with # found in output: %q", out)
 	}
-	if app.Modal.PixelProtocol != ProtocolHalfBlock && !strings.Contains(out, "\x1b7") {
-		t.Fatalf("expected DEC cursor save in rendered output")
+	if app.Modal.PixelProtocol != ProtocolHalfBlock && !strings.Contains(out, "\x1b[6;2H") {
+		t.Fatalf("expected initial pixel placement at row 6 col 2 (\\x1b[6;2H) in rendered output")
 	}
 
 	// 3. Adjust geometry: increase width (+1 word = +16 px = +2 bytes)
@@ -975,21 +975,38 @@ func TestBitplaneViewerInteractive(t *testing.T) {
 		t.Fatalf("expected 640x256x4, got %dx%dx%d", st.WidthPx(), st.Height, st.Planes)
 	}
 
-	// 7. Save PNG and IFF
+	// 7. Save PNG and IFF, verify status message is visible in rendered status bar
 	t.Cleanup(func() { _ = os.RemoveAll("assets") })
 	app.HandleKey("w")
 	if !strings.Contains(app.StatusMsg, "Saved PNG") {
 		t.Fatalf("expected Saved PNG status msg, got %q", app.StatusMsg)
+	}
+	if !strings.Contains(stripANSI(RenderUI(app)), "Saved PNG") {
+		t.Fatalf("expected Saved PNG to be visible in rendered status bar")
 	}
 	app.HandleKey("W")
 	if !strings.Contains(app.StatusMsg, "Saved IFF") {
 		t.Fatalf("expected Saved IFF status msg, got %q", app.StatusMsg)
 	}
 
+	// Carve with K and verify label + Undo support
+	st.RowBytes = 2
+	st.Height = 2
+	st.SetBPU(1)
+	app.HandleKey("K")
+	if !strings.Contains(app.StatusMsg, "Carved bitplane range") {
+		t.Fatalf("expected Carved bitplane range status msg, got %q", app.StatusMsg)
+	}
+
 	// 8. Exit bitplane viewer with esc
 	app.HandleKey("esc")
 	if app.Modal.Kind != ModalNone {
 		t.Fatalf("expected ModalNone after esc, got %v", app.Modal.Kind)
+	}
+	// Undo the carve with 'ctrl+z'
+	app.HandleKey("ctrl+z")
+	if app.StatusMsg != "Undone" {
+		t.Fatalf("expected Undone after 'ctrl+z', got %q", app.StatusMsg)
 	}
 }
 

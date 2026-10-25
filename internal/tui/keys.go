@@ -916,6 +916,7 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 		case ComponentCancel:
 			a.Modal = modal
 			a.Modal.Kind = ModalBitplane
+			a.refreshBitplaneCache()
 		case ComponentContinue:
 			a.Modal = modal
 		}
@@ -925,8 +926,17 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 		switch status {
 		case ComponentDone:
 			if modal.Bitplane != nil && val != "" {
-				off, err := project.ParseUint32(val)
+				cleanVal := strings.TrimSpace(val)
+				isRel := strings.HasPrefix(cleanVal, "+")
+				if isRel {
+					cleanVal = strings.TrimSpace(strings.TrimPrefix(cleanVal, "+"))
+				}
+				parsed, err := project.ParseUint32(cleanVal)
 				if err == nil {
+					off := parsed
+					if !isRel && a.BaseAddr > 0 && parsed >= a.BaseAddr && int(parsed-a.BaseAddr) < len(a.BinaryData) {
+						off = parsed - a.BaseAddr
+					}
 					if pal, name, ok := ParseAmigaPalette(a.BinaryData, off); ok {
 						modal.Bitplane.CustomPalette = pal
 						modal.Bitplane.CustomPalName = fmt.Sprintf("%s@+$%05X", name, off)
@@ -943,6 +953,7 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 		case ComponentCancel:
 			a.Modal = modal
 			a.Modal.Kind = ModalBitplane
+			a.refreshBitplaneCache()
 		case ComponentContinue:
 			a.Modal = modal
 		}
@@ -958,14 +969,14 @@ func (a *App) handleBitplaneKey(modal Modal, key string) bool {
 		return true
 	}
 	a.Modal = modal
+	a.StatusMsg = ""
 
 	switch key {
 	case "esc", "q":
 		if modal.PixelProtocol == ProtocolKitty {
-			fmt.Print(ClearKittyPlacements())
+			a.PendingEscapeSeq = ClearKittyPlacements()
 		}
 		a.Modal = Modal{Kind: ModalNone}
-		a.StatusMsg = ""
 		return true
 
 	case "left":
@@ -1011,9 +1022,12 @@ func (a *App) handleBitplaneKey(modal Modal, key string) bool {
 		a.refreshBitplaneCache()
 
 	case "g":
+		if modal.PixelProtocol == ProtocolKitty {
+			a.PendingEscapeSeq = ClearKittyPlacements()
+		}
 		a.Modal = Modal{
 			Kind:          ModalBitplaneGeometry,
-			Input:         NewTextInput(fmt.Sprintf("%dx%dx%d", st.WidthPx(), st.Height, st.Planes)),
+			Input:         NewTextInput(fmt.Sprintf("%dx%dx%d", st.WidthPx(), st.Height, st.BPU())),
 			Bitplane:      st,
 			PixelProtocol: modal.PixelProtocol,
 		}
@@ -1049,14 +1063,10 @@ func (a *App) handleBitplaneKey(modal Modal, key string) bool {
 		a.stepBitplanes(-2)
 	case ".":
 		a.stepBitplanes(2)
-	case "l":
+	case "l", "up":
 		a.stepBitplanes(-st.RowStrideBytes())
-	case "L":
+	case "L", "down":
 		a.stepBitplanes(st.RowStrideBytes())
-	case "up":
-		a.stepBitplanes(-st.RowBytes)
-	case "down":
-		a.stepBitplanes(st.RowBytes)
 	case "z":
 		a.stepBitplanes(-1024)
 	case "x":
@@ -1142,6 +1152,9 @@ func (a *App) handleBitplaneKey(modal Modal, key string) bool {
 		st.HAM = !st.HAM
 		a.refreshBitplaneCache()
 	case "p":
+		if modal.PixelProtocol == ProtocolKitty {
+			a.PendingEscapeSeq = ClearKittyPlacements()
+		}
 		a.Modal = Modal{
 			Kind:          ModalBitplanePalette,
 			Input:         EmptyTextInput(),
@@ -1158,13 +1171,14 @@ func (a *App) handleBitplaneKey(modal Modal, key string) bool {
 		a.refreshBitplaneCache()
 
 	case "v":
-		next := (a.Modal.PixelProtocol + 1) % 5
+		prev := a.Modal.PixelProtocol
+		next := (prev + 1) % 5
 		if next == ProtocolAuto {
 			next = ProtocolKitty
 		}
 		a.Modal.PixelProtocol = next
-		if next == ProtocolKitty {
-			fmt.Print(ClearKittyPlacements())
+		if prev == ProtocolKitty {
+			a.PendingEscapeSeq = ClearKittyPlacements()
 		}
 		a.refreshBitplaneCache()
 

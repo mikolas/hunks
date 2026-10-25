@@ -63,6 +63,8 @@ func DetectProtocol() PixelProtocol {
 	return ProtocolHalfBlock
 }
 
+var fastPNGEncoder = png.Encoder{CompressionLevel: png.BestSpeed}
+
 // EncodeKittyPNG encodes img into a Kitty Graphics Protocol sequence.
 // It wraps the sequence in DEC cursor save (\x1b7), cursor positioning (\x1b[<row>;<col>H),
 // and DEC cursor restore (\x1b8).
@@ -74,7 +76,7 @@ func EncodeKittyPNG(img *image.RGBA, col, row int) string {
 	}
 
 	var pngBuf bytes.Buffer
-	if err := png.Encode(&pngBuf, img); err != nil {
+	if err := fastPNGEncoder.Encode(&pngBuf, img); err != nil {
 		return ""
 	}
 
@@ -129,7 +131,7 @@ func EncodeItermPNG(img *image.RGBA, col, row int) string {
 	}
 
 	var pngBuf bytes.Buffer
-	if err := png.Encode(&pngBuf, img); err != nil {
+	if err := fastPNGEncoder.Encode(&pngBuf, img); err != nil {
 		return ""
 	}
 
@@ -151,19 +153,45 @@ func EncodeSixel(img *image.RGBA, col, row int) string {
 		return ""
 	}
 
-	// Extract unique colors (up to 64)
+	// Pass 1: Extract unique colors (up to 64) and build a flat palette index buffer
 	palette := make([]color.RGBA, 0, 64)
-	colorMap := make(map[color.RGBA]int)
+	colorMap := make(map[color.RGBA]uint8, 64)
+	pixelIdx := make([]uint8, width*height)
 
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			c := img.RGBAAt(x, y)
-			if _, exists := colorMap[c]; !exists {
+	var lastColor color.RGBA
+	var lastIdx uint8
+	hasLast := false
+
+	for y := 0; y < height; y++ {
+		srcY := bounds.Min.Y + y
+		rowStart := srcY*img.Stride + bounds.Min.X*4
+		idxRow := y * width
+		for x := 0; x < width; x++ {
+			off := rowStart + x*4
+			c := color.RGBA{
+				R: img.Pix[off+0],
+				G: img.Pix[off+1],
+				B: img.Pix[off+2],
+				A: img.Pix[off+3],
+			}
+			if hasLast && c == lastColor {
+				pixelIdx[idxRow+x] = lastIdx
+				continue
+			}
+			cIdx, exists := colorMap[c]
+			if !exists {
 				if len(palette) < 64 {
-					colorMap[c] = len(palette)
+					cIdx = uint8(len(palette))
+					colorMap[c] = cIdx
 					palette = append(palette, c)
+				} else {
+					cIdx = 0
 				}
 			}
+			lastColor = c
+			lastIdx = cIdx
+			hasLast = true
+			pixelIdx[idxRow+x] = cIdx
 		}
 	}
 
@@ -181,50 +209,53 @@ func EncodeSixel(img *image.RGBA, col, row int) string {
 		sb.WriteString(fmt.Sprintf("#%d;2;%d;%d;%d", idx, rPct, gPct, bPct))
 	}
 
-	// Emit sixel scanbands (6 vertical pixel rows per band)
-	for bandY := bounds.Min.Y; bandY < bounds.Max.Y; bandY += 6 {
+	sixelRow := make([]byte, width)
+
+	// Pass 2: Emit sixel scanbands (6 vertical pixel rows per band)
+	for bandY := 0; bandY < height; bandY += 6 {
+		var activeColors uint64
+		maxBit := min(6, height-bandY)
+		for bit := 0; bit < maxBit; bit++ {
+			rowOff := (bandY + bit) * width
+			for x := 0; x < width; x++ {
+				activeColors |= 1 << pixelIdx[rowOff+x]
+			}
+		}
+
 		for colorIdx := range palette {
-			var sixelRow []byte
-			hasPixels := false
-
-			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if (activeColors & (1 << colorIdx)) == 0 {
+				continue
+			}
+			cIdx := uint8(colorIdx)
+			for x := 0; x < width; x++ {
 				var sixelVal byte
-				for bit := 0; bit < 6; bit++ {
-					py := bandY + bit
-					if py < bounds.Max.Y {
-						c := img.RGBAAt(x, py)
-						if cIdx, ok := colorMap[c]; ok && cIdx == colorIdx {
-							sixelVal |= 1 << bit
-						}
+				for bit := 0; bit < maxBit; bit++ {
+					if pixelIdx[(bandY+bit)*width+x] == cIdx {
+						sixelVal |= 1 << bit
 					}
 				}
-				if sixelVal != 0 {
-					hasPixels = true
-				}
-				sixelRow = append(sixelRow, sixelVal+63)
+				sixelRow[x] = sixelVal + 63
 			}
 
-			if hasPixels {
-				sb.WriteString(fmt.Sprintf("#%d", colorIdx))
-				// RLE compression for the sixel row
-				runChar := byte(0)
-				runLen := 0
-				for _, ch := range sixelRow {
-					if ch == runChar {
-						runLen++
-					} else {
-						if runLen > 0 {
-							emitSixelRun(&sb, runChar, runLen)
-						}
-						runChar = ch
-						runLen = 1
+			sb.WriteString(fmt.Sprintf("#%d", colorIdx))
+			// RLE compression for the sixel row
+			runChar := byte(0)
+			runLen := 0
+			for _, ch := range sixelRow {
+				if ch == runChar {
+					runLen++
+				} else {
+					if runLen > 0 {
+						emitSixelRun(&sb, runChar, runLen)
 					}
+					runChar = ch
+					runLen = 1
 				}
-				if runLen > 0 {
-					emitSixelRun(&sb, runChar, runLen)
-				}
-				sb.WriteByte('$') // Carriage return to start of sixel band
 			}
+			if runLen > 0 {
+				emitSixelRun(&sb, runChar, runLen)
+			}
+			sb.WriteByte('$') // Carriage return to start of sixel band
 		}
 		sb.WriteByte('-') // Line feed to next 6-row band
 	}
