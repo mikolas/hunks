@@ -72,8 +72,9 @@ type Recognizer interface {
 }
 
 // Recognizers returns the built-in recognizer registry in ExoticRipper format-ID order:
-//   2 Final Music System, 5/6 Future Composer, 22 SoundTracker 2.6, 23 ProTracker,
-//   35 David Whittaker, 42 Old SoundTracker, 43 Delta Music 1.0.
+//
+//	2 Final Music System, 5/6 Future Composer, 22 SoundTracker 2.6, 23 ProTracker,
+//	35 David Whittaker, 42 Old SoundTracker, 43 Delta Music 1.0.
 func Recognizers() []Recognizer {
 	return []Recognizer{
 		FinalMusicSystem{},

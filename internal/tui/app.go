@@ -13,28 +13,28 @@ import (
 
 // App holds the full interactive TUI state and implements tea.Model.
 type App struct {
-	Proj            *project.Project
-	DB              *db.Controller
-	Theme           Theme
-	SelectedIdx     int
-	ScrollOffset    int
-	DisasmRows      []ListingRow
-	ShouldQuit      bool
-	Modal           Modal
-	NavHistory      []uint32
-	StatusMsg       string
-	BinaryData      []byte
-	BaseAddr        uint32
-	IsRelocatable   bool
-	CachedCodeBytes uint32
-	DataByteOff     int
-	UndoStack       []UndoEntry
-	SelectionStart  *uint32
-	Width           int
-	Height          int
-	LastWidth       int
-	PixelWidth      int
-	PixelHeight     int
+	Proj             *project.Project
+	DB               *db.Controller
+	Theme            Theme
+	SelectedIdx      int
+	ScrollOffset     int
+	DisasmRows       []ListingRow
+	ShouldQuit       bool
+	Modal            Modal
+	NavHistory       []uint32
+	StatusMsg        string
+	BinaryData       []byte
+	BaseAddr         uint32
+	IsRelocatable    bool
+	CachedCodeBytes  uint32
+	DataByteOff      int
+	UndoStack        []UndoEntry
+	SelectionStart   *uint32
+	Width            int
+	Height           int
+	LastWidth        int
+	PixelWidth       int
+	PixelHeight      int
 	CellWidth        int
 	CellHeight       int
 	PendingEscapeSeq string

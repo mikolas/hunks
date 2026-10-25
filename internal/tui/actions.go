@@ -479,4 +479,3 @@ func (a *App) CarveBitplaneRange() {
 	a.ReloadAtCursor()
 	a.StatusMsg = fmt.Sprintf("Carved bitplane range +$%05X..+$%05X (%s)", startOff, endOff, label)
 }
-

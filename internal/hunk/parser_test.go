@@ -16,13 +16,13 @@ func TestParseSyntheticMultiHunkBinary(t *testing.T) {
 
 	// HUNK_HEADER: 3 hunks (CODE public 8B, DATA chip 8B, BSS chip 64B)
 	push(HunkHeader)
-	push(0)                         // resident libs
-	push(3)                         // table_size = 3
-	push(0)                         // first_hunk = 0
-	push(2)                         // last_hunk = 2
-	push(2)                         // hunk0: 2 longs (8B) public
-	push((1 << 30) | 2)             // hunk1: 2 longs (8B) chip
-	push((1 << 30) | 16)            // hunk2: 16 longs (64B) chip
+	push(0)              // resident libs
+	push(3)              // table_size = 3
+	push(0)              // first_hunk = 0
+	push(2)              // last_hunk = 2
+	push(2)              // hunk0: 2 longs (8B) public
+	push((1 << 30) | 2)  // hunk1: 2 longs (8B) chip
+	push((1 << 30) | 16) // hunk2: 16 longs (64B) chip
 
 	// Hunk 0: CODE + RELOC32 to hunk 1
 	push(HunkCode)

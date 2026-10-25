@@ -1,0 +1,92 @@
+# Continuous Integration workflow for hunks.
+# Note: Byte-for-byte vasmm68k_mot reassembly parity on real Amiga targets is a
+# local development verification step (see TESTING.md); CI runs strictly on
+# synthetic, copyright-free unit tests (AGENTS.md Invariant #6).
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['v*']
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  lint:
+    name: Lint & Invariants
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Check gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not formatted with gofmt:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: Verify Go modules
+        run: |
+          go mod verify
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Verify SQL isolation invariant (AGENTS.md Invariant #2)
+        run: |
+          if grep -rnE '\.(Query|QueryRow|Exec)\(' cmd/ internal/analyzer/ internal/emitter/ internal/callgraph/ internal/project/ internal/tui/ --exclude='*_test.go'; then
+            echo "Error: raw SQL found outside internal/db/ (violates AGENTS.md Hard Invariant #2)"
+            exit 1
+          fi
+
+  test:
+    name: Build & Test (${{ matrix.os }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Build CLI (pure Go, CGO_ENABLED=0)
+        run: go build -v -trimpath ./cmd/hunks
+
+      - name: Run unit tests (CGO_ENABLED=0)
+        run: go test -v ./...
+
+      - name: Run race detector (Linux)
+        if: runner.os == 'Linux'
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./...

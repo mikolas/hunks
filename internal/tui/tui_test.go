@@ -754,6 +754,7 @@ func TestThemeLoadAndTokenization(t *testing.T) {
 
 	// Partial ~/.config/hunks/theme.json override preserves untouched defaults.
 	tmp := t.TempDir()
+	t.Setenv("HUNKS_THEME", "")
 	t.Setenv("XDG_CONFIG_HOME", tmp)
 	cfgDir := filepath.Join(tmp, "hunks")
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
@@ -1009,4 +1010,3 @@ func TestBitplaneViewerInteractive(t *testing.T) {
 		t.Fatalf("expected Undone after 'ctrl+z', got %q", app.StatusMsg)
 	}
 }
-

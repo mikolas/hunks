@@ -733,12 +733,12 @@ func EncodeIFFILBM(st *BitplaneState, data []byte) ([]byte, error) {
 	binary.BigEndian.PutUint16(bmhd[4:6], 0) // x
 	binary.BigEndian.PutUint16(bmhd[6:8], 0) // y
 	bmhd[8] = uint8(planes)
-	bmhd[9] = 0  // masking: mskNone
-	bmhd[10] = 0 // compression: cmpNone
-	bmhd[11] = 0 // pad
+	bmhd[9] = 0                                // masking: mskNone
+	bmhd[10] = 0                               // compression: cmpNone
+	bmhd[11] = 0                               // pad
 	binary.BigEndian.PutUint16(bmhd[12:14], 0) // transparentColor
-	bmhd[14] = 10 // xAspect
-	bmhd[15] = 11 // yAspect (PAL standard)
+	bmhd[14] = 10                              // xAspect
+	bmhd[15] = 11                              // yAspect (PAL standard)
 	binary.BigEndian.PutUint16(bmhd[16:18], uint16(width))
 	binary.BigEndian.PutUint16(bmhd[18:20], uint16(height))
 

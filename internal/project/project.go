@@ -345,17 +345,17 @@ type AnalysisData struct {
 }
 
 type ProjectData struct {
-	TargetName         string                       `json:"target_name"`
-	Segments           []Segment                    `json:"segments"`
-	Spaces             []Space                      `json:"spaces"`
-	ActiveSpace        string                       `json:"active_space"`
-	Output             string                       `json:"output"`
-	EntryPoints        []EntryPoint                 `json:"entry_points"`
-	MemoryRegions      []MemoryRegion               `json:"memory_regions"`
-	Structs            map[string]map[string]string `json:"structs"`
-	RegisterAliases    map[string]string            `json:"register_aliases"`
-	Carves             []Carve                      `json:"carves"`
-	Analysis           AnalysisData                 `json:"_analysis"`
+	TargetName      string                       `json:"target_name"`
+	Segments        []Segment                    `json:"segments"`
+	Spaces          []Space                      `json:"spaces"`
+	ActiveSpace     string                       `json:"active_space"`
+	Output          string                       `json:"output"`
+	EntryPoints     []EntryPoint                 `json:"entry_points"`
+	MemoryRegions   []MemoryRegion               `json:"memory_regions"`
+	Structs         map[string]map[string]string `json:"structs"`
+	RegisterAliases map[string]string            `json:"register_aliases"`
+	Carves          []Carve                      `json:"carves"`
+	Analysis        AnalysisData                 `json:"_analysis"`
 }
 
 type Project struct {
