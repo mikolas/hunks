@@ -258,6 +258,8 @@ func (a *App) HandleKey(key string) bool {
 		}
 	case "?":
 		a.Modal = Modal{Kind: ModalHelp}
+	case "B":
+		a.OpenBitplaneViewer()
 	}
 	return true
 }
@@ -886,8 +888,310 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 		case ComponentContinue:
 			a.Modal = modal
 		}
+	case ModalBitplane:
+		return a.handleBitplaneKey(modal, key)
+	case ModalBitplaneGeometry:
+		status, val := modal.Input.HandleKey(key)
+		switch status {
+		case ComponentDone:
+			if modal.Bitplane != nil && val != "" {
+				var w, h, d int
+				n, _ := fmt.Sscanf(val, "%dx%dx%d", &w, &h, &d)
+				if n >= 2 {
+					modal.Bitplane.RowBytes = max(w/8, 1)
+					modal.Bitplane.Height = max(h, 1)
+					if n == 3 {
+						modal.Bitplane.SetBPU(d)
+						modal.Bitplane.ControlMask &= uint8((1 << modal.Bitplane.BPU()) - 1)
+						if modal.Bitplane.ControlMask == 0 {
+							modal.Bitplane.ControlMask = uint8((1 << modal.Bitplane.BPU()) - 1)
+						}
+					}
+					modal.Bitplane.AutoSnapPlanes()
+				}
+			}
+			a.Modal = modal
+			a.Modal.Kind = ModalBitplane
+			a.refreshBitplaneCache()
+		case ComponentCancel:
+			a.Modal = modal
+			a.Modal.Kind = ModalBitplane
+			a.refreshBitplaneCache()
+		case ComponentContinue:
+			a.Modal = modal
+		}
+		return true
+	case ModalBitplanePalette:
+		status, val := modal.Input.HandleKey(key)
+		switch status {
+		case ComponentDone:
+			if modal.Bitplane != nil && val != "" {
+				cleanVal := strings.TrimSpace(val)
+				isRel := strings.HasPrefix(cleanVal, "+")
+				if isRel {
+					cleanVal = strings.TrimSpace(strings.TrimPrefix(cleanVal, "+"))
+				}
+				parsed, err := project.ParseUint32(cleanVal)
+				if err == nil {
+					off := parsed
+					if !isRel && a.BaseAddr > 0 && parsed >= a.BaseAddr && int(parsed-a.BaseAddr) < len(a.BinaryData) {
+						off = parsed - a.BaseAddr
+					}
+					if pal, name, ok := ParseAmigaPalette(a.BinaryData, off); ok {
+						modal.Bitplane.CustomPalette = pal
+						modal.Bitplane.CustomPalName = fmt.Sprintf("%s@+$%05X", name, off)
+						modal.Bitplane.PaletteMode = PaletteCustom
+						a.StatusMsg = fmt.Sprintf("Loaded %s palette from +$%05X", name, off)
+					} else {
+						a.StatusMsg = fmt.Sprintf("No palette found at +$%05X", off)
+					}
+				}
+			}
+			a.Modal = modal
+			a.Modal.Kind = ModalBitplane
+			a.refreshBitplaneCache()
+		case ComponentCancel:
+			a.Modal = modal
+			a.Modal.Kind = ModalBitplane
+			a.refreshBitplaneCache()
+		case ComponentContinue:
+			a.Modal = modal
+		}
+		return true
 	}
 	return true
+}
+
+func (a *App) handleBitplaneKey(modal Modal, key string) bool {
+	st := modal.Bitplane
+	if st == nil {
+		a.Modal = Modal{Kind: ModalNone}
+		return true
+	}
+	a.Modal = modal
+	a.StatusMsg = ""
+
+	switch key {
+	case "esc", "q":
+		if modal.PixelProtocol == ProtocolKitty {
+			a.PendingEscapeSeq = ClearKittyPlacements()
+		}
+		a.Modal = Modal{Kind: ModalNone}
+		return true
+
+	case "left":
+		st.RowBytes = max(st.RowBytes-2, 2)
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+	case "right":
+		st.RowBytes += 2
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+	case "a":
+		st.RowBytes = max(st.RowBytes-1, 1)
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+	case "d":
+		st.RowBytes += 1
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+	case "A":
+		st.RowBytes = max(st.RowBytes-16, 2)
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+	case "D":
+		st.RowBytes += 16
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+
+	case "s":
+		st.Height = max(st.Height-1, 1)
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+	case "S":
+		st.Height += 1
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+	case "h":
+		st.Height = max(st.Height-8, 1)
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+	case "H":
+		st.Height += 8
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+
+	case "g":
+		if modal.PixelProtocol == ProtocolKitty {
+			a.PendingEscapeSeq = ClearKittyPlacements()
+		}
+		a.Modal = Modal{
+			Kind:          ModalBitplaneGeometry,
+			Input:         NewTextInput(fmt.Sprintf("%dx%dx%d", st.WidthPx(), st.Height, st.BPU())),
+			Bitplane:      st,
+			PixelProtocol: modal.PixelProtocol,
+		}
+		return true
+
+	case "+":
+		if st.BPU() < 7 {
+			st.ChangeBPU(st.BPU() + 1)
+			a.refreshBitplaneCache()
+		}
+	case "-":
+		if st.BPU() > 1 {
+			st.ChangeBPU(st.BPU() - 1)
+			a.refreshBitplaneCache()
+		}
+
+	case "m":
+		st.Modulo -= 2
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+	case "M":
+		st.Modulo += 2
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+
+	case "tab":
+		st.Interleaved = !st.Interleaved
+		st.AutoSnapPlanes()
+		a.refreshBitplaneCache()
+
+	case ",":
+		a.stepBitplanes(-2)
+	case ".":
+		a.stepBitplanes(2)
+	case "l", "up":
+		a.stepBitplanes(-st.RowStrideBytes())
+	case "L", "down":
+		a.stepBitplanes(st.RowStrideBytes())
+	case "z":
+		a.stepBitplanes(-1024)
+	case "x":
+		a.stepBitplanes(1024)
+	case "u":
+		a.stepBitplanes(-32768)
+	case "J":
+		a.stepBitplanes(32768)
+
+	case "1", "2", "3", "4", "5", "6", "7":
+		pIdx := int(key[0] - '1')
+		st.ControlMask ^= (1 << pIdx)
+		a.refreshBitplaneCache()
+	case "0", " ":
+		activeMask := uint8((1 << st.BPU()) - 1)
+		if st.ControlMask == activeMask {
+			st.ControlMask = 1 // Solo plane 1
+		} else {
+			st.ControlMask = activeMask // Arm all active planes
+		}
+		a.refreshBitplaneCache()
+
+	// Direct bitplane depth selection (BPU 1..7)
+	// Supports US, UK, Scandinavian, German, French, and international keyboards:
+	case "!", "shift+1":
+		st.ChangeBPU(1)
+		st.ControlMask = 1
+		a.refreshBitplaneCache()
+	case "@", "\"", "shift+2":
+		st.ChangeBPU(2)
+		a.refreshBitplaneCache()
+	case "#", "£", "§", "shift+3":
+		st.ChangeBPU(3)
+		a.refreshBitplaneCache()
+	case "$", "¤", "shift+4":
+		st.ChangeBPU(4)
+		a.refreshBitplaneCache()
+	case "%", "shift+5":
+		st.ChangeBPU(5)
+		a.refreshBitplaneCache()
+	case "^", "&", "shift+6":
+		st.ChangeBPU(6)
+		a.refreshBitplaneCache()
+	case "/", "shift+7":
+		st.ChangeBPU(7)
+		a.refreshBitplaneCache()
+	case ")", "=", "shift+0":
+		if st.BPU() > 1 {
+			st.ChangeBPU(1)
+			st.ControlMask = 1
+		} else {
+			st.ChangeBPU(6)
+		}
+		a.refreshBitplaneCache()
+
+	case "r":
+		st.RotatePlanes(true)
+		a.refreshBitplaneCache()
+	case "R":
+		st.RotatePlanes(false)
+		a.refreshBitplaneCache()
+
+	case "c":
+		st.PaletteMode = (st.PaletteMode + 1) % 3
+		a.refreshBitplaneCache()
+	case "i":
+		st.Invert = !st.Invert
+		a.refreshBitplaneCache()
+	case "b":
+		st.Brightness = max(st.Brightness-1, -4)
+		a.refreshBitplaneCache()
+	case "B":
+		st.Brightness = min(st.Brightness+1, 4)
+		a.refreshBitplaneCache()
+	case "e":
+		st.HAM = !st.HAM
+		a.refreshBitplaneCache()
+	case "p":
+		if modal.PixelProtocol == ProtocolKitty {
+			a.PendingEscapeSeq = ClearKittyPlacements()
+		}
+		a.Modal = Modal{
+			Kind:          ModalBitplanePalette,
+			Input:         EmptyTextInput(),
+			Bitplane:      st,
+			PixelProtocol: modal.PixelProtocol,
+		}
+		return true
+
+	case "o":
+		st.Scale = max(st.Scale-1, 1)
+		a.refreshBitplaneCache()
+	case "O":
+		st.Scale = min(st.Scale+1, 8)
+		a.refreshBitplaneCache()
+
+	case "v":
+		prev := a.Modal.PixelProtocol
+		next := (prev + 1) % 5
+		if next == ProtocolAuto {
+			next = ProtocolKitty
+		}
+		a.Modal.PixelProtocol = next
+		if prev == ProtocolKitty {
+			a.PendingEscapeSeq = ClearKittyPlacements()
+		}
+		a.refreshBitplaneCache()
+
+	case "w":
+		a.SaveBitplanePNG()
+	case "W":
+		a.SaveBitplaneIFF()
+	case "K":
+		a.CarveBitplaneRange()
+	}
+
+	return true
+}
+
+func (a *App) stepBitplanes(delta int) {
+	st := a.Modal.Bitplane
+	if st == nil {
+		return
+	}
+	st.StepControlPlanes(delta)
+	a.refreshBitplaneCache()
 }
 
 // HandleMouseMsg processes mouse scroll and clicks in Bubble Tea.

@@ -503,8 +503,55 @@ Instructions that jump/call across hunks or through a register jump-vector table
 | `t` | Struct editor (`n` = new struct, `Enter` = edit struct fields, `a` = add field, `d` = delete, `Esc` = back) |
 | `a` | Register alias editor (maps a base register to a struct for automatic `d16(An)` field substitution) |
 | `Ctrl-z` | Undo last type-marking action |
+| `B` | Open interactive Bitplane Image Viewer at cursor address |
 | `?` | Help popup |
 | `q` | Quit |
+
+### Interactive Bitplane Image Viewer (`B`)
+
+Pressing `B` in the Disassembly view opens the integrated, keyboard-driven Bitplane Image Viewer directly inside the terminal. It renders true high-resolution Amiga bitmaps using modern terminal pixel graphics (Kitty Graphics Protocol, iTerm2 inline images, or Sixel) with zero-dependency Unicode Half-Block (`▀`) fallback.
+
+The viewer manages a single image at a time with up to 7 bitplanes (including AGA / special test mode). The status panel displays the exact Amiga custom chipset registers and human-readable geometry:
+- **Top Border**: Base cursor address, display window (`DIW: 320×200`), data fetch/buffer stride (`DDF: 384 px (48 B)`), integer zoom factor, and pixel graphics protocol. If the buffer in RAM is wider than the native visible window (320 in Lores, 640 in Hires), the viewer automatically cuts the extra margin so the visible window displays distortion-free.
+- **Register Statusline**: `BPLCON0` raw hex word, `BPL1MOD` & `BPL2MOD` line modulos (accounting for contiguous buffer cuts and interleaved multi-plane strides), and active bitplane starting pointers (`BPLxPT: 1:$04000 2:$05F40 ...`).
+- **Indicators Statusline**:
+  1. **`BPU:        1  2  3  4  5  6  7`**: Sequential active bitplane count in `BPLCON0` (bits 14–12). Digits $1..BPU$ are highlighted in bright cyan (`#7AA2F7 bold`); inactive digits in legible slate gray (`#65728A`).
+  2. **`Synced:     1  2  3  4  5  6  7`**: Independent pointer adjustment group (`BPL1PT`–`BPL7PT`). Armed numbers are rendered in bright warm gold (`#E0AF68 bold`); unarmed numbers in legible slate gray (`#65728A`).
+  3. **`Pal`**: Active color mode and live truecolor RGB swatches.
+
+The viewer queries the terminal text area pixel dimensions at startup via the cross-platform `XTWINOPS` escape sequence (`\x1b[14t` $\rightarrow$ `\x1b[4;<height>;<width>t`) to automatically select the optimal integer scaling factor ($1\times..8\times$) and clip oversized bitmaps to the canvas, ensuring native Amiga bitmaps (320×200, 320×256, 640×512) fit cleanly with crisp, square device pixels on Linux, macOS, and Windows.
+
+| Key | Action |
+|-----|--------|
+| `←` / `→` | Adjust bitmap width by $\mp 1$ word ($\mp 16$ px / $\mp 2$ bytes) |
+| `a` / `d` | Adjust bitmap width by $\mp 1$ byte ($\mp 8$ px) |
+| `A` / `D` | Adjust bitmap width by $\mp 16$ bytes ($\mp 128$ px) |
+| `s` / `S` | Adjust scanline height by $\mp 1$ line |
+| `h` / `H` | Adjust scanline height by $\mp 8$ lines |
+| `g` | Direct geometry input dialog (e.g. `320x200` or `320x200x4`) |
+| `+` / `-` | Increase / decrease active bitplane depth ($BPU = 1..7$) |
+| `1`–`7` | Toggle bitplane $N$ in **Synced Selection** (arm/disarm pointer for stepping) |
+| `0` / `Space` | Toggle all active planes armed vs. plane 1 soloed in Synced Selection |
+| `!` / `"` / `#` / `¤` (`$`) / `%` / `&` / `/` | Direct depth jump to $BPU$ 1..7 (international/Nordic/US layout friendly; `Shift+1`..`Shift+7`) |
+| `)` / `=` / `Shift+0` | Toggle 1 plane ($BPU=1$) vs. full 6 planes ($BPU=6$) |
+| `m` / `M` | Adjust scanline row modulo by $\mp 2$ bytes |
+| `Tab` | Toggle layout: Contiguous vs. Interleaved scanlines |
+| `,` / `.` | Step starting pointers of armed Synced planes by $\mp 1$ word ($\mp 2$ bytes / $\mp 16$ px horizontally) |
+| `↑` / `↓` or `l` / `L` | Step starting pointers of armed Synced planes by $\mp 1$ scanline row stride (vertical line scroll) |
+| `z` / `x` | Coarse step starting pointers by $\mp 1$ KB ($\mp 1024$ bytes) |
+| `u` / `J` | Large step starting pointers by $\mp 32$ KB ($\mp 32768$ bytes) |
+| `r` / `R` | Rotate plane assignments cyclically forward / backward |
+| `c` | Cycle palette mode: Grayscale $\rightarrow$ High-Contrast $\rightarrow$ Custom |
+| `i` | Invert palette colors |
+| `b` / `B` | Adjust palette brightness bias ($-4..+4$) |
+| `e` | Toggle Hold-And-Modify 6 (HAM6) decoding (when $BPU = 6$) |
+| `p` | Prompt for Copper list or raw $\$0RGB$ palette address or `+$offset` in binary |
+| `o` / `O` | Zoom out / Zoom in nearest-neighbor integer scaling ($1\times..8\times$) |
+| `v` | Cycle terminal graphics protocol (`Kitty` $\rightarrow$ `iTerm2` $\rightarrow$ `Sixel` $\rightarrow$ `Half-Block`) |
+| `w` | Export unscaled bitmap as standard PNG to `assets/<seg>_<addr>_<WxHxD>.png` |
+| `W` | Export bitmap as standard Commodore Amiga `FORM ILBM` file to `assets/<seg>_<addr>_<WxHxD>.ilbm` |
+| `K` | Carve bitplane byte range in database as Data (`DAT`) with label `gfx_<W>x<H>x<D>` (undoable via `Ctrl-z`) |
+| `Esc` / `q` | Close viewer and return immediately to disassembly listing |
 
 ### Theme Customization (`~/.config/hunks/theme.json`)
 

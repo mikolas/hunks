@@ -808,3 +808,205 @@ func TestThemeLoadAndTokenization(t *testing.T) {
 	}
 }
 
+func TestBitplaneViewerInteractive(t *testing.T) {
+	tmpDir := t.TempDir()
+	proj := project.New(filepath.Join(tmpDir, "project.json"))
+	proj.Data.Segments = append(proj.Data.Segments, project.Segment{
+		Name:        "seg0",
+		AllocSize:   4096,
+		Base:        0x1000,
+		Relocatable: false,
+	})
+	proj.ActiveSegmentName = "seg0"
+
+	dbCtrl, err := db.New(filepath.Join(tmpDir, "project.db"))
+	if err != nil {
+		t.Fatalf("failed to create db: %v", err)
+	}
+	defer dbCtrl.Close()
+	proj.SyncDBScope(dbCtrl)
+
+	app, err := NewApp(proj, dbCtrl)
+	if err != nil {
+		t.Fatalf("failed to create app: %v", err)
+	}
+	app.Width = 100
+	app.Height = 30
+	app.BaseAddr = 0x1000
+	app.BinaryData = make([]byte, 4096)
+	for i := 0; i < 4096; i++ {
+		app.BinaryData[i] = byte(i)
+	}
+
+	// 1. Press B to open bitplane viewer
+	app.HandleKey("B")
+	if app.Modal.Kind != ModalBitplane {
+		t.Fatalf("expected ModalBitplane, got %v", app.Modal.Kind)
+	}
+	st := app.Modal.Bitplane
+	if st == nil {
+		t.Fatalf("expected Bitplane state to be non-nil")
+	}
+	if st.Planes != 1 {
+		t.Fatalf("expected initial Planes 1, got %d", st.Planes)
+	}
+	if st.Scale < 1 {
+		t.Fatalf("expected initial Scale >= 1, got %d", st.Scale)
+	}
+	if st.CachedEscapeSeq == "" && app.Modal.PixelProtocol != ProtocolHalfBlock {
+		t.Fatalf("expected CachedEscapeSeq to be populated")
+	}
+
+	// 2. Render UI and verify output contains Bitplanes title, registers, both indicator groups, and CachedEscapeSeq
+	out := RenderUI(app)
+	plain := stripANSI(out)
+	if !strings.Contains(plain, "Bitplanes") {
+		t.Fatalf("expected Bitplanes in rendered output: %q", plain)
+	}
+	if !strings.Contains(plain, "Synced:") {
+		t.Fatalf("expected Synced: indicator group in rendered output: %q", plain)
+	}
+	if !strings.Contains(plain, "BPU:") {
+		t.Fatalf("expected BPU: indicator group in rendered output: %q", plain)
+	}
+	if !strings.Contains(plain, "BPLCON0:") {
+		t.Fatalf("expected BPLCON0: in rendered output: %q", plain)
+	}
+	if !strings.Contains(plain, "DIW:") {
+		t.Fatalf("expected DIW: in rendered output: %q", plain)
+	}
+	if !strings.Contains(plain, "DDF:") {
+		t.Fatalf("expected DDF: in rendered output: %q", plain)
+	}
+	if strings.Contains(plain, "#") || strings.Contains(plain, "0CAF5") || strings.Contains(plain, "0AF68") {
+		t.Fatalf("corrupted raw ANSI color token leaked into plain text: %q", plain)
+	}
+	if strings.Contains(out, "\x1b[#") {
+		t.Fatalf("invalid ANSI CSI sequence with # found in output: %q", out)
+	}
+	if app.Modal.PixelProtocol != ProtocolHalfBlock && !strings.Contains(out, "\x1b[6;2H") {
+		t.Fatalf("expected initial pixel placement at row 6 col 2 (\\x1b[6;2H) in rendered output")
+	}
+
+	// 3. Adjust geometry: increase width (+1 word = +16 px = +2 bytes)
+	origBytes := st.RowBytes
+	app.HandleKey("right")
+	if st.RowBytes != origBytes+2 {
+		t.Fatalf("expected RowBytes %d, got %d", origBytes+2, st.RowBytes)
+	}
+
+	// 4. Adjust planes: increase to 2 planes
+	app.HandleKey("+")
+	if st.Planes != 2 {
+		t.Fatalf("expected Planes 2, got %d", st.Planes)
+	}
+
+	// 5. Plane control selection and visibility groups
+	// Toggle plane 1 out of control selection
+	app.HandleKey("1")
+	if (st.ControlMask & 1) != 0 {
+		t.Fatalf("expected plane 1 to be unarmed from control selection")
+	}
+	if (st.ControlMask & 2) == 0 {
+		t.Fatalf("expected plane 2 to remain armed in control selection")
+	}
+	bpl0 := st.BPL[0]
+	bpl1 := st.BPL[1]
+	app.HandleKey(".") // Step control-selected planes by +2
+	if st.BPL[0] != bpl0 {
+		t.Fatalf("unarmed plane 1 should not move: got %d vs %d", st.BPL[0], bpl0)
+	}
+	if st.BPL[1] != bpl1+2 {
+		t.Fatalf("armed plane 2 should advance: got %d vs %d", st.BPL[1], bpl1+2)
+	}
+
+	// Toggle depth with direct keys (BPU 1..7)
+	// Depth 1: !
+	app.HandleKey("!")
+	if st.BPU() != 1 {
+		t.Fatalf("expected BPU 1 after '!', got %d", st.BPU())
+	}
+	// Depth 4: Nordic ¤ or US $
+	app.HandleKey("¤")
+	if st.BPU() != 4 {
+		t.Fatalf("expected BPU 4 after '¤', got %d", st.BPU())
+	}
+	// Depth 7: /
+	app.HandleKey("/")
+	if st.BPU() != 7 {
+		t.Fatalf("expected BPU 7 after '/', got %d", st.BPU())
+	}
+	if st.BPLCON0Hex() != 0x7200 {
+		t.Fatalf("expected BPLCON0 $7200 for 7 planes, got $%04X", st.BPLCON0Hex())
+	}
+
+	// Toggle 1 vs 6 with ')'
+	app.HandleKey(")")
+	if st.BPU() != 1 {
+		t.Fatalf("expected BPU 1 after first ')', got %d", st.BPU())
+	}
+	app.HandleKey(")")
+	if st.BPU() != 6 {
+		t.Fatalf("expected BPU 6 after second ')', got %d", st.BPU())
+	}
+
+	// Test '0' toggling: from all armed (0x3F) -> solo plane 1 (1) -> all armed (0x3F)
+	app.HandleKey("0")
+	if st.ControlMask != 1 {
+		t.Fatalf("expected solo plane 1 after first '0', got %d", st.ControlMask)
+	}
+	app.HandleKey("0")
+	if st.ControlMask != 0x3F {
+		t.Fatalf("expected all planes armed after second '0', got %d", st.ControlMask)
+	}
+
+	// 6. Direct Geometry Input prompt
+	app.HandleKey("g")
+	if app.Modal.Kind != ModalBitplaneGeometry {
+		t.Fatalf("expected ModalBitplaneGeometry, got %v", app.Modal.Kind)
+	}
+	// Type 640x256x4 and press enter
+	app.Modal.Input = NewTextInput("640x256x4")
+	app.HandleKey("enter")
+	if app.Modal.Kind != ModalBitplane {
+		t.Fatalf("expected return to ModalBitplane, got %v", app.Modal.Kind)
+	}
+	if st.WidthPx() != 640 || st.Height != 256 || st.Planes != 4 {
+		t.Fatalf("expected 640x256x4, got %dx%dx%d", st.WidthPx(), st.Height, st.Planes)
+	}
+
+	// 7. Save PNG and IFF, verify status message is visible in rendered status bar
+	t.Cleanup(func() { _ = os.RemoveAll("assets") })
+	app.HandleKey("w")
+	if !strings.Contains(app.StatusMsg, "Saved PNG") {
+		t.Fatalf("expected Saved PNG status msg, got %q", app.StatusMsg)
+	}
+	if !strings.Contains(stripANSI(RenderUI(app)), "Saved PNG") {
+		t.Fatalf("expected Saved PNG to be visible in rendered status bar")
+	}
+	app.HandleKey("W")
+	if !strings.Contains(app.StatusMsg, "Saved IFF") {
+		t.Fatalf("expected Saved IFF status msg, got %q", app.StatusMsg)
+	}
+
+	// Carve with K and verify label + Undo support
+	st.RowBytes = 2
+	st.Height = 2
+	st.SetBPU(1)
+	app.HandleKey("K")
+	if !strings.Contains(app.StatusMsg, "Carved bitplane range") {
+		t.Fatalf("expected Carved bitplane range status msg, got %q", app.StatusMsg)
+	}
+
+	// 8. Exit bitplane viewer with esc
+	app.HandleKey("esc")
+	if app.Modal.Kind != ModalNone {
+		t.Fatalf("expected ModalNone after esc, got %v", app.Modal.Kind)
+	}
+	// Undo the carve with 'ctrl+z'
+	app.HandleKey("ctrl+z")
+	if app.StatusMsg != "Undone" {
+		t.Fatalf("expected Undone after 'ctrl+z', got %q", app.StatusMsg)
+	}
+}
+

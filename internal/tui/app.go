@@ -2,8 +2,10 @@ package tui
 
 import (
 	"fmt"
+	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/term"
 	"github.com/mikolas/hunks/internal/db"
 	"github.com/mikolas/hunks/internal/m68k"
 	"github.com/mikolas/hunks/internal/project"
@@ -31,8 +33,13 @@ type App struct {
 	Width           int
 	Height          int
 	LastWidth       int
-	activeDBPath    string
-	ownsDB          bool
+	PixelWidth      int
+	PixelHeight     int
+	CellWidth        int
+	CellHeight       int
+	PendingEscapeSeq string
+	activeDBPath     string
+	ownsDB           bool
 }
 
 // NewApp initializes the TUI state from proj and ctrl.
@@ -97,6 +104,8 @@ func Run(proj *project.Project) error {
 		}
 	}()
 
+	app.QueryTermPixelSize()
+
 	p := tea.NewProgram(app, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err = p.Run()
 	return err
@@ -113,6 +122,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		a.Width = m.Width
 		a.Height = m.Height
+		a.UpdateTermPixelSize()
+		if a.Modal.Kind == ModalBitplane && a.Modal.Bitplane != nil {
+			a.refreshBitplaneCache()
+		}
 		if max(a.Width, 80) != a.LastWidth {
 			anchorAddr, ok := a.CursorAddr()
 			_ = a.LoadData()
@@ -345,4 +358,38 @@ func (a *App) GetStatusLine() string {
 		padOrTruncate(sizePart, 16),
 		padOrTruncate(timing.String(), 19),
 		pct)
+}
+
+// QueryTermPixelSize queries the terminal text area pixel size via \x1b[14t
+// in raw mode at startup (before Bubble Tea takes ownership of stdin).
+func (a *App) QueryTermPixelSize() {
+	if cols, rows, err := term.GetSize(os.Stdout.Fd()); err == nil && cols > 0 && rows > 0 {
+		a.Width = cols
+		a.Height = rows
+	}
+	if pxW, pxH := QueryTextAreaPixels(); pxW > 0 && pxH > 0 {
+		a.PixelWidth = pxW
+		a.PixelHeight = pxH
+		if a.Width > 0 {
+			a.CellWidth = a.PixelWidth / a.Width
+		}
+		if a.Height > 0 {
+			a.CellHeight = a.PixelHeight / a.Height
+		}
+	}
+}
+
+// UpdateTermPixelSize updates the terminal window pixel dimensions when the
+// character grid (Width x Height) is resized during an active TUI session.
+func (a *App) UpdateTermPixelSize() {
+	if a.CellWidth <= 0 && a.PixelWidth > 0 && a.Width > 0 {
+		a.CellWidth = a.PixelWidth / a.Width
+	}
+	if a.CellHeight <= 0 && a.PixelHeight > 0 && a.Height > 0 {
+		a.CellHeight = a.PixelHeight / a.Height
+	}
+	if a.CellWidth > 0 && a.CellHeight > 0 && a.Width > 0 && a.Height > 0 {
+		a.PixelWidth = a.Width * a.CellWidth
+		a.PixelHeight = a.Height * a.CellHeight
+	}
 }

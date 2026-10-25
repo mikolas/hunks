@@ -32,7 +32,8 @@ internal/
   db/                  controller.go (Controller + DTOs), types.go (domain enums)
   amiga/               hardware equates / vectors
   tui/                 Bubble Tea + 2D screenBuffer TUI (app, listing, keys,
-                       actions, nav, render, theme, popups, types)
+                       actions, nav, render, theme, popups, bitplane, pixelgfx,
+                       types)
 ```
 
 Core model: a project owns a flat pool of `Segment`s; a `Space` is a named,
@@ -151,6 +152,7 @@ procedures in [TESTING.md](TESTING.md) use user-supplied binaries.
 ## Git
 
 - Never work directly on `master`/`main`; use feature branches.
+- Never merge directly to `master`/`main`; always open a Pull Request (PR) for review and integration.
 - Small, focused commits with a clear subject + rationale body. Conventional
   prefixes in use (`feat`, `fix`, `refactor`, `docs`, `chore`, `style`).
 - Do not commit over hand-edited `.asm`, secrets, or copyrighted binaries.
@@ -164,3 +166,4 @@ procedures in [TESTING.md](TESTING.md) use user-supplied binaries.
 4. If analysis/emission was touched: rebuild a reference target and confirm
    load-image parity (`scripts/verify_parity.py`) before declaring done.
 5. Commit with a descriptive message; update MANUAL.md if behavior changed.
+6. Push feature branch and open a Pull Request against `master` (never merge directly).

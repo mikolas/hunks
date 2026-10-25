@@ -16,7 +16,7 @@ Amiga M68k Reverse Engineering System — terminal-native, keyboard-first disass
 - **Source-linkable `; XREF:` comments** (`; XREF: hunk5:LAB_5_24E84 (jsr 498(a5))`) and automatic cross-hunk / jump-vector target hints (`; -> hunk3:LAB_3_26432`)
 - **Static Call Graph CLI (`hunks -m <module> cg`)** with automatic `d16(a5)` jump-vector resolution, bottom-up `--ready` worklists, `--leaves`, `--anchors` (strings & `$DFFxxx` hardware), `--suspect` audits, and `--code` caller/callee inspection
 - **Standalone Amiga music module scanner (`hunks rip <file>`)** with 26 ExoticRipper recognizers (including sandboxed self-executing M68000 driver probes for David Whittaker and Final Music System)
-- **Interactive TUI (`hunks -m <module> tui`)** with full-width Sub-Row Code View, inline 16-byte `dc.b` hex/ASCII grid, 3-tier EOL comment priority, exact MC68000 instruction cycle & R/W bus timing, configurable truecolor themes (`~/.config/hunks/theme.json`), vertical scrollbar, floating modal overlays, byte-exact cursor splitting, cross-hunk `Enter` navigation, `x` XREFs modal, `f` Functions filter, and struct/alias editors
+- **Interactive TUI (`hunks -m <module> tui`)** with full-width Sub-Row Code View, inline 16-byte `dc.b` hex/ASCII grid, 3-tier EOL comment priority, exact MC68000 instruction cycle & R/W bus timing, interactive **Amiga Bitplane Image Viewer & Ripper (`B`)** (Kitty/iTerm2/Sixel/Half-Block pixel graphics, `BPLCON0` 1–7 planes, EHB/HAM6, Copper/`$0RGB` palette extraction, PNG & `FORM ILBM` export), configurable truecolor themes (`~/.config/hunks/theme.json`), vertical scrollbar, floating modal overlays, byte-exact cursor splitting, cross-hunk `Enter` navigation, `x` XREFs modal, `f` Functions filter, and struct/alias editors
 - **100% bit-for-bit reassembly** verified with `vasmm68k_mot`
 
 ## Quick Start
@@ -71,7 +71,7 @@ hunks -m disk_1 tui
 
 ### Prerequisites
 
-- **Go 1.26+** (pure Go build; zero CGo dependencies)
+- **Go 1.27+** (pure Go build; zero CGo dependencies)
 - **`vasmm68k_mot`** (optional, required only when running end-to-end reassembly parity checks against local binaries)
 
 ### Build, Lint & Test
