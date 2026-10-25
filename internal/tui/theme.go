@@ -107,8 +107,14 @@ func LoadTheme() Theme {
 	if envPath := strings.TrimSpace(os.Getenv("HUNKS_THEME")); envPath != "" {
 		candidates = append(candidates, envPath)
 	}
+	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
+		candidates = append(candidates, filepath.Join(xdg, "hunks", "theme.json"))
+	}
 	if cfgDir, err := os.UserConfigDir(); err == nil && cfgDir != "" {
 		candidates = append(candidates, filepath.Join(cfgDir, "hunks", "theme.json"))
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		candidates = append(candidates, filepath.Join(home, ".config", "hunks", "theme.json"))
 	}
 	for _, path := range candidates {
 		data, err := os.ReadFile(path)
