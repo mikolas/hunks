@@ -1271,10 +1271,15 @@ func TestBlockAndSubroutineCycles(t *testing.T) {
 	//   0x10016: rts            (0x4E75) -> actual end of Sub3
 	//
 	// Subroutine 4 at 0x10018 (ends via unskipped tail-call jmp):
-	//   0x10018: moveq #1,d0    (0x7001)
-	//   0x1001A: jmp $10000.l   (0x4EF9 0x00010000) -> unskipped tail-call jmp ends Sub4!
+	//   0x10018: moveq #1,d0    (0x7001) -> 4 cyc
+	//   0x1001A: jmp $10000.l   (0x4EF9 0x00010000) -> 12 cyc; unskipped tail-call jmp ends Sub4!
 	//
-	// Trailing data at 0x10020..0x10023 (4 bytes)
+	// Subroutine 5 at 0x10020 (calls Sub1 via bsr.w):
+	//   0x10020: bsr.w $10000   (0x6100 0xFFDE) -> 18 (2/2) cyc
+	//   0x10024: rts            (0x4E75)        -> 16 (4/0) cyc
+	//   Self = 34 (6/2) cyc, Inclusive = 34 + 24 = 58 cyc
+	//
+	// Trailing data at 0x10026..0x10029 (4 bytes)
 	raw := []byte{
 		0x70, 0x00,
 		0x52, 0x40,
@@ -1288,6 +1293,8 @@ func TestBlockAndSubroutineCycles(t *testing.T) {
 		0x4E, 0x75,
 		0x70, 0x01,
 		0x4E, 0xF9, 0x00, 0x01, 0x00, 0x00,
+		0x61, 0x00, 0xFF, 0xDE,
+		0x4E, 0x75,
 		0xAA, 0xBB, 0xCC, 0xDD,
 	}
 
@@ -1339,16 +1346,27 @@ func TestBlockAndSubroutineCycles(t *testing.T) {
 	mustInsertCode(0x10016, raw[22:24], "rts", "")
 	mustInsertCode(0x10018, raw[24:26], "moveq", "#1,d0")
 	mustInsertCode(0x1001A, raw[26:32], "jmp", "$10000.l")
+	mustInsertCode(0x10020, raw[32:36], "bsr.w", "Sub1")
+	mustInsertCode(0x10024, raw[36:38], "rts", "")
 
 	_ = ctrl.SetLabel(0x10014, "LAB_10014", db.LabelLab, true)
 	_ = ctrl.InsertXref(0x1000C, 0x10014, db.XrefCodeBranch)
+	_ = ctrl.InsertXref(0x10020, 0x10000, db.XrefCodeCall)
 
 	_ = ctrl.InsertFunction(0x10000, "Sub1", 255)
-	_ = ctrl.UpdateFunctionMetadataBatch([]db.FunctionMeta{{
-		Entry:   0x10000,
-		EndAddr: 0x10006,
-		HasEnd:  true,
-	}})
+	_ = ctrl.InsertFunction(0x10020, "Sub5", 255)
+	_ = ctrl.UpdateFunctionMetadataBatch([]db.FunctionMeta{
+		{
+			Entry:   0x10000,
+			EndAddr: 0x10006,
+			HasEnd:  true,
+		},
+		{
+			Entry:   0x10020,
+			EndAddr: 0x10026,
+			HasEnd:  true,
+		},
+	})
 
 	app, err := NewApp(proj, ctrl)
 	if err != nil {
@@ -1421,8 +1439,40 @@ func TestBlockAndSubroutineCycles(t *testing.T) {
 	}
 	app.HandleKey("esc")
 
-	// 6. Press 'V' on data-only row -> clears/refuses with "No subroutine at cursor"
+	// 6. Cursor on bsr.w Sub1 at 0x10020 shows callee cycle hint [→24 cyc], and 'V' shows inclusive [incl: 58 cyc]
 	app.GotoAddress(0x10020)
+	status = app.GetStatusLine()
+	if !strings.Contains(status, "18 (2/2) cyc [→24 cyc]") {
+		t.Fatalf("expected bsr.w status with callee hint '18 (2/2) cyc [→24 cyc]', got %q", status)
+	}
+	app.HandleKey("V")
+	status = app.GetStatusLine()
+	if !strings.Contains(status, "34 (6/2) cyc [incl: 58 cyc]") {
+		t.Fatalf("expected Sub5 inclusive status '34 (6/2) cyc [incl: 58 cyc]', got %q", status)
+	}
+	app.HandleKey("esc")
+
+	// 7. OpenFunctions ('f') populates cycle summaries on FuncItem
+	app.OpenFunctions()
+	if len(app.Modal.AllFuncs) < 2 {
+		t.Fatalf("expected at least 2 functions in Modal.AllFuncs, got %d", len(app.Modal.AllFuncs))
+	}
+	var foundSub5 bool
+	for _, fn := range app.Modal.AllFuncs {
+		if fn.Addr == 0x10020 {
+			foundSub5 = true
+			if fn.Cycles != "34 cyc [incl: 58 cyc]" {
+				t.Fatalf("expected Sub5 FuncItem.Cycles='34 cyc [incl: 58 cyc]', got %q", fn.Cycles)
+			}
+		}
+	}
+	if !foundSub5 {
+		t.Fatalf("Sub5 (0x10020) not found in Modal.AllFuncs")
+	}
+	app.Modal.Kind = ModalNone
+
+	// 8. Press 'V' on data-only row -> clears/refuses with "No subroutine at cursor"
+	app.GotoAddress(0x10026)
 	app.HandleKey("V")
 	if app.SelectionStart != nil || app.StatusMsg != "No subroutine at cursor" {
 		t.Fatalf("expected 'No subroutine at cursor' on data row, got StatusMsg=%q", app.StatusMsg)

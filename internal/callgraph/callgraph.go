@@ -17,6 +17,7 @@ import (
 	"github.com/google/btree"
 	"github.com/mikolas/hunks/internal/amiga"
 	"github.com/mikolas/hunks/internal/db"
+	"github.com/mikolas/hunks/internal/m68k"
 	"github.com/mikolas/hunks/internal/project"
 )
 
@@ -46,6 +47,12 @@ type FunctionNode struct {
 	OffsetInSeg   uint32           `json:"offset_in_seg"`
 	InsnAddrs     []uint32         `json:"insn_addrs"`
 	ByteSize      uint32           `json:"byte_size"`
+	SelfMinCycles uint32           `json:"self_min_cycles"`
+	SelfMaxCycles uint32           `json:"self_max_cycles"`
+	InclMinCycles uint32           `json:"incl_min_cycles"`
+	InclMaxCycles uint32           `json:"incl_max_cycles"`
+	HasLoop       bool             `json:"has_loop"`
+	HasIndirect   bool             `json:"has_indirect"`
 	BlockComment  *string          `json:"block_comment"`
 	Callers       []CallSite       `json:"callers"`
 	Callees       []CallSite       `json:"callees"`
@@ -53,6 +60,34 @@ type FunctionNode struct {
 	HWRegs        []string         `json:"hw_regs"`
 	IndirectCalls []AddrStringPair `json:"indirect_calls"`
 	SuspectCutoff *AddrStringPair  `json:"suspect_cutoff"`
+}
+
+func formatCycleSpan(lo, hi uint32) string {
+	if lo == hi {
+		return strconv.FormatUint(uint64(lo), 10)
+	}
+	return strconv.FormatUint(uint64(lo), 10) + "-" + strconv.FormatUint(uint64(hi), 10)
+}
+
+func (f *FunctionNode) FormatCycles() string {
+	if f.SelfMaxCycles == 0 {
+		return "-- cyc"
+	}
+	var sb strings.Builder
+	sb.WriteString(formatCycleSpan(f.SelfMinCycles, f.SelfMaxCycles))
+	sb.WriteString(" cyc")
+	if f.InclMaxCycles > f.SelfMaxCycles || f.InclMinCycles > f.SelfMinCycles {
+		sb.WriteString(" [incl: ")
+		sb.WriteString(formatCycleSpan(f.InclMinCycles, f.InclMaxCycles))
+		sb.WriteString(" cyc]")
+	}
+	if f.HasLoop {
+		sb.WriteString(" +loop")
+	}
+	if f.HasIndirect {
+		sb.WriteString(" +ind")
+	}
+	return sb.String()
 }
 
 func (f *FunctionNode) IsLeaf() bool {
@@ -357,6 +392,8 @@ func Build(proj *project.Project) (*CallGraph, error) {
 		stringMap := make(map[uint32]string)
 		hwSet := make(map[string]bool)
 		var indirectCalls []AddrStringPair
+		var selfMinCyc, selfMaxCyc uint32
+		hasLoop := false
 
 		for _, ia := range insnAddrs {
 			cell, ok := cells[ia]
@@ -365,6 +402,43 @@ func Build(proj *project.Project) (*CallGraph, error) {
 			}
 			mnem := cell.MnemonicStr()
 			opStr := cell.OpStrVal()
+
+			raw := cell.RawBytes
+			if len(raw) < 2 && segOpt != nil {
+				data, ok := segDataCache[segOpt.Base]
+				if !ok {
+					data = segOpt.LoadBinaryData()
+					segDataCache[segOpt.Base] = data
+				}
+				off := int(ia - segOpt.Base)
+				end := min(off+int(cell.Size), len(data))
+				if off >= 0 && off < end {
+					raw = data[off:end]
+				}
+			}
+			if insn, ok := m68k.Decode(raw, ia); ok {
+				t := insn.Timing()
+				switch t.Kind {
+				case m68k.TimingBranch, m68k.TimingRange:
+					selfMinCyc += uint32(min(t.Primary.Cycles, t.Secondary.Cycles))
+					selfMaxCyc += uint32(max(t.Primary.Cycles, t.Secondary.Cycles))
+				default:
+					selfMinCyc += uint32(t.Primary.Cycles)
+					selfMaxCyc += uint32(t.Primary.Cycles)
+				}
+				if insn.IsBranch() && !insn.IsCall() {
+					for _, op := range insn.Operands() {
+						if (op.Mode == m68k.EABranch || op.Mode == m68k.EAPCDisp16) && op.UVal >= entryAddr && op.UVal <= ia {
+							hasLoop = true
+						}
+					}
+				}
+			}
+			for _, e := range edgesBySrc[ia] {
+				if (e.kind == db.EdgeCondTrue || e.kind == db.EdgeUncond) && e.target >= entryAddr && e.target <= ia {
+					hasLoop = true
+				}
+			}
 
 			if mnem == "jsr" || mnem == "jmp" {
 				hasDirectEdge := false
@@ -435,6 +509,12 @@ func Build(proj *project.Project) (*CallGraph, error) {
 			OffsetInSeg:   offsetInSeg,
 			InsnAddrs:     insnAddrs,
 			ByteSize:      byteSize,
+			SelfMinCycles: selfMinCyc,
+			SelfMaxCycles: selfMaxCyc,
+			InclMinCycles: selfMinCyc,
+			InclMaxCycles: selfMaxCyc,
+			HasLoop:       hasLoop,
+			HasIndirect:   len(indirectCalls) > 0,
 			BlockComment:  blockComment,
 			Callers:       []CallSite{},
 			Callees:       []CallSite{},
@@ -568,6 +648,61 @@ func Build(proj *project.Project) (*CallGraph, error) {
 				callee.Callers = append(callee.Callers, site)
 			}
 		}
+	}
+
+	type inclResult struct {
+		minCyc      uint32
+		maxCyc      uint32
+		hasLoop     bool
+		hasIndirect bool
+	}
+	memo := make(map[uint32]inclResult, len(funcAddrs))
+	visiting := make(map[uint32]bool)
+	var computeIncl func(addr uint32) inclResult
+	computeIncl = func(addr uint32) inclResult {
+		if res, ok := memo[addr]; ok {
+			return res
+		}
+		f, ok := functions[addr]
+		if !ok {
+			return inclResult{}
+		}
+		if visiting[addr] {
+			return inclResult{hasLoop: true}
+		}
+		visiting[addr] = true
+		res := inclResult{
+			minCyc:      f.SelfMinCycles,
+			maxCyc:      f.SelfMaxCycles,
+			hasLoop:     f.HasLoop,
+			hasIndirect: f.HasIndirect,
+		}
+		for _, site := range f.Callees {
+			if site.TargetFunc == addr || visiting[site.TargetFunc] {
+				res.hasLoop = true
+				continue
+			}
+			sub := computeIncl(site.TargetFunc)
+			res.minCyc += sub.minCyc
+			res.maxCyc += sub.maxCyc
+			if sub.hasLoop {
+				res.hasLoop = true
+			}
+			if sub.hasIndirect {
+				res.hasIndirect = true
+			}
+		}
+		delete(visiting, addr)
+		memo[addr] = res
+		return res
+	}
+	for _, addr := range funcAddrs {
+		res := computeIncl(addr)
+		f := functions[addr]
+		f.InclMinCycles = res.minCyc
+		f.InclMaxCycles = res.maxCyc
+		f.HasLoop = res.hasLoop
+		f.HasIndirect = res.hasIndirect
 	}
 
 	return &CallGraph{
@@ -854,12 +989,13 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 	out.WriteString("=== Target Function ===\n")
 	fmt.Fprintf(
 		&out,
-		"  %s%s [+%05X] — %d insts, %d bytes%s\n",
+		"  %s%s [+%05X] — %d insts, %d bytes, %s%s\n",
 		f.QualifiedName(),
 		renameTag,
 		f.OffsetInSeg,
 		len(f.InsnAddrs),
 		f.ByteSize,
+		f.FormatCycles(),
 		expTag,
 	)
 	if f.BlockComment != nil {
@@ -1408,13 +1544,14 @@ func (cg *CallGraph) renderWorklist(opts *Options, normSeg string) (string, erro
 
 		fmt.Fprintf(
 			&out,
-			"  %-28s [+%05X] in:%-3d out:%-3d %4d insts (%5d B)%s\n",
+			"  %-28s [+%05X] in:%-3d out:%-3d %4d insts (%5d B) | %s%s\n",
 			f.QualifiedName(),
 			f.OffsetInSeg,
 			len(f.Callers),
 			len(f.Callees),
 			len(f.InsnAddrs),
 			f.ByteSize,
+			f.FormatCycles(),
 			tagStr,
 		)
 

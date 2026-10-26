@@ -420,11 +420,14 @@ Emitted `; XREF:` comments above labels list the **enclosing caller label** and 
 
 Every caller listed in `; XREF:` can be jumped to immediately in `src/hunk*.asm` via `rg "^<label>:"`.
 
-### 3. Cross-Hunk & Jump-Vector Target Hints
-Instructions that jump/call across hunks or through a register jump-vector table automatically receive a trailing target comment:
+### 3. Cross-Hunk, Jump-Vector & Hardware Register Bitfield Auto-Comments
+Instructions that jump/call across hunks or through a register jump-vector table automatically receive a trailing target comment, and immediate `.w` / `.l` writes to key Amiga custom registers (`DMACON`, `INTENA`, `INTREQ`, `ADKCON`, `BPLCON0`, `BLTCON0`, `BLTCON1`, `BLTSIZE`) automatically decode their bitfields into persistent auto-comments that survive `emit`:
 ```asm
 	jmp	LAB_5_2810E.l	; -> hunk5
 	jsr	414(a5)	; -> hunk3:LAB_3_26432
+	move.w	#$83C0,_custom+DMACON	; SET|DMAEN|BPLEN|COPEN|BLTEN
+	move.l	#$09F00002,BLTCON0(a5)	; BLTCON0: USEA|USED|LF=$F0 (D=A) | BLTCON1: DESC
+	move.w	#$1004,BLTSIZE(a5)	; 64x64 px (4w x 64h)
 ```
 
 ---
@@ -463,15 +466,15 @@ Instructions that jump/call across hunks or through a register jump-vector table
 | `Backspace` / `-` | Navigate back in history stack (up to 100 entries across segments) |
 | `g` | Goto (`<seg>:<label>`, `<seg>:+<offset>`, `<label>`, `+offset`, or hex address) |
 | `/` | Prefix-scoped search (`[seg:]addr` / `[seg:]label` navigation, or `m:`/`o:`/`s:`/`c:`/`b:`/`l:`/`cluster:` with optional `seg/` or `all/` scope, e.g. `m:jsr`, `s:hunk3/disk`, `cluster:blitter`) |
-| `f` | Function list popup (shows `<seg> +<offset>  <name>`, type to filter, `Enter` to jump) |
+| `f` | Function list popup (shows `<seg> +<offset>  <name>` and self/inclusive cycle timing, type to filter, `Enter` to jump) |
 | `x` | XREFs popup to current address (shows `<seg> +<offset>  <type>  (in <caller_label>)  <mnem> <ops>`, `Enter` to jump) |
 
 ### Type Marking & Selection Keys
 
 | Key | Action |
 |-----|--------|
-| `v` | Toggle range selection (`Esc` cancels active selection); when code instructions are selected, the status bar displays aggregate byte size, instruction count, and MC68000 execution cycles + `(R/W)` bus words |
-| `V` | Select (or cancel selection of) the current subroutine and display its aggregate byte size, instruction count, and MC68000 execution cycles + `(R/W)` bus words in the status bar |
+| `v` | Toggle range selection (`Esc` cancels active selection); when code instructions are selected, the status bar displays aggregate byte size, instruction count, self MC68000 execution cycles + `(R/W)` bus words, and `[incl: ... cyc]` when calls (`jsr`/`bsr`) are included |
+| `V` | Select (or cancel selection of) the current subroutine and display its aggregate byte size, instruction count, self MC68000 execution cycles + `(R/W)` bus words, and inclusive `[incl: ... cyc]` timing across resolved callees in the status bar |
 | `c` | Mark cursor (or selection) as `CODE` (`confidence = 100`) and run incremental analysis |
 | `b` | Mark as `DATA_B` (1 byte) |
 | `w` | Mark as `DATA_W` (2 bytes) |

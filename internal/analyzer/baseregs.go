@@ -432,6 +432,19 @@ func (a *Analyzer) resolveBaseRelativeAccesses(slots []db.CellSlot, globalBase r
 						name: hw,
 					})
 				}
+				if opIdx == 1 && insn.Op == m68k.OpMOVE && insn.Ops[0].Mode == m68k.EAImm && target >= amiga.CustomBase && target <= 0xDFF1FF {
+					hwOff := target - amiga.CustomBase
+					var bf string
+					switch insn.Suffix {
+					case m68k.SizeW:
+						bf = amiga.DecodeCustomRegWrite(hwOff, uint16(insn.Ops[0].UVal))
+					case m68k.SizeL:
+						bf = amiga.DecodeCustomRegLongWrite(hwOff, insn.Ops[0].UVal)
+					}
+					if bf != "" {
+						comments = append(comments, addrComment{addr: slot.Addr, frag: bf})
+					}
+				}
 			} else if a.isInDataOrBss(target) {
 				isWrite := (op.Access & m68k.AccessWrite) != 0
 				globals = append(globals, globalRef{site: slot.Addr, target: target, isWrite: isWrite})

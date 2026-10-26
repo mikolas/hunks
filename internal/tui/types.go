@@ -186,8 +186,21 @@ type XrefItem struct {
 
 // FuncItem represents a single function entry in the Functions modal.
 type FuncItem struct {
-	Addr uint32
-	Name string
+	Addr   uint32
+	Name   string
+	Cycles string
+}
+
+// SubroutineCycles holds precomputed self and inclusive cycle bounds for a subroutine.
+type SubroutineCycles struct {
+	StartAddr     uint32
+	EndAddr       uint32
+	SelfMinCycles uint32
+	SelfMaxCycles uint32
+	InclMinCycles uint32
+	InclMaxCycles uint32
+	HasLoop       bool
+	HasIndirect   bool
 }
 
 // DirEntryItem represents a file or directory in the FileBrowser modal.
