@@ -83,14 +83,14 @@ internal/
     ├── types.go            Enums, structs (`Modal`, `ListingRow`, `SubRowKind`, `UndoEntry`, `TextInput`)
     ├── listing.go          `BuildListingRows`: Sub-Row Code View builder, 16-byte `dc.b` coalescer, 3-tier EOL comment priority
     ├── app.go              `App` (`tea.Model`) + segment/status management
-    ├── actions.go          Interactive type marking (`c`/`b`/`w`/`l`/`p`/`s`/`u`), carve/uncarve & undo
+    ├── actions.go          Interactive type marking (`c`/`b`/`w`/`l`/`p`/`s`/`u`), virtual segment carve/uncarve (`K`), bitplane/music ripper actions (`B`/`M`), & transactional undo (`Ctrl-z`)
     ├── nav.go              Cursor, byte-offset (`←`/`→`), & automatic cross-hunk / jump-vector reference navigation
     ├── popups.go           XREFs (`x`), Functions (`f`), Search (`/`), Structs (`t`), and Segment/Space popups
     ├── keys.go             Keyboard/mouse event handling
-    ├── bitplane.go         Interactive Amiga Bitplane Image Viewer (`B`), `BPLCON0`/modulo geometry, planar/EHB/HAM6 decoder, `FORM ILBM` encoder, & `XTWINOPS` (`\x1b[14t`) pixel sizing
+    ├── bitplane.go         Interactive Amiga Bitplane Image Viewer (`B`), `BPLCON0`/modulo geometry, planar/EHB/HAM6 decoder, `FORM ILBM` encoder, `XTWINOPS` (`\x1b[14t`) pixel sizing, & block comment round-trip
     ├── pixelgfx.go         Terminal pixel graphics encoders (`Kitty`, `iTerm2`, `Sixel`, Unicode `Half-Block`)
     ├── theme.go            Configurable truecolor `Theme`, `LoadTheme`, and per-token operand/comment styling
-    └── render.go           Fixed-grid 2D `screenBuffer` compositor, scrollbars, floating modals
+    └── render.go           Fixed-grid 2D `screenBuffer` compositor, scrollbars, floating modals (`ModalBitplane`, `ModalMusicRipper`, etc.)
 ```
 
 ## Data Model
@@ -217,9 +217,9 @@ preserved.
   register-context-resolved `d16(An)` hardware accesses are named
   (`INTREQR+1` etc.).
 
-## Music Module Recognizer Engine (`internal/modules/`)
+## Music Module Recognizer Engine (`internal/modules/`, Experimental)
 
-A self-contained recognizer subsystem (reverse-engineered from ExoticRipper
+A self-contained experimental recognizer subsystem (reverse-engineered from ExoticRipper
 V2.31) that operates directly on `[]byte` buffers without SQLite, `Project`, or
 I/O dependencies:
 

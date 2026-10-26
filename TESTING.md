@@ -124,6 +124,7 @@ Verify:
 - `/` search; `f` Functions; `x` XREFs (`Enter` jumps to caller).
 - `Enter` follows branches, cross-hunk refs (`⇢`), and jump-vector hints; `-`/`Bksp` returns.
 - `←`/`→` moves the byte cursor on `DATA` rows or cycles caller badges on `; XREF` rows; `s`/`b`/`w`/`l`/`p`/`c`/`u` mark cells; `K` carve/uncarve; `Ctrl-z` undo.
+- `B` opens the Bitplane Image Viewer (`K` carves as `incbin` with metadata block comment and round-trips on `B`); `M` opens the experimental Music Module Ripper (`Enter` jumps, `w` rips to `assets/`, `K` carves as `incbin`).
 - `?` Help; `q` quit.
 
 ---
@@ -158,7 +159,7 @@ Expected:
 - (b) carve over an interior reloc in a relocatable hunk **exits non-zero** with
   a clean refusal (no panic).
 - (c) carve on the flat part succeeds (guard does not apply to non-relocatable parts).
-- (d) `uncarve` empties `project.json` `carves`.
+- (d) `uncarve` removes the `INCBIN` cell, label, and block comment from `project.db`.
 
 ### Carve byte-neutrality on relocatable hunks
 Carve a **reloc-free DATA range**, emit, re-assemble, confirm load-image parity:

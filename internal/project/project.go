@@ -140,53 +140,6 @@ func (m *MemoryRegion) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type Carve struct {
-	Start uint32 `json:"start"`
-	End   uint32 `json:"end"`
-	File  string `json:"file"`
-	Name  string `json:"name"`
-}
-
-func (c Carve) MarshalJSON() ([]byte, error) {
-	type wire struct {
-		Start string `json:"start"`
-		End   string `json:"end"`
-		File  string `json:"file"`
-		Name  string `json:"name"`
-	}
-	return json.Marshal(wire{
-		Start: formatHex(c.Start),
-		End:   formatHex(c.End),
-		File:  c.File,
-		Name:  c.Name,
-	})
-}
-
-func (c *Carve) UnmarshalJSON(data []byte) error {
-	var wire struct {
-		Start json.RawMessage `json:"start"`
-		End   json.RawMessage `json:"end"`
-		File  string          `json:"file"`
-		Name  string          `json:"name"`
-	}
-	if err := json.Unmarshal(data, &wire); err != nil {
-		return err
-	}
-	start, err := parseHexJSON(wire.Start)
-	if err != nil {
-		return err
-	}
-	end, err := parseHexJSON(wire.End)
-	if err != nil {
-		return err
-	}
-	c.Start = start
-	c.End = end
-	c.File = wire.File
-	c.Name = wire.Name
-	return nil
-}
-
 type Segment struct {
 	Name        string          `json:"name"`
 	HunkIndex   int             `json:"hunk_index"`
@@ -354,7 +307,6 @@ type ProjectData struct {
 	MemoryRegions   []MemoryRegion               `json:"memory_regions"`
 	Structs         map[string]map[string]string `json:"structs"`
 	RegisterAliases map[string]string            `json:"register_aliases"`
-	Carves          []Carve                      `json:"carves"`
 	Analysis        AnalysisData                 `json:"_analysis"`
 }
 
@@ -376,7 +328,6 @@ func New(filepath string) *Project {
 			MemoryRegions:   []MemoryRegion{},
 			Structs:         make(map[string]map[string]string),
 			RegisterAliases: make(map[string]string),
-			Carves:          []Carve{},
 			Analysis: AnalysisData{
 				IndirectAddressing: []string{},
 			},
@@ -444,9 +395,6 @@ func (p *Project) Load() error {
 	}
 	if p.Data.MemoryRegions == nil {
 		p.Data.MemoryRegions = []MemoryRegion{}
-	}
-	if p.Data.Carves == nil {
-		p.Data.Carves = []Carve{}
 	}
 	if p.Data.Analysis.IndirectAddressing == nil {
 		p.Data.Analysis.IndirectAddressing = []string{}

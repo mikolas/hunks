@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -234,7 +233,8 @@ func TestTUICarveGuardAndRoundtrip(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = ctrl.Close() })
 	proj.SyncDBScope(ctrl)
-	_ = ctrl.MarkData(0x2000, 8, db.CellDataB)
+	_ = ctrl.MarkData(0x2000, 4, db.CellDataL)
+	_ = ctrl.MarkData(0x2004, 4, db.CellDataB)
 
 	app, err := NewApp(proj, ctrl)
 	if err != nil {
@@ -243,13 +243,42 @@ func TestTUICarveGuardAndRoundtrip(t *testing.T) {
 	app.BinaryData = []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
 	_ = app.LoadData()
 
-	app.CarveRange(0x2002, 0x2005, "FlatBlob")
+	app.CarveRange(0x2002, 0x2005, "FlatBlob", "Header description\nLine 2")
 	cell, err := app.DB.GetCell(0x2002)
-	if err != nil || cell == nil || cell.Type != db.CellIncbin || cell.Size != 4 || !bytes.Equal(cell.RawBytes, []byte{0x33, 0x44, 0x55, 0x66}) {
+	if err != nil || cell == nil || cell.Type != db.CellIncbin || cell.Size != 4 {
 		t.Fatalf("unexpected carved cell: %+v", cell)
 	}
-	if len(app.Proj.Data.Carves) != 1 || app.Proj.Data.Carves[0].File != "assets/FlatBlob.bin" {
-		t.Fatalf("unexpected project carves: %+v", app.Proj.Data.Carves)
+	if lbl, ok, _ := app.DB.GetLabel(0x2002); !ok || lbl != "FlatBlob" {
+		t.Fatalf("expected label 'FlatBlob', got %q", lbl)
+	}
+	if bc := app.DB.GetAddressComment(0x2002).BlockComment; bc != "Header description\nLine 2" {
+		t.Fatalf("expected block comment, got %q", bc)
+	}
+
+	// Pressing 'w' or 'l' on a folded incbin must be refused without destroying the incbin.
+	app.GotoAddress(0x2002)
+	app.HandleKey("w")
+	if !strings.Contains(app.StatusMsg, "Folded incbin") {
+		t.Fatalf("expected Folded incbin refusal on 'w', got %q", app.StatusMsg)
+	}
+	if cCheck, _ := app.DB.GetCell(0x2002); cCheck == nil || cCheck.Type != db.CellIncbin {
+		t.Fatalf("expected CellIncbin intact after refused 'w', got %+v", cCheck)
+	}
+
+	// Pressing 'b' on a folded incbin unfolds it back into bytes (deletes the CellIncbin), and Ctrl+Z folds it back.
+	app.HandleKey("b")
+	if cAfterB, _ := app.DB.GetCell(0x2002); cAfterB != nil && cAfterB.Type == db.CellIncbin {
+		t.Fatalf("expected CellIncbin unfolded after 'b', got %+v", cAfterB)
+	}
+	// Pressing 'K' on the now-unfolded dc.b data row must refuse ("No carve at cursor") and not crash.
+	app.HandleKey("K")
+	if app.StatusMsg != "No carve at cursor" {
+		t.Fatalf("expected 'No carve at cursor' when pressing K on dc.b row, got %q", app.StatusMsg)
+	}
+	// Undo the 'b' unfold -> restores CellIncbin
+	app.Undo()
+	if cRestoredB, _ := app.DB.GetCell(0x2002); cRestoredB == nil || cRestoredB.Type != db.CellIncbin {
+		t.Fatalf("expected CellIncbin restored after undoing 'b' unfold, got %+v", cRestoredB)
 	}
 
 	// TUI reload must NOT write the incbin sidecar to disk.
@@ -260,14 +289,66 @@ func TestTUICarveGuardAndRoundtrip(t *testing.T) {
 		t.Fatalf("TUI reload must not write incbin sidecar to disk")
 	}
 
+	// Undo carve with Ctrl-z (must also restore the straddling 4-byte CellDataL at 0x2000 with no 1-byte remnant at 0x2001)
+	app.Undo()
+	cellUndone, _ := app.DB.GetCell(0x2002)
+	if cellUndone != nil && cellUndone.Type == db.CellIncbin {
+		t.Fatalf("expected CellIncbin gone after undoing carve")
+	}
+	straddlingRestored, _ := app.DB.GetCell(0x2000)
+	if straddlingRestored == nil || straddlingRestored.Type != db.CellDataL || straddlingRestored.Size != 4 {
+		t.Fatalf("expected straddling 4-byte CellDataL at 0x2000 restored after undo, got %+v", straddlingRestored)
+	}
+	if remnant, _ := app.DB.GetCell(0x2001); remnant != nil {
+		t.Fatalf("expected no remnant cell at 0x2001 after undo, got %+v", remnant)
+	}
+	if lbl, ok, _ := app.DB.GetLabel(0x2002); ok && lbl != "" {
+		t.Fatalf("expected label gone after undoing carve, got %q", lbl)
+	}
+	if bc := app.DB.GetAddressComment(0x2002).BlockComment; bc != "" {
+		t.Fatalf("expected block comment gone after undoing carve, got %q", bc)
+	}
+
+	// Re-carve to test overlapping re-carve (0x2000..0x2005 replacing 0x2002..0x2005) and its undo
+	app.CarveRange(0x2002, 0x2005, "FlatBlob", "Header description\nLine 2")
+	app.CarveRange(0x2000, 0x2005, "WiderBlob", "Wider header")
+	if wider, _ := app.DB.GetCell(0x2000); wider == nil || wider.Type != db.CellIncbin || wider.Size != 6 {
+		t.Fatalf("expected single replaced CellIncbin at 0x2000, got %+v", wider)
+	}
+	if lbl, ok, _ := app.DB.GetLabel(0x2002); ok && lbl != "" {
+		t.Fatalf("expected interior overlapped label at 0x2002 cleaned up, got %q", lbl)
+	}
+	app.Undo()
+	if prev, _ := app.DB.GetCell(0x2002); prev == nil || prev.Type != db.CellIncbin || prev.Size != 4 {
+		t.Fatalf("expected previous CellIncbin at 0x2002 restored after undo, got %+v", prev)
+	}
+	if lbl, ok, _ := app.DB.GetLabel(0x2002); !ok || lbl != "FlatBlob" {
+		t.Fatalf("expected label 'FlatBlob' at 0x2002 restored after undo, got %q", lbl)
+	}
 	app.GotoAddress(0x2002)
 	app.UncarveAtCursor()
 	after, _ := app.DB.GetCell(0x2002)
 	if after != nil && after.Type == db.CellIncbin {
 		t.Fatalf("INCBIN cell must be gone after uncarve")
 	}
-	if len(app.Proj.Data.Carves) != 0 {
-		t.Fatalf("expected carves empty after uncarve")
+	if lbl, ok, _ := app.DB.GetLabel(0x2002); ok && lbl != "" {
+		t.Fatalf("expected label gone after uncarve, got %q", lbl)
+	}
+	if bc := app.DB.GetAddressComment(0x2002).BlockComment; bc != "" {
+		t.Fatalf("expected block comment gone after uncarve, got %q", bc)
+	}
+
+	// Undo uncarve with Ctrl-z
+	app.Undo()
+	cellReRestored, _ := app.DB.GetCell(0x2002)
+	if cellReRestored == nil || cellReRestored.Type != db.CellIncbin {
+		t.Fatalf("expected CellIncbin restored after undoing uncarve")
+	}
+	if lbl, ok, _ := app.DB.GetLabel(0x2002); !ok || lbl != "FlatBlob" {
+		t.Fatalf("expected label 'FlatBlob' restored after undoing uncarve, got %q", lbl)
+	}
+	if bc := app.DB.GetAddressComment(0x2002).BlockComment; bc != "Header description\nLine 2" {
+		t.Fatalf("expected block comment restored after undoing uncarve, got %q", bc)
 	}
 
 	// Relocatable segment: carve across an interior reloc is refused.
@@ -299,8 +380,8 @@ func TestTUICarveGuardAndRoundtrip(t *testing.T) {
 	}
 	app2.BinaryData = make([]byte, 8)
 	_ = app2.LoadData()
-	app2.CarveRange(0x3000, 0x3005, "ShouldRefuse")
-	if len(app2.Proj.Data.Carves) != 0 {
+	app2.CarveRange(0x3000, 0x3005, "ShouldRefuse", "")
+	if refused, _ := app2.DB.GetCell(0x3000); refused != nil && refused.Type == db.CellIncbin {
 		t.Fatalf("carve over interior reloc must be refused")
 	}
 }
@@ -990,23 +1071,182 @@ func TestBitplaneViewerInteractive(t *testing.T) {
 		t.Fatalf("expected Saved IFF status msg, got %q", app.StatusMsg)
 	}
 
-	// Carve with K and verify label + Undo support
+	// Carve with K -> ModalCarveName -> esc returns to ModalBitplane; K -> enter carves, and verify Modulo/Masks/Palette round-trip on B
 	st.RowBytes = 2
 	st.Height = 2
-	st.SetBPU(1)
+	st.Modulo = 6
+	st.SetBPU(2)
+	st.VisibleMask = 0x01
+	st.ControlMask = 0x02
+	st.PaletteMode = PaletteHighContrast
+	st.Invert = true
+	st.Brightness = 2
+	st.AutoSnapPlanes()
 	app.HandleKey("K")
-	if !strings.Contains(app.StatusMsg, "Carved bitplane range") {
-		t.Fatalf("expected Carved bitplane range status msg, got %q", app.StatusMsg)
+	if app.Modal.Kind != ModalCarveName {
+		t.Fatalf("expected ModalCarveName after K in bitplane viewer, got %v", app.Modal.Kind)
+	}
+	app.HandleKey("esc")
+	if app.Modal.Kind != ModalBitplane {
+		t.Fatalf("expected return to ModalBitplane on esc from ModalCarveName, got %v", app.Modal.Kind)
+	}
+	app.HandleKey("K")
+	if !strings.HasPrefix(app.Modal.Input.Value, "gfx_") {
+		t.Fatalf("expected default label starting with gfx_, got %q", app.Modal.Input.Value)
+	}
+	if !strings.Contains(app.Modal.CarveBlockComment, "Bitmap:") {
+		t.Fatalf("expected CarveBlockComment to contain Bitmap:, got %q", app.Modal.CarveBlockComment)
+	}
+	app.HandleKey("enter")
+	if !strings.Contains(app.StatusMsg, "Carved") {
+		t.Fatalf("expected Carved status msg, got %q", app.StatusMsg)
+	}
+	if app.Modal.Kind != ModalNone {
+		t.Fatalf("expected ModalNone after carving, got %v", app.Modal.Kind)
 	}
 
-	// 8. Exit bitplane viewer with esc
-	app.HandleKey("esc")
-	if app.Modal.Kind != ModalNone {
-		t.Fatalf("expected ModalNone after esc, got %v", app.Modal.Kind)
+	// Verify round-trip on 'B': reopen bitplane viewer on the carved row
+	app.HandleKey("B")
+	if app.Modal.Kind != ModalBitplane {
+		t.Fatalf("expected ModalBitplane after pressing B, got %v", app.Modal.Kind)
 	}
+	rb := app.Modal.Bitplane
+	if rb.RowBytes != 2 || rb.Height != 2 || rb.BPU() != 2 || rb.Modulo != 6 {
+		t.Fatalf("expected restored geometry 2x2x2 modulo 6, got %dx%dx%d modulo %d",
+			rb.RowBytes, rb.Height, rb.BPU(), rb.Modulo)
+	}
+	if rb.VisibleMask != 0x01 || rb.ControlMask != 0x02 {
+		t.Fatalf("expected restored masks VIS=$01 SYNC=$02, got VIS=$%02X SYNC=$%02X",
+			rb.VisibleMask, rb.ControlMask)
+	}
+	if rb.PaletteMode != PaletteHighContrast || !rb.Invert || rb.Brightness != 2 {
+		t.Fatalf("expected restored High-Contrast inv bias=+2, got mode=%v inv=%v bias=%d",
+			rb.PaletteMode, rb.Invert, rb.Brightness)
+	}
+	app.HandleKey("esc")
+
 	// Undo the carve with 'ctrl+z'
 	app.HandleKey("ctrl+z")
 	if app.StatusMsg != "Undone" {
 		t.Fatalf("expected Undone after 'ctrl+z', got %q", app.StatusMsg)
+	}
+}
+
+func TestMusicRipperModalAndCarve(t *testing.T) {
+	tmp := t.TempDir()
+	proj := project.New(filepath.Join(tmp, "project.json"))
+	proj.WorkspaceRoot = tmp
+	proj.Data.Segments = append(proj.Data.Segments, project.Segment{
+		Name:        "main",
+		HunkIndex:   0,
+		HunkType:    hunk.HunkTypeCode,
+		MemoryType:  hunk.MemoryPublic,
+		AllocSize:   4096,
+		Base:        0x10000,
+		DB:          ":memory:",
+		Relocatable: false,
+	})
+	proj.Data.Spaces = append(proj.Data.Spaces, project.Space{Name: "default", Segments: []string{"main"}})
+	proj.Data.ActiveSpace = "default"
+	proj.ActiveSegmentName = "main"
+
+	ctrl, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ctrl.Close() })
+	proj.SyncDBScope(ctrl)
+
+	app, err := NewApp(proj, ctrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a synthetic ProTracker module at offset 256
+	mod := make([]byte, 1084+1024+100)
+	copy(mod[0:min(len("TestTune"), 20)], "TestTune")
+	mod[952] = 0 // max pattern index
+	mod[42] = 0
+	mod[43] = 50 // 50 words = 100 bytes sample
+	copy(mod[1080:1084], "M.K.")
+
+	modOffset := 256
+	app.BinaryData = make([]byte, 4096)
+	copy(app.BinaryData[modOffset:], mod)
+	_ = app.LoadData()
+
+	// 1. Press 'M' to open Music Ripper
+	app.HandleKey("M")
+	if app.Modal.Kind != ModalMusicRipper {
+		t.Fatalf("expected ModalMusicRipper, got %v", app.Modal.Kind)
+	}
+	st := &app.Modal.MusicRipper
+	if len(st.Items) != 1 {
+		t.Fatalf("expected 1 detected module item, got %d", len(st.Items))
+	}
+	it := st.Items[0]
+	if it.Name != "ProTracker" || it.Variant != "ProTracker" || it.Start != modOffset {
+		t.Fatalf("unexpected module item: %+v", it)
+	}
+
+	// 2. Press 'w' to save / rip module to <WorkspaceRoot>/assets/
+	app.HandleKey("w")
+	if !strings.Contains(app.StatusMsg, "Saved music module") {
+		t.Fatalf("expected Saved music module status, got %q", app.StatusMsg)
+	}
+
+	// 3. Press 'K' to carve as incbin, test 'esc' returns to ModalMusicRipper, then 'K' again
+	app.HandleKey("K")
+	if app.Modal.Kind != ModalCarveName {
+		t.Fatalf("expected ModalCarveName after K, got %v", app.Modal.Kind)
+	}
+	app.HandleKey("esc")
+	if app.Modal.Kind != ModalMusicRipper {
+		t.Fatalf("expected return to ModalMusicRipper on esc from ModalCarveName, got %v", app.Modal.Kind)
+	}
+	app.HandleKey("K")
+	if !strings.HasPrefix(app.Modal.Input.Value, "mod_protracker_") {
+		t.Fatalf("expected label starting with mod_protracker_, got %q", app.Modal.Input.Value)
+	}
+	if !strings.Contains(app.Modal.CarveBlockComment, "Music:  ProTracker") {
+		t.Fatalf("expected Music block comment, got %q", app.Modal.CarveBlockComment)
+	}
+
+	// 4. Press 'enter' to confirm carve and verify cursor jumped to carved start
+	app.HandleKey("enter")
+	if app.Modal.Kind != ModalNone {
+		t.Fatalf("expected ModalNone after carve, got %v", app.Modal.Kind)
+	}
+	if cur, ok := app.CursorAddr(); !ok || cur != uint32(0x10000+modOffset) {
+		t.Fatalf("expected cursor to jump to carved start 0x%X, got 0x%X (ok=%v)", 0x10000+modOffset, cur, ok)
+	}
+	cell, err := app.DB.GetCell(uint32(0x10000 + modOffset))
+	if err != nil || cell == nil || cell.Type != db.CellIncbin {
+		t.Fatalf("expected CellIncbin at carve start, got %+v", cell)
+	}
+	bc := app.DB.GetAddressComment(uint32(0x10000 + modOffset)).BlockComment
+	if !strings.Contains(bc, "Music:  ProTracker") {
+		t.Fatalf("expected BlockComment on carved cell, got %q", bc)
+	}
+
+	// 5. Undo carve with 'ctrl+z'
+	app.HandleKey("ctrl+z")
+	cellAfter, _ := app.DB.GetCell(uint32(0x10000 + modOffset))
+	if cellAfter != nil && cellAfter.Type == db.CellIncbin {
+		t.Fatalf("expected CellIncbin gone after undo")
+	}
+
+	// 6. Test Enter navigation: reopen 'M', press 'enter', verify cursor jump
+	app.HandleKey("M")
+	if app.Modal.Kind != ModalMusicRipper {
+		t.Fatalf("expected ModalMusicRipper, got %v", app.Modal.Kind)
+	}
+	app.HandleKey("enter")
+	if app.Modal.Kind != ModalNone {
+		t.Fatalf("expected ModalNone after enter, got %v", app.Modal.Kind)
+	}
+	curAddr, ok := app.CursorAddr()
+	if !ok || curAddr != uint32(0x10000+modOffset) {
+		t.Fatalf("expected cursor at 0x%X, got 0x%X (ok=%v)", 0x10000+modOffset, curAddr, ok)
 	}
 }

@@ -260,6 +260,8 @@ func (a *App) HandleKey(key string) bool {
 		a.Modal = Modal{Kind: ModalHelp}
 	case "B":
 		a.OpenBitplaneViewer()
+	case "M":
+		a.OpenMusicRipper()
 	}
 	return true
 }
@@ -884,7 +886,19 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 		status, val := modal.Input.HandleKey(key)
 		switch status {
 		case ComponentDone:
-			a.CarveRange(modal.CarveStart, modal.CarveEnd, val)
+			a.CarveRange(modal.CarveStart, modal.CarveEnd, val, modal.CarveBlockComment)
+			a.Modal = Modal{Kind: ModalNone}
+		case ComponentCancel:
+			if modal.Bitplane != nil {
+				a.Modal = modal
+				a.Modal.Kind = ModalBitplane
+				a.refreshBitplaneCache()
+			} else if len(modal.MusicRipper.Items) > 0 {
+				a.Modal = modal
+				a.Modal.Kind = ModalMusicRipper
+			} else {
+				a.Modal = Modal{Kind: ModalNone}
+			}
 		case ComponentContinue:
 			a.Modal = modal
 		}
@@ -956,6 +970,56 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 			a.refreshBitplaneCache()
 		case ComponentContinue:
 			a.Modal = modal
+		}
+		return true
+	case ModalMusicRipper:
+		a.Modal = modal
+		st := modal.MusicRipper
+		switch key {
+		case "esc", "q":
+			a.Modal = Modal{Kind: ModalNone}
+		case "down", "j":
+			if st.Selected+1 < len(st.Items) {
+				st.Selected++
+			}
+			modal.MusicRipper = st
+			a.Modal = modal
+		case "up", "k":
+			if st.Selected > 0 {
+				st.Selected--
+			}
+			modal.MusicRipper = st
+			a.Modal = modal
+		case "pgdown":
+			if len(st.Items) > 0 {
+				st.Selected = min(st.Selected+10, len(st.Items)-1)
+			}
+			modal.MusicRipper = st
+			a.Modal = modal
+		case "pgup":
+			st.Selected = max(st.Selected-10, 0)
+			modal.MusicRipper = st
+			a.Modal = modal
+		case "home":
+			st.Selected = 0
+			modal.MusicRipper = st
+			a.Modal = modal
+		case "end":
+			if len(st.Items) > 0 {
+				st.Selected = len(st.Items) - 1
+			}
+			modal.MusicRipper = st
+			a.Modal = modal
+		case "enter":
+			if st.Selected >= 0 && st.Selected < len(st.Items) {
+				it := st.Items[st.Selected]
+				a.Modal = Modal{Kind: ModalNone}
+				a.GotoAddress(a.BaseAddr + uint32(it.Start))
+			}
+		case "w":
+			a.SaveMusicModule()
+		case "K":
+			a.CarveMusicModule()
 		}
 		return true
 	}

@@ -751,11 +751,12 @@ func (e *Emitter) PopulateCellsItems() error {
 
 			switch cell.Type {
 			case db.CellIncbin:
-				file := fmt.Sprintf("assets/incbin_%08X.bin", addr)
-				for _, c := range e.Proj.Data.Carves {
-					if c.Start == addr {
-						file = c.File
-						break
+				file := opStr
+				if file == "" {
+					if lbl := getLabelStr(addr); lbl != "" {
+						file = fmt.Sprintf("assets/%s.bin", lbl)
+					} else {
+						file = fmt.Sprintf("assets/incbin_%08X.bin", addr)
 					}
 				}
 				outPath := file

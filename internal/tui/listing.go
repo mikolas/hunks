@@ -22,6 +22,8 @@ func isExplicitCell(c *db.Cell) bool {
 	switch c.Type {
 	case db.CellCode, db.CellStr, db.CellPointer, db.CellIncbin:
 		return true
+	case db.CellDataB, db.CellDataZero:
+		return false
 	default:
 		return c.Confidence >= 100
 	}
@@ -1058,11 +1060,12 @@ func buildListingRowsWithData(
 			}
 
 		case db.CellIncbin:
-			file := fmt.Sprintf("assets/incbin_%08X.bin", addr)
-			for _, c := range proj.Data.Carves {
-				if c.Start == addr {
-					file = c.File
-					break
+			file := cell.OpStrVal()
+			if file == "" {
+				if lbl := getLabelStr(addr); lbl != "" {
+					file = fmt.Sprintf("assets/%s.bin", lbl)
+				} else {
+					file = fmt.Sprintf("assets/incbin_%08X.bin", addr)
 				}
 			}
 			ac := commentsMap[addr]

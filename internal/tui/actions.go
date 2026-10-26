@@ -5,12 +5,11 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/mikolas/hunks/internal/analyzer"
 	"github.com/mikolas/hunks/internal/db"
-	"github.com/mikolas/hunks/internal/project"
+	"github.com/mikolas/hunks/internal/modules"
 )
 
 func (a *App) pushUndo(entry UndoEntry) {
@@ -23,13 +22,59 @@ func (a *App) pushUndo(entry UndoEntry) {
 func (a *App) pushUndoForRegion(addr, size uint32) {
 	cells, _ := a.DB.CellsOverlapping(addr, size)
 	comments, _ := a.DB.GetCommentsInRange(addr, addr+size)
+	var oldLabels []db.Label
+	if lbl, _ := a.DB.GetLabelFull(addr); lbl != nil {
+		oldLabels = append(oldLabels, *lbl)
+	}
 	a.pushUndo(UndoEntry{
 		Kind:         UndoCellDelete,
 		ClearedStart: addr,
 		ClearedLen:   size,
 		Cells:        cells,
 		Comments:     comments,
+		OldLabels:    oldLabels,
 	})
+}
+
+// incbinCellAtCursor returns the INCBIN cell if and only if the cursor is currently
+// positioned on an INCBIN row in DisasmRows (and backed by a CellIncbin in the DB).
+// It never matches dc.x (SubRowData), CODE, or other non-incbin rows.
+func (a *App) incbinCellAtCursor() *db.Cell {
+	if len(a.DisasmRows) > 0 {
+		idx := min(max(a.SelectedIdx, 0), len(a.DisasmRows)-1)
+		row := a.DisasmRows[idx]
+		if row.Kind == SubRowData || row.CellType != "INCBIN" {
+			return nil
+		}
+		if row.Addr != nil {
+			if cell, err := a.DB.GetCell(*row.Addr); err == nil && cell != nil && cell.Type == db.CellIncbin && cell.Size > 0 {
+				return cell
+			}
+		}
+		return nil
+	}
+	addr, ok := a.CursorAddr()
+	if !ok {
+		return nil
+	}
+	if cell, err := a.DB.GetCell(addr); err == nil && cell != nil && cell.Type == db.CellIncbin && cell.Size > 0 {
+		return cell
+	}
+	return nil
+}
+
+// rangeOverlapsIncbin returns true if [start, start+size) overlaps any CellIncbin in the DB.
+func (a *App) rangeOverlapsIncbin(start, size uint32) bool {
+	cells, err := a.DB.CellsOverlapping(start, size)
+	if err != nil {
+		return false
+	}
+	for i := range cells {
+		if cells[i].Type == db.CellIncbin {
+			return true
+		}
+	}
+	return false
 }
 
 // Undo reverts the most recent user edit from UndoStack.
@@ -42,12 +87,67 @@ func (a *App) Undo() {
 	a.UndoStack = a.UndoStack[:len(a.UndoStack)-1]
 	switch entry.Kind {
 	case UndoCellDelete:
-		_ = a.DB.ClearOverlaps(entry.ClearedStart, entry.ClearedLen)
-		for i := range entry.Cells {
-			_ = a.DB.InsertCell(&entry.Cells[i])
-		}
-		for cAddr, ac := range entry.Comments {
-			_ = a.DB.SetAutoComment(cAddr, ac.AutoComment)
+		if err := a.DB.WithTransaction(func() error {
+			if err := a.DB.ClearOverlaps(entry.ClearedStart, entry.ClearedLen); err != nil {
+				return err
+			}
+			clearMin := entry.ClearedStart
+			clearMax := entry.ClearedStart + entry.ClearedLen
+			for i := range entry.Cells {
+				if entry.Cells[i].Addr < clearMin {
+					clearMin = entry.Cells[i].Addr
+				}
+				if end := entry.Cells[i].Addr + entry.Cells[i].Size; end > clearMax {
+					clearMax = end
+				}
+			}
+			if err := a.DB.DeleteCellsInRange(clearMin, clearMax); err != nil {
+				return err
+			}
+			for i := range entry.Cells {
+				if err := a.DB.InsertCell(&entry.Cells[i]); err != nil {
+					return err
+				}
+			}
+			currentComments, _ := a.DB.GetCommentsInRange(entry.ClearedStart, entry.ClearedStart+entry.ClearedLen)
+			for cAddr := range currentComments {
+				if _, existed := entry.Comments[cAddr]; !existed {
+					if err := a.DB.UpdateComment(cAddr, ""); err != nil {
+						return err
+					}
+					if err := a.DB.UpdateBlockComment(cAddr, ""); err != nil {
+						return err
+					}
+					if err := a.DB.SetAutoComment(cAddr, ""); err != nil {
+						return err
+					}
+				}
+			}
+			for cAddr, ac := range entry.Comments {
+				if err := a.DB.UpdateComment(cAddr, ac.Comment); err != nil {
+					return err
+				}
+				if err := a.DB.UpdateBlockComment(cAddr, ac.BlockComment); err != nil {
+					return err
+				}
+				if err := a.DB.SetAutoComment(cAddr, ac.AutoComment); err != nil {
+					return err
+				}
+			}
+			if entry.DeletedLabel {
+				if err := a.DB.DeleteLabelAt(entry.ClearedStart); err != nil {
+					return err
+				}
+			}
+			for _, lbl := range entry.OldLabels {
+				if err := a.DB.SetLabel(lbl.Addr, lbl.Name, lbl.Type, lbl.IsAuto); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			a.StatusMsg = fmt.Sprintf("Undo failed: %v", err)
+			return
 		}
 	case UndoLabelChange:
 		if entry.OldStr != nil {
@@ -80,6 +180,10 @@ func (a *App) Undo() {
 
 // MarkString marks a NUL-terminated or printable ASCII string starting at the cursor.
 func (a *App) MarkString() {
+	if a.incbinCellAtCursor() != nil {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
+	}
 	addr, ok := a.CursorAddr()
 	if !ok {
 		return
@@ -110,31 +214,59 @@ func (a *App) MarkString() {
 	if size == 0 {
 		return
 	}
+	if a.rangeOverlapsIncbin(addr, size) {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
+	}
 	a.pushUndoForRegion(addr, size)
-	_ = a.DB.MarkData(addr, size, db.CellStr)
+	_ = a.DB.WithTransaction(func() error {
+		return a.DB.MarkData(addr, size, db.CellStr)
+	})
 	a.ReloadAtCursor()
 	a.StatusMsg = fmt.Sprintf("Marked %d byte string at %s", size, a.FormatAddr(addr))
 }
 
-// MarkType marks size bytes at the cursor as cellType.
+// MarkType marks size bytes at the cursor as cellType (or unfolds an incbin when pressing 'b').
 func (a *App) MarkType(cellType db.CellType, size uint32) {
+	if a.incbinCellAtCursor() != nil {
+		if cellType == db.CellDataB {
+			a.UncarveAtCursor()
+		} else {
+			a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		}
+		return
+	}
 	addr, ok := a.CursorAddr()
 	if !ok {
 		return
 	}
+	if a.rangeOverlapsIncbin(addr, size) {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
+	}
 	a.pushUndoForRegion(addr, size)
-	_ = a.DB.MarkData(addr, size, cellType)
+	_ = a.DB.WithTransaction(func() error {
+		return a.DB.MarkData(addr, size, cellType)
+	})
 	a.ReloadAtCursor()
 	a.StatusMsg = fmt.Sprintf("Marked %s at %s", cellType.AsStr(), a.FormatAddr(addr))
 }
 
 // MarkCode marks the word-aligned cursor address as a code entry point and runs incremental analysis.
 func (a *App) MarkCode() {
+	if a.incbinCellAtCursor() != nil {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
+	}
 	rawAddr, ok := a.CursorAddr()
 	if !ok {
 		return
 	}
 	addr := rawAddr &^ 1
+	if a.rangeOverlapsIncbin(addr, 2) {
+		a.StatusMsg = "Folded incbin — press 'b' or 'K' to unfold first"
+		return
+	}
 	a.pushUndoForRegion(addr, 2)
 	if _, err := analyzer.ApplyCodeHint(a.Proj, a.DB, addr); err != nil {
 		a.StatusMsg = fmt.Sprintf("Analyze failed: %v", err)
@@ -145,7 +277,11 @@ func (a *App) MarkCode() {
 }
 
 // CarveRange carves [start, endIncl] in the current segment into an INCBIN cell.
-func (a *App) CarveRange(start, endIncl uint32, name string) {
+func (a *App) CarveRange(start, endIncl uint32, name, blockComment string) {
+	if endIncl < start || endIncl == 0xFFFFFFFF || start < a.BaseAddr {
+		a.StatusMsg = "Invalid carve range"
+		return
+	}
 	end := endIncl + 1
 	seg := a.Proj.SegmentAtAddr(start)
 	if seg == nil {
@@ -175,12 +311,30 @@ func (a *App) CarveRange(start, endIncl uint32, name string) {
 		a.StatusMsg = "Selection exceeds segment payload"
 		return
 	}
-	raw := make([]byte, endOff-off)
-	copy(raw, a.BinaryData[off:endOff])
+
+	cells, _ := a.DB.CellsOverlapping(start, end-start)
+	comments, _ := a.DB.GetCommentsInRange(start, end)
+	var oldLabels []db.Label
+	hadStartLabel := false
+	if lbl, _ := a.DB.GetLabelFull(start); lbl != nil {
+		oldLabels = append(oldLabels, *lbl)
+		hadStartLabel = true
+	}
+	var interiorOverlappedStarts []uint32
+	for _, c := range cells {
+		if c.Type == db.CellIncbin && c.Addr > start && c.Addr < end {
+			interiorOverlappedStarts = append(interiorOverlappedStarts, c.Addr)
+			if lbl, _ := a.DB.GetLabelFull(c.Addr); lbl != nil {
+				oldLabels = append(oldLabels, *lbl)
+			}
+		}
+	}
 
 	label := strings.TrimSpace(name)
+	isAuto := false
 	if label == "" {
 		label = a.Proj.AutoLabel(start)
+		isAuto = true
 	}
 	sidecar := fmt.Sprintf("assets/%s.bin", label)
 
@@ -191,71 +345,113 @@ func (a *App) CarveRange(start, endIncl uint32, name string) {
 		if err := a.DB.DeleteCellsInRange(start, end); err != nil {
 			return err
 		}
+		for _, cStart := range interiorOverlappedStarts {
+			if err := a.DB.DeleteLabelAt(cStart); err != nil {
+				return err
+			}
+			if err := a.DB.UpdateBlockComment(cStart, ""); err != nil {
+				return err
+			}
+		}
 		if err := a.DB.InsertCell(&db.Cell{
 			Seg:        a.DB.SegOf(start),
 			Addr:       start,
 			Size:       end - start,
 			Type:       db.CellIncbin,
 			Confidence: 255,
-			RawBytes:   raw,
 		}); err != nil {
 			return err
 		}
-		return a.DB.SetLabel(start, label, db.LabelDat, false)
+		if err := a.DB.SetLabel(start, label, db.LabelDat, isAuto); err != nil {
+			return err
+		}
+		if blockComment != "" {
+			if err := a.DB.UpdateBlockComment(start, blockComment); err != nil {
+				return err
+			}
+		}
+		return nil
 	}); err != nil {
 		a.StatusMsg = fmt.Sprintf("Carve failed: %v", err)
 		return
 	}
 
-	a.Proj.Data.Carves = slices.DeleteFunc(a.Proj.Data.Carves, func(c project.Carve) bool {
-		return c.Start == start
+	a.pushUndo(UndoEntry{
+		Kind:         UndoCellDelete,
+		ClearedStart: start,
+		ClearedLen:   end - start,
+		Cells:        cells,
+		Comments:     comments,
+		OldLabels:    oldLabels,
+		DeletedLabel: !hadStartLabel,
 	})
-	a.Proj.Data.Carves = append(a.Proj.Data.Carves, project.Carve{
-		Start: start,
-		End:   end,
-		File:  sidecar,
-		Name:  label,
-	})
-	_ = a.Proj.Save()
+
 	a.SelectionStart = nil
 	a.ReloadAtCursor()
+	// Move the disassembly cursor to the carved incbin's start address (intentional TUI UX
+	// when carving from ModalBitplane, ModalMusicRipper, or a downward/upward range selection).
+	a.GotoAddress(start)
 	a.StatusMsg = fmt.Sprintf("Carved %d bytes at %s -> %s", end-start, a.FormatAddr(start), sidecar)
 }
 
-// UncarveAtCursor removes the carve whose range contains the cursor address.
+// UncarveAtCursor unfolds the INCBIN cell at the cursor row back into bytes.
+// It refuses to act if the cursor is on a dc.x data row or any non-INCBIN row.
 func (a *App) UncarveAtCursor() {
-	addr, ok := a.CursorAddr()
-	if !ok {
-		return
-	}
-	idx := -1
-	var carve project.Carve
-	for i, c := range a.Proj.Data.Carves {
-		if addr >= c.Start && addr < c.End {
-			idx = i
-			carve = c
-			break
-		}
-	}
-	if idx < 0 {
+	cell := a.incbinCellAtCursor()
+	if cell == nil {
 		a.StatusMsg = "No carve at cursor"
 		return
 	}
-	_ = a.DB.DeleteCellsInRange(carve.Start, carve.End)
-	a.Proj.Data.Carves = append(a.Proj.Data.Carves[:idx], a.Proj.Data.Carves[idx+1:]...)
-	_ = a.Proj.Save()
+	carveStart := cell.Addr
+	carveEnd := cell.Addr + cell.Size
+	cells, _ := a.DB.CellsOverlapping(carveStart, cell.Size)
+	comments, _ := a.DB.GetCommentsInRange(carveStart, carveEnd)
+	var oldLabels []db.Label
+	if lbl, _ := a.DB.GetLabelFull(carveStart); lbl != nil {
+		oldLabels = append(oldLabels, *lbl)
+	}
+	if err := a.DB.WithTransaction(func() error {
+		if err := a.DB.DeleteCellsInRange(carveStart, carveEnd); err != nil {
+			return err
+		}
+		if err := a.DB.DeleteLabelAt(carveStart); err != nil {
+			return err
+		}
+		if err := a.DB.UpdateBlockComment(carveStart, ""); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		a.StatusMsg = fmt.Sprintf("Uncarve failed: %v", err)
+		return
+	}
+	a.pushUndo(UndoEntry{
+		Kind:         UndoCellDelete,
+		ClearedStart: carveStart,
+		ClearedLen:   cell.Size,
+		Cells:        cells,
+		Comments:     comments,
+		OldLabels:    oldLabels,
+	})
 	a.ReloadAtCursor()
-	a.StatusMsg = fmt.Sprintf("Uncarved %s — press 'r' to reclassify", a.FormatAddr(carve.Start))
+	a.StatusMsg = fmt.Sprintf("Uncarved %s — press 'r' to reclassify", a.FormatAddr(carveStart))
 }
 
-// Undefine deletes the cell and control edges at the cursor address.
+// Undefine deletes the cell and control edges at the cursor address (or unfolds an INCBIN).
 func (a *App) Undefine() {
+	if a.incbinCellAtCursor() != nil {
+		a.UncarveAtCursor()
+		return
+	}
 	addr, ok := a.CursorAddr()
 	if !ok {
 		return
 	}
 	targetAddr := addr
 	if cell, err := a.DB.GetCellContaining(addr); err == nil && cell != nil {
+		if cell.Type == db.CellIncbin {
+			return
+		}
 		targetAddr = cell.Addr
 		a.pushUndoForRegion(targetAddr, max(cell.Size, 1))
 	}
@@ -349,7 +545,18 @@ func (a *App) OpenBitplaneViewer() {
 	if addr >= a.BaseAddr {
 		baseOff = addr - a.BaseAddr
 	}
-	st := NewBitplaneState(baseOff)
+
+	var st *BitplaneState
+	if a.DB != nil {
+		ac := a.DB.GetAddressComment(addr)
+		lbl, _, _ := a.DB.GetLabel(addr)
+		if restored, ok := ParseBitplaneBlockComment(ac.BlockComment, lbl, a.BaseAddr, baseOff, a.BinaryData); ok {
+			st = restored
+		}
+	}
+	if st == nil {
+		st = NewBitplaneState(baseOff)
+	}
 	proto := DetectProtocol()
 
 	// Scale to fit the terminal window canvas using exact pixel measurements
@@ -382,6 +589,13 @@ func (a *App) refreshBitplaneCache() {
 	st.UpdateCacheClipped(a.BinaryData, 2, 6, a.Modal.PixelProtocol, maxOutPxW, maxOutPxH)
 }
 
+func (a *App) assetsDir() string {
+	if a.Proj != nil && a.Proj.WorkspaceRoot != "" {
+		return filepath.Join(a.Proj.WorkspaceRoot, "assets")
+	}
+	return "assets"
+}
+
 // SaveBitplanePNG saves the full bitmap to assets/<seg>_<addr>_<W>x<H>x<D>.png.
 func (a *App) SaveBitplanePNG() {
 	st := a.Modal.Bitplane
@@ -393,7 +607,7 @@ func (a *App) SaveBitplanePNG() {
 	img := st.DecodeImage(a.BinaryData, 0, 0)
 	st.Scale = oldScale
 
-	dir := "assets"
+	dir := a.assetsDir()
 	_ = os.MkdirAll(dir, 0755)
 
 	segName := "seg"
@@ -429,7 +643,7 @@ func (a *App) SaveBitplaneIFF() {
 		return
 	}
 
-	dir := "assets"
+	dir := a.assetsDir()
 	_ = os.MkdirAll(dir, 0755)
 
 	segName := "seg"
@@ -446,7 +660,7 @@ func (a *App) SaveBitplaneIFF() {
 	a.StatusMsg = fmt.Sprintf("Saved IFF ILBM: %s", outPath)
 }
 
-// CarveBitplaneRange carves the memory region spanned by the current bitplanes.
+// CarveBitplaneRange initiates carving of the memory region spanned by the current bitplanes.
 func (a *App) CarveBitplaneRange() {
 	st := a.Modal.Bitplane
 	if st == nil || a.DB == nil {
@@ -460,22 +674,167 @@ func (a *App) CarveBitplaneRange() {
 		return
 	}
 	startAddr := a.BaseAddr + startOff
-	length := endOff - startOff
+	endAddr := a.BaseAddr + endOff
 
-	label := fmt.Sprintf("gfx_%dx%dx%d", st.VisibleWidth(), st.Height, st.BPU())
-	a.pushUndoForRegion(startAddr, length)
-	if err := a.DB.WithTransaction(func() error {
-		if err := a.DB.ClearOverlaps(startAddr, length); err != nil {
-			return err
-		}
-		if err := a.DB.MarkData(startAddr, length, db.CellDataB); err != nil {
-			return err
-		}
-		return a.DB.SetLabel(startAddr, label, db.LabelDat, true)
-	}); err != nil {
-		a.StatusMsg = fmt.Sprintf("Carve failed: %v", err)
+	seg := a.Proj.SegmentAtAddr(startAddr)
+	if seg == nil || seg.IsRelocatable() {
+		a.StatusMsg = "Refused: bitplane carving only supported in flat binaries"
 		return
 	}
-	a.ReloadAtCursor()
-	a.StatusMsg = fmt.Sprintf("Carved bitplane range +$%05X..+$%05X (%s)", startOff, endOff, label)
+
+	iSuf := ""
+	if st.Interleaved {
+		iSuf = "i"
+	}
+	hSuf := ""
+	if st.Hires || st.RowBytes >= 80 {
+		hSuf = "h"
+	}
+	hamSuf := ""
+	if st.HAM && st.BPU() == 6 {
+		hamSuf = "ham"
+	}
+	defaultLabel := fmt.Sprintf("gfx_%dx%dx%d%s%s%s", st.WidthPx(), st.Height, st.BPU(), iSuf, hSuf, hamSuf)
+	blockComment := st.FormatBlockComment(a.BaseAddr)
+
+	if a.Modal.PixelProtocol == ProtocolKitty {
+		a.PendingEscapeSeq = ClearKittyPlacements()
+	}
+
+	a.Modal = Modal{
+		Kind:              ModalCarveName,
+		Input:             NewTextInput(defaultLabel),
+		CarveStart:        startAddr,
+		CarveEnd:          endAddr - 1,
+		CarveBlockComment: blockComment,
+		Bitplane:          st,
+		PixelProtocol:     a.Modal.PixelProtocol,
+	}
+}
+
+// OpenMusicRipper scans the active segment for embedded music modules and opens the ripper modal.
+func (a *App) OpenMusicRipper() {
+	if len(a.BinaryData) == 0 {
+		a.StatusMsg = "No binary data in active segment"
+		return
+	}
+	matches := modules.Scan(a.BinaryData)
+	if len(matches) == 0 {
+		a.StatusMsg = "No music modules found in segment"
+		return
+	}
+	var items []MusicRipperItem
+	for _, m := range matches {
+		for _, r := range m.Regions {
+			items = append(items, MusicRipperItem{
+				FormatID: m.FormatID,
+				Name:     m.Name,
+				Variant:  m.Variant,
+				Role:     r.Role,
+				Start:    r.Start,
+				Len:      r.Len,
+			})
+		}
+	}
+	cursorOff := 0
+	if cur, ok := a.CursorAddr(); ok && cur >= a.BaseAddr {
+		cursorOff = int(cur - a.BaseAddr)
+	}
+	bestIdx := 0
+	for i, it := range items {
+		if cursorOff >= it.Start && cursorOff < it.Start+it.Len {
+			bestIdx = i
+			break
+		}
+	}
+	a.Modal = Modal{
+		Kind: ModalMusicRipper,
+		MusicRipper: MusicRipperState{
+			Items:    items,
+			Selected: bestIdx,
+		},
+	}
+	a.StatusMsg = ""
+}
+
+func musicFormatSlug(name string) string {
+	var sb strings.Builder
+	prevUnderscore := false
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+			prevUnderscore = false
+		} else if !prevUnderscore && sb.Len() > 0 {
+			sb.WriteByte('_')
+			prevUnderscore = true
+		}
+	}
+	res := strings.TrimSuffix(sb.String(), "_")
+	if res == "" {
+		return "mod"
+	}
+	return res
+}
+
+// SaveMusicModule writes the selected module region to assets/<slug>_<offset>.bin (or .mod).
+func (a *App) SaveMusicModule() {
+	st := a.Modal.MusicRipper
+	if len(st.Items) == 0 || st.Selected < 0 || st.Selected >= len(st.Items) {
+		return
+	}
+	it := st.Items[st.Selected]
+	endOff := it.Start + it.Len
+	if it.Start < 0 || endOff > len(a.BinaryData) {
+		a.StatusMsg = "Selected module exceeds binary payload"
+		return
+	}
+	raw := a.BinaryData[it.Start:endOff]
+
+	dir := a.assetsDir()
+	_ = os.MkdirAll(dir, 0755)
+
+	slug := musicFormatSlug(it.Name)
+	ext := modules.FileExtForFormatID(it.FormatID, it.Role)
+	filename := fmt.Sprintf("%s_%05X.%s", slug, it.Start, ext)
+	outPath := filepath.Join(dir, filename)
+
+	if err := os.WriteFile(outPath, raw, 0644); err != nil {
+		a.StatusMsg = fmt.Sprintf("Module write error: %v", err)
+		return
+	}
+	a.StatusMsg = fmt.Sprintf("Saved music module: %s (%d bytes)", outPath, len(raw))
+}
+
+// CarveMusicModule initiates carving of the selected music module region into an INCBIN cell.
+func (a *App) CarveMusicModule() {
+	st := a.Modal.MusicRipper
+	if len(st.Items) == 0 || st.Selected < 0 || st.Selected >= len(st.Items) {
+		return
+	}
+	it := st.Items[st.Selected]
+	startAddr := a.BaseAddr + uint32(it.Start)
+	endAddr := a.BaseAddr + uint32(it.Start+it.Len)
+
+	seg := a.Proj.SegmentAtAddr(startAddr)
+	if seg == nil || seg.IsRelocatable() {
+		a.StatusMsg = "Refused: asset carving only supported in flat binaries"
+		return
+	}
+
+	slug := musicFormatSlug(it.Name)
+	defaultLabel := fmt.Sprintf("mod_%s_%05X", slug, it.Start)
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Music:  %s (%s) — %s\n", it.Name, it.Variant, it.Role)
+	fmt.Fprintf(&sb, "Span:   $%06X..$%06X (%d bytes)", startAddr, endAddr, it.Len)
+	blockComment := sb.String()
+
+	a.Modal = Modal{
+		Kind:              ModalCarveName,
+		Input:             NewTextInput(defaultLabel),
+		CarveStart:        startAddr,
+		CarveEnd:          endAddr - 1,
+		CarveBlockComment: blockComment,
+		MusicRipper:       st,
+	}
 }
