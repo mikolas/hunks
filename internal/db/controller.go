@@ -1135,24 +1135,25 @@ func (c *Controller) FunctionLabelAddrs() []uint32 {
 		return out
 	}
 	sql1 := fmt.Sprintf(
-		`SELECT DISTINCT l.addr FROM labels l JOIN cells c ON c.seg = l.seg AND c.addr = l.addr
-		 WHERE c.seg IN (%s) AND c.type = 'CODE' AND (
-		     l.is_exported = 1
-		     OR EXISTS (SELECT 1 FROM edges e WHERE e.seg IN (%s) AND e.target_addr = l.addr AND e.type = 'CALL')
-		     OR EXISTS (SELECT 1 FROM xrefs x WHERE x.seg IN (%s) AND x.target_addr = l.addr)
-		 ) ORDER BY l.addr ASC`,
-		inClause, inClause, inEmpty,
+		`SELECT DISTINCT addr FROM (
+			SELECT l.addr AS addr FROM labels l JOIN cells c ON c.seg = l.seg AND c.addr = l.addr
+			WHERE c.seg IN (%s) AND c.type = 'CODE' AND (
+			    l.kind = 'SUB'
+			    OR l.is_exported = 1
+			    OR EXISTS (SELECT 1 FROM edges e WHERE e.seg IN (%s) AND e.target_addr = l.addr AND e.type = 'CALL')
+			    OR (
+			        EXISTS (SELECT 1 FROM xrefs x WHERE x.seg IN (%s) AND x.target_addr = l.addr AND x.type != 'CODE_BRANCH')
+			        AND NOT EXISTS (SELECT 1 FROM xrefs xb WHERE xb.seg IN (%s) AND xb.target_addr = l.addr AND xb.type = 'CODE_BRANCH')
+			    )
+			)
+			UNION
+			SELECT f.entry_addr AS addr FROM functions f JOIN cells c ON c.seg = f.seg AND c.addr = f.entry_addr
+			WHERE c.seg IN (%s) AND c.type = 'CODE'
+			AND NOT EXISTS (SELECT 1 FROM xrefs xb WHERE xb.seg IN (%s) AND xb.target_addr = f.entry_addr AND xb.type = 'CODE_BRANCH')
+		) ORDER BY addr ASC`,
+		inClause, inClause, inEmpty, inEmpty, inClause, inEmpty,
 	)
-	out := queryInto(sql1)
-	if len(out) == 0 {
-		sql2 := fmt.Sprintf(
-			`SELECT DISTINCT l.addr FROM labels l JOIN cells c ON c.seg = l.seg AND c.addr = l.addr
-			 WHERE c.seg IN (%s) AND c.type = 'CODE' ORDER BY l.addr ASC`,
-			inClause,
-		)
-		out = queryInto(sql2)
-	}
-	return out
+	return queryInto(sql1)
 }
 
 func (c *Controller) searchBoundsAndClause(rng *AddrRange, col string, includeEmpty bool) (uint32, uint32, string) {

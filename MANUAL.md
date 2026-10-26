@@ -470,7 +470,8 @@ Instructions that jump/call across hunks or through a register jump-vector table
 
 | Key | Action |
 |-----|--------|
-| `v` | Toggle range selection (`Esc` cancels active selection) |
+| `v` | Toggle range selection (`Esc` cancels active selection); when code instructions are selected, the status bar displays aggregate byte size, instruction count, and MC68000 execution cycles + `(R/W)` bus words |
+| `V` | Select (or cancel selection of) the current subroutine and display its aggregate byte size, instruction count, and MC68000 execution cycles + `(R/W)` bus words in the status bar |
 | `c` | Mark cursor (or selection) as `CODE` (`confidence = 100`) and run incremental analysis |
 | `b` | Mark as `DATA_B` (1 byte) |
 | `w` | Mark as `DATA_W` (2 bytes) |

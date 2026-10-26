@@ -2,7 +2,11 @@ package tui
 
 import (
 	"fmt"
+	"maps"
 	"os"
+	"slices"
+	"strconv"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/term"
@@ -247,6 +251,197 @@ func (a *App) ToggleSelection() {
 	}
 }
 
+// SelectSubroutine selects (or cancels selection of) the subroutine enclosing the cursor.
+func (a *App) SelectSubroutine() {
+	funcStart, lastInsnAddr, ok := a.subroutineBoundsAtCursor()
+	if !ok {
+		a.StatusMsg = "No subroutine at cursor"
+		return
+	}
+	if selStart, selEnd, hasSel := a.GetSelectionRange(); hasSel && selStart == funcStart && selEnd == lastInsnAddr {
+		a.SelectionStart = nil
+		a.StatusMsg = "Selection cancelled"
+		return
+	}
+	a.SelectionStart = &funcStart
+	a.GotoAddress(lastInsnAddr)
+}
+
+func isSubroutineTerminator(mnem string) bool {
+	op, _ := m68k.ParseMnemonic(mnem)
+	switch op {
+	case m68k.OpRTS, m68k.OpRTE, m68k.OpRTR, m68k.OpJMP, m68k.OpBRA, m68k.OpILLEGAL:
+		return true
+	}
+	return false
+}
+
+func branchTargetAddr(row *ListingRow, curAddr uint32) (uint32, bool) {
+	if len(row.RawBytes) >= 2 {
+		if insn, ok := m68k.Decode(row.RawBytes, curAddr); ok {
+			if insn.IsBranch() && !insn.IsCall() {
+				for _, op := range insn.Operands() {
+					if op.Mode == m68k.EABranch || op.Mode == m68k.EAPCDisp16 {
+						return op.UVal, true
+					}
+				}
+				if row.RefTarget != nil {
+					return *row.RefTarget, true
+				}
+			}
+			return 0, false
+		}
+	}
+	op, _ := m68k.ParseMnemonic(row.Mnem)
+	if (op == m68k.OpBcc || op == m68k.OpDBcc || op == m68k.OpBRA) && row.RefTarget != nil {
+		return *row.RefTarget, true
+	}
+	return 0, false
+}
+
+func (a *App) subroutineBoundsAtCursor() (uint32, uint32, bool) {
+	cur, ok := a.CursorAddr()
+	if !ok {
+		return 0, 0, false
+	}
+
+	var codeIdxs []int
+	curCodePos := -1
+	for i := range a.DisasmRows {
+		r := &a.DisasmRows[i]
+		if r.Kind == SubRowCode && r.Addr != nil {
+			if *r.Addr == cur && curCodePos < 0 {
+				curCodePos = len(codeIdxs)
+			}
+			codeIdxs = append(codeIdxs, i)
+		}
+	}
+	if len(codeIdxs) == 0 || curCodePos < 0 {
+		return 0, 0, false
+	}
+
+	funcSet := make(map[uint32]struct{})
+	if a.DB != nil {
+		for _, fa := range a.DB.FunctionLabelAddrs() {
+			funcSet[fa] = struct{}{}
+		}
+	}
+	if a.Proj != nil {
+		for _, ep := range a.Proj.Data.EntryPoints {
+			if ep.Segment == "" || strings.EqualFold(ep.Segment, a.Proj.ActiveSegmentName) {
+				funcSet[ep.Addr] = struct{}{}
+			}
+		}
+	}
+	funcAddrs := slices.Sorted(maps.Keys(funcSet))
+
+	subStartPos := 0
+	var maxBranchTarget uint32
+	for pos := 0; pos < len(codeIdxs); pos++ {
+		curRow := &a.DisasmRows[codeIdxs[pos]]
+		curAddr := *curRow.Addr
+		curSize := max(curRow.Size, 2)
+		nextAddr := curAddr + curSize
+
+		if brTgt, isBr := branchTargetAddr(curRow, curAddr); isBr && brTgt > curAddr {
+			idx, _ := slices.BinarySearch(funcAddrs, curAddr+1)
+			crossesFunc := idx < len(funcAddrs) && funcAddrs[idx] <= brTgt
+			if !crossesFunc && brTgt > maxBranchTarget {
+				maxBranchTarget = brTgt
+			}
+		}
+
+		isEnd := false
+		if pos+1 >= len(codeIdxs) {
+			isEnd = true
+		} else {
+			nextRow := &a.DisasmRows[codeIdxs[pos+1]]
+			if *nextRow.Addr != nextAddr {
+				isEnd = true
+			} else if _, isFunc := funcSet[*nextRow.Addr]; isFunc {
+				isEnd = true
+			} else if isSubroutineTerminator(curRow.Mnem) && maxBranchTarget < nextAddr {
+				isEnd = true
+			}
+		}
+
+		if isEnd {
+			if pos >= curCodePos {
+				startAddr := *a.DisasmRows[codeIdxs[subStartPos]].Addr
+				endAddr := *a.DisasmRows[codeIdxs[pos]].Addr
+				return startAddr, endAddr, true
+			}
+			subStartPos = pos + 1
+			maxBranchTarget = 0
+		}
+	}
+
+	return 0, 0, false
+}
+
+func formatRangeUint32(lo, hi uint32) string {
+	if lo == hi {
+		return strconv.FormatUint(uint64(lo), 10)
+	}
+	return strconv.FormatUint(uint64(lo), 10) + "-" + strconv.FormatUint(uint64(hi), 10)
+}
+
+func formatBlockTiming(minCyc, maxCyc, minR, maxR, minW, maxW uint32) string {
+	if maxCyc == 0 {
+		return "-- cyc"
+	}
+	return fmt.Sprintf("%s (%s/%s) cyc",
+		formatRangeUint32(minCyc, maxCyc),
+		formatRangeUint32(minR, maxR),
+		formatRangeUint32(minW, maxW),
+	)
+}
+
+func (a *App) selectionBlockStats(start, end uint32) (size uint32, insns int, timingStr string) {
+	maxEndByte := end
+	var minCyc, maxCyc uint32
+	var minR, maxR uint32
+	var minW, maxW uint32
+
+	for i := range a.DisasmRows {
+		row := &a.DisasmRows[i]
+		if row.Kind != SubRowCode || row.Addr == nil {
+			continue
+		}
+		rStart := *row.Addr
+		rEnd := rStart + max(row.Size, 1) - 1
+		if rStart > end || rEnd < start {
+			continue
+		}
+		if rEnd > maxEndByte {
+			maxEndByte = rEnd
+		}
+		insns++
+		t := row.Timing
+		switch t.Kind {
+		case m68k.TimingBranch, m68k.TimingRange:
+			minCyc += uint32(min(t.Primary.Cycles, t.Secondary.Cycles))
+			maxCyc += uint32(max(t.Primary.Cycles, t.Secondary.Cycles))
+			minR += uint32(min(t.Primary.Reads, t.Secondary.Reads))
+			maxR += uint32(max(t.Primary.Reads, t.Secondary.Reads))
+			minW += uint32(min(t.Primary.Writes, t.Secondary.Writes))
+			maxW += uint32(max(t.Primary.Writes, t.Secondary.Writes))
+		default:
+			minCyc += uint32(t.Primary.Cycles)
+			maxCyc += uint32(t.Primary.Cycles)
+			minR += uint32(t.Primary.Reads)
+			maxR += uint32(t.Primary.Reads)
+			minW += uint32(t.Primary.Writes)
+			maxW += uint32(t.Primary.Writes)
+		}
+	}
+	size = maxEndByte - start + 1
+	if insns > 0 {
+		timingStr = formatBlockTiming(minCyc, maxCyc, minR, maxR, minW, maxW)
+	}
+	return size, insns, timingStr
+}
+
 // GetSelectionRange returns the ordered inclusive (start, end) selection range if active.
 func (a *App) GetSelectionRange() (uint32, uint32, bool) {
 	if a.SelectionStart == nil {
@@ -297,7 +492,11 @@ func (a *App) GetStatusLine() string {
 		return " No selection"
 	}
 	if start, end, selOk := a.GetSelectionRange(); selOk {
-		size := end - start + 1
+		size, insns, timingStr := a.selectionBlockStats(start, end)
+		if insns > 0 {
+			return fmt.Sprintf(" SELECT: %s–%s (%dB, %d insns) │ %s │ c/b/w/l/s/p/K to apply, Esc cancel",
+				a.FormatAddr(start), a.FormatAddr(end), size, insns, timingStr)
+		}
 		return fmt.Sprintf(" SELECT: %s–%s (%dB) │ c/b/w/l/s/p/K to apply, Esc cancel",
 			a.FormatAddr(start), a.FormatAddr(end), size)
 	}

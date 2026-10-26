@@ -992,7 +992,7 @@ func renderModal(buf *screenBuffer, a *App, screen rect) {
 			"  #  Cycle format (HEX/DEC/BIN)",
 			"",
 			"Type Marking:",
-			"  c Code  b Byte  w Word  l Long  v Select",
+			"  c Code  b Byte  w Word  l Long  v/V Select/Sub",
 			"  s String  p Pointer  P Ptr table  u Undefine",
 			"  K Carve selection->incbin (on carve: uncarve)",
 			"",
