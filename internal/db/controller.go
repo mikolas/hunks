@@ -473,7 +473,6 @@ func (c *Controller) initSchema() error {
 		is_noreturn BOOLEAN DEFAULT 0,
 		stack_frame INTEGER,
 		confidence INTEGER NOT NULL DEFAULT 0,
-		abi TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY (seg, entry_addr)
 	);
 
@@ -510,12 +509,8 @@ func (c *Controller) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_edges_seg_target ON edges(seg, target_addr);
 	CREATE INDEX IF NOT EXISTS idx_xrefs_seg_target ON xrefs(seg, target_addr);
 	CREATE INDEX IF NOT EXISTS idx_cells_seg_type ON cells(seg, type);`
-	if _, err := c.conn.Exec(schema); err != nil {
-		return err
-	}
-	// Migrate pre-existing project.db files that were created before `functions.abi` existed.
-	_, _ = c.conn.Exec("ALTER TABLE functions ADD COLUMN abi TEXT NOT NULL DEFAULT ''")
-	return nil
+	_, err := c.conn.Exec(schema)
+	return err
 }
 
 func (c *Controller) InsertReloc(siteAddr, targetAddr uint32) error {
@@ -2323,53 +2318,6 @@ func (c *Controller) GetSpaceCellSpans() ([]CellSpan, error) {
 		out = append(out, CellSpan{Addr: addr, Size: size, Mnemonic: m})
 	}
 	return out, rows.Err()
-}
-
-// SetFunctionABI sets (or clears when abi == "") the ABI signature on a function entry,
-// creating the functions row if it does not yet exist.
-func (c *Controller) SetFunctionABI(entryAddr uint32, name, abi string) error {
-	seg := c.SegOf(entryAddr)
-	_, err := c.conn.Exec(
-		`INSERT INTO functions (seg, entry_addr, name, confidence, abi)
-		 VALUES (?1, ?2, ?3, 0, ?4)
-		 ON CONFLICT(seg, entry_addr) DO UPDATE SET abi = excluded.abi`,
-		seg, entryAddr, name, abi,
-	)
-	return err
-}
-
-// GetFunctionABI returns the manual ABI string recorded for entryAddr in the active space.
-func (c *Controller) GetFunctionABI(entryAddr uint32) string {
-	seg := c.SegOf(entryAddr)
-	var abi sql.NullString
-	_ = c.conn.QueryRow(
-		"SELECT abi FROM functions WHERE seg = ?1 AND entry_addr = ?2",
-		seg, entryAddr,
-	).Scan(&abi)
-	return abi.String
-}
-
-// GetAllFunctionABIs returns a map of entry_addr -> non-empty manual ABI strings across the active space.
-func (c *Controller) GetAllFunctionABIs() map[uint32]string {
-	out := make(map[uint32]string)
-	inClause := c.spaceSegInClause(false)
-	query := fmt.Sprintf(
-		"SELECT entry_addr, abi FROM functions WHERE seg IN (%s) AND abi != ''",
-		inClause,
-	)
-	rows, err := c.conn.Query(query)
-	if err != nil {
-		return out
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var addr uint32
-		var abi sql.NullString
-		if rows.Scan(&addr, &abi) == nil && abi.String != "" {
-			out[addr] = abi.String
-		}
-	}
-	return out
 }
 
 // GetXrefsToRange returns all cross-references targeting [startAddr, endAddr] in the active space.

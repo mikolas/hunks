@@ -1244,37 +1244,6 @@ func TestAbsShortXrefsAndRangeRollup(t *testing.T) {
 	}
 }
 
-func TestStaticMemorySlotTrampolineResolution(t *testing.T) {
-	const base uint32 = 0x10000
-	// 0x10000: move.w #$4EF9,$1032.w        31 FC 4E F9 10 32
-	// 0x10006: move.l #$00010014,$1034.w    21 FC 00 01 00 14 10 34
-	// 0x1000E: jsr    $1032.w               4E B8 10 32
-	// 0x10012: rts                          4E 75
-	// 0x10014: moveq  #$2A,d0               70 2A
-	// 0x10016: rts                          4E 75
-	code := []byte{
-		0x31, 0xFC, 0x4E, 0xF9, 0x10, 0x32,
-		0x21, 0xFC, 0x00, 0x01, 0x00, 0x14, 0x10, 0x34,
-		0x4E, 0xB8, 0x10, 0x32,
-		0x4E, 0x75,
-		0x70, 0x2A,
-		0x4E, 0x75,
-	}
-	a, ctrl := newTestTraceAnalyzer(t, code, base)
-	a.Analyze([]uint32{base})
-
-	cTarget, err := ctrl.GetCell(0x10014)
-	if err != nil || cTarget == nil || cTarget.Type != db.CellCode {
-		t.Fatalf("expected target 0x10014 to be discovered as CODE via static trampoline slot, got %+v", cTarget)
-	}
-	if tgt, ok := ctrl.FirstControlEdgeTarget(0x1000E); !ok || tgt != 0x10014 {
-		t.Fatalf("expected jsr $1032.w at 0x1000E to have EdgeCall to 0x10014, got (%#x, %v)", tgt, ok)
-	}
-	if autoCmt := ctrl.GetAddressComment(0x1000E).AutoComment; !strings.Contains(autoCmt, "-> LAB_0_00014 (via $1032)") {
-		t.Fatalf("expected auto-comment at 0x1000E to contain '-> LAB_0_00014 (via $1032)', got %q", autoCmt)
-	}
-}
-
 func TestTraceLowRAMTrampolineBouncing(t *testing.T) {
 	const base uint32 = 0x10000
 	code := []byte{
@@ -1295,25 +1264,6 @@ func TestTraceLowRAMTrampolineBouncing(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected RunTrace to bounce through low-RAM trampoline $1032.w and resolve 0x10014, got %+v", res.Sites)
-	}
-}
-
-func TestSMCAutoCommentAnnotation(t *testing.T) {
-	const base uint32 = 0x10000
-	// 0x10000: move.w #$1234,$0001000A.l    33 FC 12 34 00 01 00 0A (patches immediate word inside 0x10008!)
-	// 0x10008: move.w #$0000,d0             30 3C 00 00
-	// 0x1000C: rts                          4E 75
-	code := []byte{
-		0x33, 0xFC, 0x12, 0x34, 0x00, 0x01, 0x00, 0x0A,
-		0x30, 0x3C, 0x00, 0x00,
-		0x4E, 0x75,
-	}
-	a, ctrl := newTestTraceAnalyzer(t, code, base)
-	a.Analyze([]uint32{base})
-
-	autoCmt := ctrl.GetAddressComment(0x10000).AutoComment
-	if !strings.Contains(autoCmt, "[SMC] writes code at") {
-		t.Fatalf("expected SMC auto-comment at 0x10000, got %q", autoCmt)
 	}
 }
 

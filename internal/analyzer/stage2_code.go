@@ -381,26 +381,14 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 	// 6. Verify no CODE cell swallows an interior label in `labels`
 	allLabelAddrs := a.DB.LabelAddrs(nil)
 	var invalidCodeAddrs []uint32
-	var bogusInteriorLabels []uint32
 	codeCells.Ascend(func(cell db.Cell) bool {
 		cEnd := cell.Addr + cell.Size
 		idx, _ := slices.BinarySearch(allLabelAddrs, cell.Addr+1)
 		if idx < len(allLabelAddrs) && allLabelAddrs[idx] < cEnd {
-			lblAddr := allLabelAddrs[idx]
-			if _, isReloc := a.RelocTargets[lblAddr]; !isReloc && cell.Confidence <= ConfHigh {
-				if lblObj, err := a.DB.GetLabelFull(lblAddr); err == nil && lblObj != nil && lblObj.IsAuto {
-					bogusInteriorLabels = append(bogusInteriorLabels, lblAddr)
-					return true
-				}
-			}
 			invalidCodeAddrs = append(invalidCodeAddrs, cell.Addr)
 		}
 		return true
 	})
-	for _, lAddr := range bogusInteriorLabels {
-		_ = a.DB.DeleteLabelAt(lAddr)
-		delete(a.LabelsCache, lAddr)
-	}
 	for _, cAddr := range invalidCodeAddrs {
 		codeCells.Delete(db.Cell{Addr: cAddr})
 	}

@@ -299,7 +299,7 @@ func TestCallGraphStaticRegsABIAndDualOffsets(t *testing.T) {
 
 	_ = ctrl.SetLabel(0x1000, "CalcStep", db.LabelLab, false)
 	_ = ctrl.InsertFunction(0x1000, "CalcStep", 0)
-	_ = ctrl.SetFunctionABI(0x1000, "CalcStep", "(a0=obj, a1=unused) -> d0 | clobbers: d0, d4")
+	proj.SetFunctionABI("CalcStep", "(a0=obj, a1=unused) -> d0 | clobbers: d0, d4")
 
 	insns := []struct {
 		addr uint32

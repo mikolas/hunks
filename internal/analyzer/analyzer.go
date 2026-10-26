@@ -478,10 +478,7 @@ func (a *Analyzer) runPipeline(entries []uint32) {
 	}
 
 	a.stage2DiscoverCode(entries, jumpTable)
-	if newSeeds := a.propagateBaseRegs(jumpTable); len(newSeeds) > 0 {
-		a.stage2DiscoverCode(newSeeds, jumpTable)
-		_ = a.propagateBaseRegs(jumpTable)
-	}
+	a.propagateBaseRegs(jumpTable)
 	a.stage3ClassifyData()
 	a.Stage3FormatOperands()
 	a.stage4FunctionMeta()

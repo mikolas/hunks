@@ -14,7 +14,6 @@ import (
 	"strings"
 
 	"github.com/mikolas/hunks/internal/amiga"
-	"github.com/mikolas/hunks/internal/analyzer"
 	"github.com/mikolas/hunks/internal/callgraph"
 	"github.com/mikolas/hunks/internal/db"
 	"github.com/mikolas/hunks/internal/project"
@@ -202,9 +201,6 @@ func registerAgentCommands(
 			if structSize > 0 {
 				sdef["_size"] = strconv.Itoa(structSize)
 			}
-			if err := reformatAllSegmentsForStructs(proj); err != nil {
-				return err
-			}
 			if err := proj.Save(); err != nil {
 				return err
 			}
@@ -242,9 +238,6 @@ func registerAgentCommands(
 				if v == name {
 					delete(proj.Data.RegisterAliases, k)
 				}
-			}
-			if err := reformatAllSegmentsForStructs(proj); err != nil {
-				return err
 			}
 			if err := proj.Save(); err != nil {
 				return err
@@ -289,9 +282,6 @@ func registerAgentCommands(
 				proj.Data.RegisterAliases = make(map[string]string)
 			}
 			proj.Data.RegisterAliases[key] = structName
-			if err := reformatAllSegmentsForStructs(proj); err != nil {
-				return err
-			}
 			if err := proj.Save(); err != nil {
 				return err
 			}
@@ -332,9 +322,6 @@ func registerAgentCommands(
 				return err
 			}
 			delete(proj.Data.RegisterAliases, key)
-			if err := reformatAllSegmentsForStructs(proj); err != nil {
-				return err
-			}
 			if err := proj.Save(); err != nil {
 				return err
 			}
@@ -409,29 +396,6 @@ func parseSignedOffset(s string) (int64, error) {
 		val = -val
 	}
 	return val, nil
-}
-
-func reformatAllSegmentsForStructs(proj *project.Project) error {
-	seenDBs := make(map[string]bool)
-	for _, seg := range proj.Data.Segments {
-		if seenDBs[seg.DB] {
-			continue
-		}
-		seenDBs[seg.DB] = true
-		ctrl, err := db.New(seg.DB)
-		if err != nil {
-			return err
-		}
-		proj.SyncDBScope(ctrl)
-		an, err := analyzer.New(proj, ctrl)
-		if err != nil {
-			_ = ctrl.Close()
-			return err
-		}
-		an.Stage3FormatOperands()
-		_ = ctrl.Close()
-	}
-	return nil
 }
 
 // --- §1: hunks search ---
@@ -1643,9 +1607,7 @@ func runABICommand(
 			if f, ok := cg.Functions[fnAddr]; ok {
 				fnName = f.Name
 			}
-			if err := ctrl.SetFunctionABI(fnAddr, fnName, sig); err != nil {
-				return err
-			}
+			proj.SetFunctionABI(fnName, sig)
 			if f, ok := cg.Functions[fnAddr]; ok {
 				f.ABI = sig
 				for _, w := range callgraph.VerifyABI(sig, f.InRegs, f.ModRegs, f.SavedRegs) {
@@ -1655,6 +1617,9 @@ func runABICommand(
 			count++
 		}
 		if err := scanner.Err(); err != nil {
+			return err
+		}
+		if err := proj.Save(); err != nil {
 			return err
 		}
 		fmt.Printf("Updated %d function ABI signature(s)\n", count)
@@ -1668,7 +1633,8 @@ func runABICommand(
 		}
 		sig := strings.TrimSpace(args[1])
 		f := cg.Functions[fnAddr]
-		if err := ctrl.SetFunctionABI(fnAddr, f.Name, sig); err != nil {
+		proj.SetFunctionABI(f.Name, sig)
+		if err := proj.Save(); err != nil {
 			return err
 		}
 		f.ABI = sig
@@ -1907,6 +1873,7 @@ func runDumpCommand(proj *project.Project, section string, format string) (strin
 		"comments":         userComments,
 		"structs":          proj.Data.Structs,
 		"register_aliases": proj.Data.RegisterAliases,
+		"function_abis":    proj.Data.FunctionABIs,
 		"carves":           carves,
 	}
 	if section != "" {
@@ -1924,6 +1891,8 @@ func runDumpCommand(proj *project.Project, section string, format string) (strin
 			payload = map[string]any{"structs": proj.Data.Structs}
 		case "aliases", "register_aliases":
 			payload = map[string]any{"register_aliases": proj.Data.RegisterAliases}
+		case "abis", "function_abis":
+			payload = map[string]any{"function_abis": proj.Data.FunctionABIs}
 		case "carves":
 			payload = map[string]any{"carves": carves}
 		default:

@@ -1124,6 +1124,8 @@ func main() {
 								ctrl.SetActiveSeg(prevSeg)
 								return err
 							}
+							proj.ReKeyFunctionABI(effectiveOld, p.newName)
+							proj.ReKeyFunctionABI(cleanOld, p.newName)
 							if hasResolved {
 								affectedAddrs = append(affectedAddrs, resolvedAddr)
 							} else if targetAddr, ok := ctrl.LabelAddrByName(effectiveOld, false); ok {

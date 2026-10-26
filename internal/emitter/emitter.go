@@ -629,7 +629,6 @@ func (e *Emitter) PopulateCellsItems() error {
 	if err != nil {
 		return err
 	}
-	abisMap := e.DB.GetAllFunctionABIs()
 
 	xrefsMap, err := e.buildXrefsMap(e.BaseAddr, endAddr, sc, allCells, true)
 	if err != nil {
@@ -673,6 +672,12 @@ func (e *Emitter) PopulateCellsItems() error {
 		}
 		return ""
 	}
+
+	fnEntrySet := make(map[uint32]bool)
+	for _, fnAddr := range e.DB.FunctionEntries() {
+		fnEntrySet[fnAddr] = true
+	}
+	var curFuncLabel, curFuncAutoLabel string
 
 	for addr < endAddr {
 		nextCellAddr := endAddr
@@ -786,10 +791,16 @@ func (e *Emitter) PopulateCellsItems() error {
 				e.addItem("", "xdef", label, "")
 			}
 		}
+		if fnEntrySet[addr] || isEntry(addr) {
+			curFuncLabel = label
+			curFuncAutoLabel = e.Proj.AutoLabel(addr)
+		}
 
 		ac := commentsMap[addr]
-		if abi := abisMap[addr]; abi != "" {
-			e.addItem("", "", "", "; ABI: "+abi)
+		if label != "" {
+			if abi := e.Proj.GetFunctionABI(label, e.Proj.AutoLabel(addr)); abi != "" {
+				e.addItem("", "", "", "; ABI: "+abi)
+			}
 		}
 		if ac.BlockComment != "" {
 			for _, line := range strings.Split(ac.BlockComment, "\n") {
@@ -812,6 +823,9 @@ func (e *Emitter) PopulateCellsItems() error {
 		}
 		if cell.OpStr != nil {
 			opStr = *cell.OpStr
+			if cell.Type == db.CellCode {
+				opStr = e.Proj.ApplyStructAliasesToOpStr(opStr, curFuncLabel, curFuncAutoLabel)
+			}
 		}
 
 		if mnem == "" && (cell.Type.IsData() || cell.Type == db.CellPointer) {

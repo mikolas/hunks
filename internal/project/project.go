@@ -307,6 +307,7 @@ type ProjectData struct {
 	MemoryRegions   []MemoryRegion               `json:"memory_regions"`
 	Structs         map[string]map[string]string `json:"structs"`
 	RegisterAliases map[string]string            `json:"register_aliases"`
+	FunctionABIs    map[string]string            `json:"function_abis,omitempty"`
 	Analysis        AnalysisData                 `json:"_analysis"`
 }
 
@@ -328,6 +329,7 @@ func New(filepath string) *Project {
 			MemoryRegions:   []MemoryRegion{},
 			Structs:         make(map[string]map[string]string),
 			RegisterAliases: make(map[string]string),
+			FunctionABIs:    make(map[string]string),
 			Analysis: AnalysisData{
 				IndirectAddressing: []string{},
 			},
@@ -560,6 +562,135 @@ func StripFieldType(field string) (string, string) {
 		}
 	}
 	return trimmed, ""
+}
+
+// GetFunctionABI returns the user-defined ABI string associated with any of the candidate
+// function label names (e.g. renamed label, segment-qualified label, or auto-label).
+func (p *Project) GetFunctionABI(labels ...string) string {
+	if len(p.Data.FunctionABIs) == 0 {
+		return ""
+	}
+	for _, lbl := range labels {
+		if lbl == "" {
+			continue
+		}
+		if abi, ok := p.Data.FunctionABIs[lbl]; ok && abi != "" {
+			return abi
+		}
+		if _, short, hasColon := strings.Cut(lbl, ":"); hasColon {
+			if abi, ok := p.Data.FunctionABIs[short]; ok && abi != "" {
+				return abi
+			}
+		}
+	}
+	return ""
+}
+
+// SetFunctionABI sets (or clears when abi == "") the user-defined ABI string keyed by label name.
+func (p *Project) SetFunctionABI(label, abi string) {
+	lbl := strings.TrimSpace(label)
+	if lbl == "" {
+		return
+	}
+	if _, short, hasColon := strings.Cut(lbl, ":"); hasColon {
+		lbl = short
+	}
+	if abi == "" {
+		delete(p.Data.FunctionABIs, lbl)
+		return
+	}
+	if p.Data.FunctionABIs == nil {
+		p.Data.FunctionABIs = make(map[string]string)
+	}
+	p.Data.FunctionABIs[lbl] = abi
+}
+
+// ReKeyFunctionABI migrates any ABI and function-scoped register aliases from oldLabel to newLabel on rename.
+func (p *Project) ReKeyFunctionABI(oldLabel, newLabel string) {
+	oldClean := strings.TrimSpace(oldLabel)
+	newClean := strings.TrimSpace(newLabel)
+	if oldClean == "" || newClean == "" || oldClean == newClean {
+		return
+	}
+	if abi, ok := p.Data.FunctionABIs[oldClean]; ok {
+		delete(p.Data.FunctionABIs, oldClean)
+		p.Data.FunctionABIs[newClean] = abi
+	}
+	prefix := oldClean + ":"
+	for k, v := range p.Data.RegisterAliases {
+		if after, ok := strings.CutPrefix(k, prefix); ok {
+			delete(p.Data.RegisterAliases, k)
+			p.Data.RegisterAliases[newClean+":"+after] = v
+		}
+	}
+}
+
+// ApplyStructAliasesToOpStr substitutes `<disp>(aN...)` with `<field>(aN...)` for any
+// register alias matching `fnLabels` or global `aN` so `struct` and `alias` updates
+// take effect immediately in `cg`, `emit`, and `search` without re-running the analyzer.
+func (p *Project) ApplyStructAliasesToOpStr(opStr string, fnLabels ...string) string {
+	if len(p.Data.RegisterAliases) == 0 || len(p.Data.Structs) == 0 || !strings.Contains(opStr, "(a") {
+		return opStr
+	}
+	parts := strings.Split(opStr, ",")
+	changed := false
+	for i, part := range parts {
+		openIdx := strings.Index(part, "(a")
+		if openIdx <= 0 || openIdx+2 >= len(part) {
+			continue
+		}
+		regChar := part[openIdx+2]
+		if regChar < '0' || regChar > '6' {
+			continue
+		}
+		afterReg := part[openIdx+3:]
+		if !strings.HasPrefix(afterReg, ")") && !strings.HasPrefix(afterReg, ",") {
+			continue
+		}
+		dispStr := strings.TrimSpace(part[:openIdx])
+		dispVal, err := strconv.ParseInt(dispStr, 10, 32)
+		if err != nil {
+			continue
+		}
+		regName := "a" + string(regChar)
+		var structName string
+		for _, fl := range fnLabels {
+			if fl == "" {
+				continue
+			}
+			if s, ok := p.Data.RegisterAliases[fl+":"+regName]; ok && s != "" {
+				structName = s
+				break
+			}
+			if _, short, hasColon := strings.Cut(fl, ":"); hasColon {
+				if s, ok := p.Data.RegisterAliases[short+":"+regName]; ok && s != "" {
+					structName = s
+					break
+				}
+			}
+		}
+		if structName == "" {
+			structName = p.Data.RegisterAliases[regName]
+		}
+		if structName == "" {
+			continue
+		}
+		sdef, ok := p.Data.Structs[structName]
+		if !ok {
+			continue
+		}
+		rawField, ok := sdef[strconv.FormatInt(dispVal, 10)]
+		if !ok || rawField == "" {
+			continue
+		}
+		field, _ := StripFieldType(rawField)
+		parts[i] = field + part[openIdx:]
+		changed = true
+	}
+	if !changed {
+		return opStr
+	}
+	return strings.Join(parts, ",")
 }
 
 // ResolveTarget resolves a user/LLM target specifier into a synthetic project address.

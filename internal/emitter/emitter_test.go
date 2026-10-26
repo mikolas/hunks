@@ -576,9 +576,7 @@ func TestStructEquatesAndABIEmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	an.Analyze([]uint32{0x10000})
-	if err := ctrl.SetFunctionABI(0x10000, "LAB_10000", "(a0=Model*) -> d0=vx"); err != nil {
-		t.Fatal(err)
-	}
+	proj.SetFunctionABI("LAB_10000", "(a0=Model*) -> d0=vx")
 
 	em, err := New(proj, ctrl)
 	if err != nil {

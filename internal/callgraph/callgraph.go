@@ -259,7 +259,6 @@ func Build(proj *project.Project) (*CallGraph, error) {
 	xrefsBySrc := make(map[uint32][]AddrStringPair)
 	pointerTargets := make(map[uint32]bool)
 	jmpTableBases := make(map[string]uint32)
-	abis := make(map[uint32]string)
 
 	seenDBs := make(map[string]bool)
 	for _, seg := range proj.ActiveSegments() {
@@ -316,7 +315,6 @@ func Build(proj *project.Project) (*CallGraph, error) {
 			})
 		}
 		maps.Copy(jmpTableBases, ctrl.DetectJumpVectorBases())
-		maps.Copy(abis, ctrl.GetAllFunctionABIs())
 		_ = ctrl.Close()
 	}
 
@@ -672,7 +670,7 @@ func Build(proj *project.Project) (*CallGraph, error) {
 			HasLoop:        hasLoop,
 			HasIndirect:    len(indirectCalls) > 0,
 			HasSMC:         hasSMC,
-			ABI:            abis[entryAddr],
+			ABI:            proj.GetFunctionABI(name, rawName, proj.AutoLabel(entryAddr)),
 			InRegs:         regMaskNames(inMask),
 			ModRegs:        regMaskNames(modMask),
 			SavedRegs:      regMaskNames(savedMask),
@@ -1416,7 +1414,7 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 				if mnem == "" {
 					mnem = "?"
 				}
-				ops := cell.OpStrVal()
+				ops := proj.ApplyStructAliasesToOpStr(cell.OpStrVal(), f.Name, f.RawName)
 				var cmt string
 				if eff := cg.Comments[ia].EffectiveComment(); eff != "" {
 					cmt = fmt.Sprintf(" ; %s", eff)
@@ -1459,7 +1457,7 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 				if mnem == "" {
 					mnem = cell.Type.AsStr()
 				}
-				ops := cell.OpStrVal()
+				ops := proj.ApplyStructAliasesToOpStr(cell.OpStrVal(), f.Name, f.RawName)
 				var off uint32
 				if cell.Addr > segBase {
 					off = cell.Addr - segBase
