@@ -13,6 +13,12 @@ func (a *Analyzer) Stage3FormatOperands() {
 	a.RefreshCaches()
 	addrs := a.DB.CodeCellAddrs()
 
+	type hwAutoComment struct {
+		addr uint32
+		frag string
+	}
+	var hwComments []hwAutoComment
+
 	updates := make([]db.CellTextUpdate, 0, len(addrs))
 	for _, addr := range addrs {
 		raw := a.ReadBytes(addr, 10)
@@ -34,8 +40,47 @@ func (a *Analyzer) Stage3FormatOperands() {
 			Mnemonic: mnem,
 			OpStr:    opStr,
 		})
+		if bf := a.decodeDirectCustomWriteComment(addr, &insn); bf != "" {
+			hwComments = append(hwComments, hwAutoComment{addr: addr, frag: bf})
+		}
 	}
 	_ = a.DB.SetCellTexts(updates)
+	if len(hwComments) > 0 {
+		_ = a.DB.WithTransaction(func() error {
+			for _, hc := range hwComments {
+				if err := a.DB.AppendAutoComment(hc.addr, hc.frag); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+}
+
+func (a *Analyzer) decodeDirectCustomWriteComment(addr uint32, insn *m68k.Insn) string {
+	if insn.Op != m68k.OpMOVE || insn.NumOps != 2 || insn.Ops[0].Mode != m68k.EAImm {
+		return ""
+	}
+	dst := insn.Ops[1]
+	if dst.Mode != m68k.EAAbsShort && dst.Mode != m68k.EAAbsLong {
+		return ""
+	}
+	if dst.Mode == m68k.EAAbsLong && a.IsRelocatableAt(addr) {
+		if _, isReloc := a.Relocs[addr+uint32(dst.ExtOffset)]; isReloc {
+			return ""
+		}
+	}
+	if dst.UVal < amiga.CustomBase || dst.UVal > 0xDFF1FF {
+		return ""
+	}
+	hwOff := dst.UVal - amiga.CustomBase
+	switch insn.Suffix {
+	case m68k.SizeW:
+		return amiga.DecodeCustomRegWrite(hwOff, uint16(insn.Ops[0].UVal))
+	case m68k.SizeL:
+		return amiga.DecodeCustomRegLongWrite(hwOff, insn.Ops[0].UVal)
+	}
+	return ""
 }
 
 // GetLabelName returns the hardware register equate or cached DB label for addr, or "" if none.

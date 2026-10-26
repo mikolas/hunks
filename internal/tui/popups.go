@@ -217,7 +217,11 @@ func (a *App) OpenFunctions() {
 		if !ok || name == "" {
 			name = a.Proj.AutoLabel(addr)
 		}
-		funcs[i] = FuncItem{Addr: addr, Name: name}
+		var cycStr string
+		if sc, ok := a.SubCycles[addr]; ok {
+			cycStr = sc.FormatSummary()
+		}
+		funcs[i] = FuncItem{Addr: addr, Name: name, Cycles: cycStr}
 	}
 	a.Modal = Modal{
 		Kind:       ModalFunctions,

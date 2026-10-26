@@ -943,17 +943,21 @@ func renderModal(buf *screenBuffer, a *App, screen rect) {
 	case ModalFunctions:
 		filtered := filterFuncs(m.AllFuncs, m.Filter)
 		h := min(len(filtered)+3, 25)
-		area := centeredRect(60, max(h, 3), screen)
+		area := centeredRect(72, max(h, 3), screen)
 		title := " Functions (type to filter) "
 		if m.Filter != "" {
 			title = fmt.Sprintf(" Functions [%s] ", m.Filter)
 		}
 		rows := make([][]styledSpan, len(filtered))
 		for i, fn := range filtered {
-			rows[i] = []styledSpan{
+			spans := []styledSpan{
 				{text: formatModalAddr(fn.Addr, a.IsRelocatable, a.Proj) + " ", style: cellStyle{fg: fgBlue}},
-				{text: fn.Name, style: cellStyle{fg: fgGreen}},
+				{text: padOrTruncate(fn.Name, max(22, len(fn.Name)+2)), style: cellStyle{fg: fgGreen}},
 			}
+			if fn.Cycles != "" {
+				spans = append(spans, styledSpan{text: fn.Cycles, style: cellStyle{fg: fgYellow}})
+			}
+			rows[i] = spans
 		}
 		renderListModal(buf, area, title, fgGreen, rows, m.ListSelect)
 	case ModalContextMenu:

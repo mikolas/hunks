@@ -45,6 +45,7 @@ func TestCallGraphInferenceAndModes(t *testing.T) {
 			Confidence: 100,
 			Mnemonic:   strPtr("lea"),
 			OpStr:      strPtr("LAB_01040(pc),a0"),
+			RawBytes:   []byte{0x41, 0xFA, 0x00, 0x3E}, // lea $1040(pc),a0 -> 8 cyc
 		},
 		{
 			Addr:       0x1004,
@@ -53,6 +54,7 @@ func TestCallGraphInferenceAndModes(t *testing.T) {
 			Confidence: 100,
 			Mnemonic:   strPtr("bsr.w"),
 			OpStr:      strPtr("LAB_01020"),
+			RawBytes:   []byte{0x61, 0x00, 0x00, 0x1A}, // bsr.w $1020 -> 18 cyc
 		},
 		{
 			Addr:       0x1008,
@@ -61,6 +63,7 @@ func TestCallGraphInferenceAndModes(t *testing.T) {
 			Confidence: 100,
 			Mnemonic:   strPtr("rts"),
 			OpStr:      strPtr(""),
+			RawBytes:   []byte{0x4E, 0x75}, // rts -> 16 cyc
 		},
 		// Func B (leaf touching BLTSIZE)
 		{
@@ -70,6 +73,7 @@ func TestCallGraphInferenceAndModes(t *testing.T) {
 			Confidence: 100,
 			Mnemonic:   strPtr("move.w"),
 			OpStr:      strPtr("d0,BLTSIZE.l"),
+			RawBytes:   []byte{0x33, 0xC0, 0x00, 0xDF, 0xF0, 0x58}, // move.w d0,$DFF058.l -> 16 cyc
 		},
 		{
 			Addr:       0x1026,
@@ -78,6 +82,7 @@ func TestCallGraphInferenceAndModes(t *testing.T) {
 			Confidence: 100,
 			Mnemonic:   strPtr("rts"),
 			OpStr:      strPtr(""),
+			RawBytes:   []byte{0x4E, 0x75}, // rts -> 16 cyc
 		},
 		// Func C (suspect fallthrough into DATA_L)
 		{
@@ -87,6 +92,7 @@ func TestCallGraphInferenceAndModes(t *testing.T) {
 			Confidence: 100,
 			Mnemonic:   strPtr("moveq"),
 			OpStr:      strPtr("#5,d0"),
+			RawBytes:   []byte{0x70, 0x05}, // moveq #5,d0 -> 4 cyc
 		},
 		{
 			Addr:       0x1034,
@@ -177,6 +183,15 @@ func TestCallGraphInferenceAndModes(t *testing.T) {
 	}
 	if !slices.Contains(fb.HWRegs, "BLTSIZE") {
 		t.Fatalf("fb.HWRegs = %v, want to contain BLTSIZE", fb.HWRegs)
+	}
+	if fb.SelfMinCycles != 32 || fb.InclMinCycles != 32 {
+		t.Fatalf("fb cycles: self=%d incl=%d, want 32/32", fb.SelfMinCycles, fb.InclMinCycles)
+	}
+	if fa.SelfMinCycles != 42 || fa.InclMinCycles != 74 {
+		t.Fatalf("fa cycles: self=%d incl=%d, want 42/74", fa.SelfMinCycles, fa.InclMinCycles)
+	}
+	if got := fa.FormatCycles(); got != "42 cyc [incl: 74 cyc]" {
+		t.Fatalf("fa.FormatCycles() = %q, want %q", got, "42 cyc [incl: 74 cyc]")
 	}
 
 	fc := cg.Functions[0x1030]

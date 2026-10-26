@@ -1138,7 +1138,7 @@ func (c *Controller) FunctionLabelAddrs() []uint32 {
 		`SELECT DISTINCT addr FROM (
 			SELECT l.addr AS addr FROM labels l JOIN cells c ON c.seg = l.seg AND c.addr = l.addr
 			WHERE c.seg IN (%s) AND c.type = 'CODE' AND (
-			    l.kind = 'SUB'
+			    l.type = 'SUB'
 			    OR l.is_exported = 1
 			    OR EXISTS (SELECT 1 FROM edges e WHERE e.seg IN (%s) AND e.target_addr = l.addr AND e.type = 'CALL')
 			    OR (

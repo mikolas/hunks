@@ -34,6 +34,7 @@ type App struct {
 	DataByteOff      int
 	UndoStack        []UndoEntry
 	SelectionStart   *uint32
+	SubCycles        map[uint32]SubroutineCycles
 	Width            int
 	Height           int
 	LastWidth        int
@@ -190,6 +191,7 @@ func (a *App) LoadData() error {
 	a.DisasmRows = rows
 	a.CachedCodeBytes = codeBytes
 	a.LastWidth = effW
+	a.rebuildSubCycles()
 	return nil
 }
 
@@ -299,25 +301,21 @@ func branchTargetAddr(row *ListingRow, curAddr uint32) (uint32, bool) {
 	return 0, false
 }
 
-func (a *App) subroutineBoundsAtCursor() (uint32, uint32, bool) {
-	cur, ok := a.CursorAddr()
-	if !ok {
-		return 0, 0, false
-	}
+type subSpan struct {
+	startPos int
+	endPos   int
+}
 
+func (a *App) partitionCodeSubroutines() ([]int, []subSpan) {
 	var codeIdxs []int
-	curCodePos := -1
 	for i := range a.DisasmRows {
 		r := &a.DisasmRows[i]
 		if r.Kind == SubRowCode && r.Addr != nil {
-			if *r.Addr == cur && curCodePos < 0 {
-				curCodePos = len(codeIdxs)
-			}
 			codeIdxs = append(codeIdxs, i)
 		}
 	}
-	if len(codeIdxs) == 0 || curCodePos < 0 {
-		return 0, 0, false
+	if len(codeIdxs) == 0 {
+		return nil, nil
 	}
 
 	funcSet := make(map[uint32]struct{})
@@ -335,6 +333,7 @@ func (a *App) subroutineBoundsAtCursor() (uint32, uint32, bool) {
 	}
 	funcAddrs := slices.Sorted(maps.Keys(funcSet))
 
+	var spans []subSpan
 	subStartPos := 0
 	var maxBranchTarget uint32
 	for pos := 0; pos < len(codeIdxs); pos++ {
@@ -366,16 +365,178 @@ func (a *App) subroutineBoundsAtCursor() (uint32, uint32, bool) {
 		}
 
 		if isEnd {
-			if pos >= curCodePos {
-				startAddr := *a.DisasmRows[codeIdxs[subStartPos]].Addr
-				endAddr := *a.DisasmRows[codeIdxs[pos]].Addr
-				return startAddr, endAddr, true
-			}
+			spans = append(spans, subSpan{startPos: subStartPos, endPos: pos})
 			subStartPos = pos + 1
 			maxBranchTarget = 0
 		}
 	}
+	return codeIdxs, spans
+}
 
+func (a *App) rebuildSubCycles() {
+	codeIdxs, spans := a.partitionCodeSubroutines()
+	a.SubCycles = make(map[uint32]SubroutineCycles, len(spans))
+	if len(spans) == 0 {
+		return
+	}
+
+	calleesBySub := make(map[uint32][]uint32, len(spans))
+	subAddrs := make([]uint32, 0, len(spans))
+
+	for _, sp := range spans {
+		startAddr := *a.DisasmRows[codeIdxs[sp.startPos]].Addr
+		endAddr := *a.DisasmRows[codeIdxs[sp.endPos]].Addr
+		var selfMin, selfMax uint32
+		hasLoop := false
+		hasInd := false
+		var callees []uint32
+
+		for pos := sp.startPos; pos <= sp.endPos; pos++ {
+			row := &a.DisasmRows[codeIdxs[pos]]
+			rAddr := *row.Addr
+			t := row.Timing
+			switch t.Kind {
+			case m68k.TimingBranch, m68k.TimingRange:
+				selfMin += uint32(min(t.Primary.Cycles, t.Secondary.Cycles))
+				selfMax += uint32(max(t.Primary.Cycles, t.Secondary.Cycles))
+			default:
+				selfMin += uint32(t.Primary.Cycles)
+				selfMax += uint32(t.Primary.Cycles)
+			}
+			if brTgt, isBr := branchTargetAddr(row, rAddr); isBr && brTgt >= startAddr && brTgt <= rAddr {
+				hasLoop = true
+			}
+			op, _ := m68k.ParseMnemonic(row.Mnem)
+			if op == m68k.OpJSR || op == m68k.OpBSR || (op == m68k.OpJMP && pos == sp.endPos) {
+				if row.RefTarget != nil {
+					callees = append(callees, *row.RefTarget)
+				} else if strings.Contains(row.Operands, "(") {
+					hasInd = true
+				}
+			}
+		}
+
+		a.SubCycles[startAddr] = SubroutineCycles{
+			StartAddr:     startAddr,
+			EndAddr:       endAddr,
+			SelfMinCycles: selfMin,
+			SelfMaxCycles: selfMax,
+			InclMinCycles: selfMin,
+			InclMaxCycles: selfMax,
+			HasLoop:       hasLoop,
+			HasIndirect:   hasInd,
+		}
+		calleesBySub[startAddr] = callees
+		subAddrs = append(subAddrs, startAddr)
+	}
+
+	type inclRes struct {
+		minCyc  uint32
+		maxCyc  uint32
+		hasLoop bool
+		hasInd  bool
+	}
+	memo := make(map[uint32]inclRes, len(subAddrs))
+	visiting := make(map[uint32]bool)
+	var computeIncl func(addr uint32) inclRes
+	computeIncl = func(addr uint32) inclRes {
+		if r, ok := memo[addr]; ok {
+			return r
+		}
+		sc, ok := a.SubCycles[addr]
+		if !ok {
+			return inclRes{}
+		}
+		if visiting[addr] {
+			return inclRes{hasLoop: true}
+		}
+		visiting[addr] = true
+		res := inclRes{
+			minCyc:  sc.SelfMinCycles,
+			maxCyc:  sc.SelfMaxCycles,
+			hasLoop: sc.HasLoop,
+			hasInd:  sc.HasIndirect,
+		}
+		for _, tgt := range calleesBySub[addr] {
+			if tgt == addr || visiting[tgt] {
+				res.hasLoop = true
+				continue
+			}
+			if _, exists := a.SubCycles[tgt]; !exists {
+				continue
+			}
+			sub := computeIncl(tgt)
+			res.minCyc += sub.minCyc
+			res.maxCyc += sub.maxCyc
+			if sub.hasLoop {
+				res.hasLoop = true
+			}
+			if sub.hasInd {
+				res.hasInd = true
+			}
+		}
+		delete(visiting, addr)
+		memo[addr] = res
+		return res
+	}
+
+	for _, addr := range subAddrs {
+		res := computeIncl(addr)
+		sc := a.SubCycles[addr]
+		sc.InclMinCycles = res.minCyc
+		sc.InclMaxCycles = res.maxCyc
+		sc.HasLoop = res.hasLoop
+		sc.HasIndirect = res.hasInd
+		a.SubCycles[addr] = sc
+	}
+}
+
+// FormatSummary formats the subroutine's self and inclusive cycle summary for the Functions modal.
+func (sc SubroutineCycles) FormatSummary() string {
+	if sc.SelfMaxCycles == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString(formatRangeUint32(sc.SelfMinCycles, sc.SelfMaxCycles))
+	sb.WriteString(" cyc")
+	if sc.InclMaxCycles > sc.SelfMaxCycles || sc.InclMinCycles > sc.SelfMinCycles {
+		sb.WriteString(" [incl: ")
+		sb.WriteString(formatRangeUint32(sc.InclMinCycles, sc.InclMaxCycles))
+		sb.WriteString(" cyc]")
+	}
+	if sc.HasLoop {
+		sb.WriteString(" +loop")
+	}
+	if sc.HasIndirect {
+		sb.WriteString(" +ind")
+	}
+	return sb.String()
+}
+
+func (a *App) subroutineBoundsAtCursor() (uint32, uint32, bool) {
+	cur, ok := a.CursorAddr()
+	if !ok {
+		return 0, 0, false
+	}
+	codeIdxs, spans := a.partitionCodeSubroutines()
+	if len(codeIdxs) == 0 || len(spans) == 0 {
+		return 0, 0, false
+	}
+	curCodePos := -1
+	for pos, idx := range codeIdxs {
+		if *a.DisasmRows[idx].Addr == cur {
+			curCodePos = pos
+			break
+		}
+	}
+	if curCodePos < 0 {
+		return 0, 0, false
+	}
+	for _, sp := range spans {
+		if sp.endPos >= curCodePos {
+			return *a.DisasmRows[codeIdxs[sp.startPos]].Addr, *a.DisasmRows[codeIdxs[sp.endPos]].Addr, true
+		}
+	}
 	return 0, 0, false
 }
 
@@ -402,6 +563,8 @@ func (a *App) selectionBlockStats(start, end uint32) (size uint32, insns int, ti
 	var minCyc, maxCyc uint32
 	var minR, maxR uint32
 	var minW, maxW uint32
+	var calleeMinCyc, calleeMaxCyc uint32
+	hasLoop := false
 
 	for i := range a.DisasmRows {
 		row := &a.DisasmRows[i]
@@ -434,10 +597,32 @@ func (a *App) selectionBlockStats(start, end uint32) (size uint32, insns int, ti
 			minW += uint32(t.Primary.Writes)
 			maxW += uint32(t.Primary.Writes)
 		}
+		if brTgt, isBr := branchTargetAddr(row, rStart); isBr && brTgt >= start && brTgt <= rStart {
+			hasLoop = true
+		}
+		op, _ := m68k.ParseMnemonic(row.Mnem)
+		if (op == m68k.OpJSR || op == m68k.OpBSR) && row.RefTarget != nil {
+			tgt := *row.RefTarget
+			if tgt < start || tgt > end {
+				if callee, ok := a.SubCycles[tgt]; ok {
+					calleeMinCyc += callee.InclMinCycles
+					calleeMaxCyc += callee.InclMaxCycles
+					if callee.HasLoop {
+						hasLoop = true
+					}
+				}
+			}
+		}
 	}
 	size = maxEndByte - start + 1
 	if insns > 0 {
 		timingStr = formatBlockTiming(minCyc, maxCyc, minR, maxR, minW, maxW)
+		if calleeMaxCyc > 0 {
+			timingStr += fmt.Sprintf(" [incl: %s cyc]", formatRangeUint32(minCyc+calleeMinCyc, maxCyc+calleeMaxCyc))
+		}
+		if hasLoop {
+			timingStr += " +loop"
+		}
 	}
 	return size, insns, timingStr
 }
@@ -519,6 +704,7 @@ func (a *App) GetStatusLine() string {
 	var rowSize uint32
 	var byteSuffix string
 	var timing m68k.Timing
+	var calleeSuffix string
 	if a.SelectedIdx >= 0 && a.SelectedIdx < len(a.DisasmRows) {
 		r := &a.DisasmRows[a.SelectedIdx]
 		if r.CellType != "" {
@@ -528,6 +714,17 @@ func (a *App) GetStatusLine() string {
 		timing = r.Timing
 		if r.Kind == SubRowData && r.Size > 1 {
 			byteSuffix = fmt.Sprintf(" +%d", a.DataByteOff)
+		}
+		if r.Kind == SubRowCode && r.RefTarget != nil {
+			if op, _ := m68k.ParseMnemonic(r.Mnem); op == m68k.OpJSR || op == m68k.OpBSR {
+				if callee, ok := a.SubCycles[*r.RefTarget]; ok && callee.InclMaxCycles > 0 {
+					cStr := formatRangeUint32(callee.InclMinCycles, callee.InclMaxCycles) + " cyc"
+					if callee.HasLoop {
+						cStr += " +loop"
+					}
+					calleeSuffix = fmt.Sprintf(" [→%s]", cStr)
+				}
+			}
 		}
 	}
 	if timing.Primary.Cycles == 0 {
@@ -558,12 +755,13 @@ func (a *App) GetStatusLine() string {
 		sizePart = cellInfo
 	}
 
+	timingDisp := timing.String() + calleeSuffix
 	return fmt.Sprintf(" %s (off +%05X) │ %s │ %s │ %s │ Code %5.1f%% │ ←/→:byte ;:cmt ?:help",
 		a.FormatAddr(addr),
 		off,
 		padOrTruncate(displayLabel, 16),
 		padOrTruncate(sizePart, 16),
-		padOrTruncate(timing.String(), 19),
+		padOrTruncate(timingDisp, max(19, len(timingDisp))),
 		pct)
 }
 

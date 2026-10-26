@@ -1175,3 +1175,36 @@ func TestValidateCandidateLivenessSuspect(t *testing.T) {
 		t.Fatalf("postinc-store-before-def: expected ok=true, suspect=true; got ok=%v suspect=%v", ok4, suspect4)
 	}
 }
+
+func TestCustomRegBitfieldAutoComments(t *testing.T) {
+	const base uint32 = 0x10000
+	// 0x10000: move.w #$83C0,$DFF096.l     33 FC 83 C0 00 DF F0 96  (8B) -> direct DMACON word write
+	// 0x10008: move.l #$09F00002,$DFF040.l 23 FC 09 F0 00 02 00 DF F0 40 (10B) -> direct BLTCON0+BLTCON1 long write
+	// 0x10012: lea.l  $DFF000.l,a5         4B F9 00 DF F0 00        (6B)
+	// 0x10018: move.w #$4200,$100(a5)      3B 7C 42 00 01 00        (6B) -> base-reg BPLCON0 word write
+	// 0x1001E: rts                         4E 75                    (2B)
+	code := []byte{
+		0x33, 0xFC, 0x83, 0xC0, 0x00, 0xDF, 0xF0, 0x96,
+		0x23, 0xFC, 0x09, 0xF0, 0x00, 0x02, 0x00, 0xDF, 0xF0, 0x40,
+		0x4B, 0xF9, 0x00, 0xDF, 0xF0, 0x00,
+		0x3B, 0x7C, 0x42, 0x00, 0x01, 0x00,
+		0x4E, 0x75,
+	}
+	a, ctrl := newTestTraceAnalyzer(t, code, base)
+	a.Analyze([]uint32{base})
+
+	cDmacon := ctrl.GetAddressComment(0x10000).AutoComment
+	if !strings.Contains(cDmacon, "SET|DMAEN|BPLEN|COPEN|BLTEN") {
+		t.Fatalf("expected DMACON bitfield auto-comment at 0x10000, got %q", cDmacon)
+	}
+
+	cBltcon := ctrl.GetAddressComment(0x10008).AutoComment
+	if !strings.Contains(cBltcon, "BLTCON0: USEA|USED|LF=$F0 (D=A) | BLTCON1: DESC") {
+		t.Fatalf("expected paired BLTCON0+BLTCON1 bitfield auto-comment at 0x10008, got %q", cBltcon)
+	}
+
+	cBplcon := ctrl.GetAddressComment(0x10018).AutoComment
+	if !strings.Contains(cBplcon, "4BPU (16c)|COLOR") {
+		t.Fatalf("expected BPLCON0 bitfield auto-comment at 0x10018, got %q", cBplcon)
+	}
+}
