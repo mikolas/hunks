@@ -381,6 +381,12 @@ func RunTrace(image []byte, base, entry uint32, opts TraceOptions) TraceReport {
 	var lastBranchDAR [16]uint32
 	var frozenReps uint64
 
+	var outsideSteps int
+	var hasTrampOrigin bool
+	var trampOriginPC uint32
+	var trampFirstOutPC uint32
+	var trampOriginDisp Dispatch
+
 	var stop StopReason
 	for {
 		if steps >= opts.Budget {
@@ -389,19 +395,32 @@ func RunTrace(image []byte, base, entry uint32, opts TraceOptions) TraceReport {
 		}
 		curRegs := cpu.Registers()
 		pc := curRegs.PC & 0x00FFFFFF
-		if uint64(pc) < uint64(base) || uint64(pc) >= imgEnd {
-			stop = StopReason{Kind: StopLeftImage, To: pc, AtPC: pc, Step: steps}
-			break
+		inImage := uint64(pc) >= uint64(base) && uint64(pc) < imgEnd
+		if !inImage {
+			if outsideSteps == 0 {
+				trampFirstOutPC = pc
+			}
+			outsideSteps++
+			if outsideSteps > 8 || pc%2 != 0 || uint64(pc) >= uint64(traceRAMLen) || dev.readWord(pc) == 0 {
+				stop = StopReason{Kind: StopLeftImage, To: trampFirstOutPC, AtPC: trampFirstOutPC, Step: steps}
+				break
+			}
+		} else {
+			outsideSteps = 0
+			pcLo = min(pcLo, pc)
+			pcHi = max(pcHi, pc)
 		}
-		pcLo = min(pcLo, pc)
-		pcHi = max(pcHi, pc)
 
 		op := dev.readWord(pc)
-		dispatch, hasDispatch := indirectDispatch(op)
+		var dispatch Dispatch
+		var hasDispatch bool
 		var darPre [16]uint32
-		copy(darPre[0:8], curRegs.D[:])
-		copy(darPre[8:16], curRegs.A[:])
-		regs[pc] = darPre
+		if inImage {
+			dispatch, hasDispatch = indirectDispatch(op)
+			copy(darPre[0:8], curRegs.D[:])
+			copy(darPre[8:16], curRegs.A[:])
+			regs[pc] = darPre
+		}
 
 		// Check self-installed vs unhandled TRAP / A-line / F-line before stepping.
 		if (op & 0xF000) == 0xA000 {
@@ -467,13 +486,47 @@ func RunTrace(image []byte, base, entry uint32, opts TraceOptions) TraceReport {
 			}
 		}
 
-		if hasDispatch {
-			sa, ok := sitesMap[pc]
-			if !ok {
-				sa = &siteAccum{disp: dispatch, targets: make(map[uint32]uint64)}
-				sitesMap[pc] = sa
+		newInImage := uint64(newPC) >= uint64(base) && uint64(newPC) < imgEnd
+		if inImage {
+			if newInImage {
+				hasTrampOrigin = false
+				if hasDispatch {
+					sa, ok := sitesMap[pc]
+					if !ok {
+						sa = &siteAccum{disp: dispatch, targets: make(map[uint32]uint64)}
+						sitesMap[pc] = sa
+					}
+					sa.targets[newPC]++
+				}
+			} else {
+				trampOriginPC = pc
+				trampFirstOutPC = newPC
+				if hasDispatch {
+					hasTrampOrigin = true
+					trampOriginDisp = dispatch
+				} else if (op&0xFFC0) == 0x4E80 || (op&0xFFC0) == 0x4EC0 || (op&0xFF00) == 0x6000 || (op&0xFF00) == 0x6100 {
+					hasTrampOrigin = true
+					isCall := (op&0xFFC0) == 0x4E80 || (op&0xFF00) == 0x6100
+					mode := m68k.EAAbsShort
+					if (op & 0x003F) == 0x0039 {
+						mode = m68k.EAAbsLong
+					}
+					trampOriginDisp = Dispatch{Mode: mode, IsCall: isCall, BaseAn: -1}
+				} else {
+					hasTrampOrigin = false
+				}
 			}
-			sa.targets[newPC]++
+		} else if newInImage && hasTrampOrigin {
+			// Bounced back into image from an out-of-image trampoline!
+			if op != 0x4E75 && op != 0x4E73 && op != 0x4E77 {
+				sa, ok := sitesMap[trampOriginPC]
+				if !ok {
+					sa = &siteAccum{disp: trampOriginDisp, targets: make(map[uint32]uint64)}
+					sitesMap[trampOriginPC] = sa
+				}
+				sa.targets[newPC]++
+			}
+			hasTrampOrigin = false
 		}
 
 		if op == 0x4E72 {
@@ -562,7 +615,7 @@ func RunTrace(image []byte, base, entry uint32, opts TraceOptions) TraceReport {
 
 func isResolvableDispatchMode(mode m68k.EAMode) bool {
 	switch mode {
-	case m68k.EAAddrInd, m68k.EADisp16, m68k.EAIndex, m68k.EAPCIndex:
+	case m68k.EAAddrInd, m68k.EADisp16, m68k.EAIndex, m68k.EAPCIndex, m68k.EAAbsShort, m68k.EAAbsLong:
 		return true
 	default:
 		return false
@@ -609,6 +662,8 @@ func (a *Analyzer) ApplyTraceDispatches(sites []DispatchSite) {
 			if s.IsCall {
 				edge = db.EdgeCall
 				xref = db.XrefCodeCall
+				labelName := a.GetOrDefaultLabel(target)
+				_ = a.DB.InsertFunction(target, labelName, ConfHigh)
 			}
 			_ = a.DB.InsertEdge(s.Addr, target, edge)
 			_ = a.DB.InsertXref(s.Addr, target, xref)

@@ -526,3 +526,81 @@ func BenchmarkEmitPipeline(b *testing.B) {
 		_ = em.FormatLines()
 	}
 }
+
+func TestStructEquatesAndABIEmission(t *testing.T) {
+	tmpDir := t.TempDir()
+	// 0x10000: move.w 2(a0),d0  30 28 00 02
+	// 0x10004: rts              4E 75
+	codeBytes := []byte{0x30, 0x28, 0x00, 0x02, 0x4E, 0x75}
+	binPath := filepath.Join(tmpDir, "main.bin")
+	if err := os.WriteFile(binPath, codeBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(tmpDir, "main.db")
+	ctrl, err := db.New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrl.Close()
+
+	proj := project.New(filepath.Join(tmpDir, "project.json"))
+	proj.Data.Segments = append(proj.Data.Segments, project.Segment{
+		Name:        "main",
+		HunkIndex:   0,
+		HunkType:    hunk.HunkTypeCode,
+		MemoryType:  hunk.MemoryPublic,
+		AllocSize:   uint32(len(codeBytes)),
+		File:        &binPath,
+		Base:        0x10000,
+		DB:          dbPath,
+		Relocatable: false,
+	})
+	proj.Data.Spaces = append(proj.Data.Spaces, project.Space{
+		Name:     "default",
+		Segments: []string{"main"},
+	})
+	proj.Data.ActiveSpace = "default"
+	proj.Data.Structs = map[string]map[string]string{
+		"Model": {
+			"0":     "Model_Radius.w",
+			"2":     "Model_VX.w",
+			"_size": "18",
+		},
+	}
+	proj.Data.RegisterAliases = map[string]string{
+		"a0": "Model",
+	}
+
+	an, err := analyzer.New(proj, ctrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	an.Analyze([]uint32{0x10000})
+	if err := ctrl.SetFunctionABI(0x10000, "LAB_10000", "(a0=Model*) -> d0=vx"); err != nil {
+		t.Fatal(err)
+	}
+
+	em, err := New(proj, ctrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := em.GenerateItems(false); err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Join(em.FormatLines(), "\n")
+	if !strings.Contains(text, "Model_Radius\tequ\t$0") {
+		t.Fatalf("expected Model_Radius equ $0 in emitted asm:\n%s", text)
+	}
+	if !strings.Contains(text, "Model_VX\tequ\t$2") {
+		t.Fatalf("expected Model_VX equ $2 in emitted asm:\n%s", text)
+	}
+	if !strings.Contains(text, "Model_SIZEOF\tequ\t$12") {
+		t.Fatalf("expected Model_SIZEOF equ $12 in emitted asm:\n%s", text)
+	}
+	if !strings.Contains(text, "; ABI: (a0=Model*) -> d0=vx") {
+		t.Fatalf("expected ABI comment in emitted asm:\n%s", text)
+	}
+	if !strings.Contains(text, "move.w\tModel_VX(a0),d0") {
+		t.Fatalf("expected Model_VX(a0),d0 in emitted asm:\n%s", text)
+	}
+}

@@ -473,6 +473,7 @@ func (c *Controller) initSchema() error {
 		is_noreturn BOOLEAN DEFAULT 0,
 		stack_frame INTEGER,
 		confidence INTEGER NOT NULL DEFAULT 0,
+		abi TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY (seg, entry_addr)
 	);
 
@@ -509,8 +510,12 @@ func (c *Controller) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_edges_seg_target ON edges(seg, target_addr);
 	CREATE INDEX IF NOT EXISTS idx_xrefs_seg_target ON xrefs(seg, target_addr);
 	CREATE INDEX IF NOT EXISTS idx_cells_seg_type ON cells(seg, type);`
-	_, err := c.conn.Exec(schema)
-	return err
+	if _, err := c.conn.Exec(schema); err != nil {
+		return err
+	}
+	// Migrate pre-existing project.db files that were created before `functions.abi` existed.
+	_, _ = c.conn.Exec("ALTER TABLE functions ADD COLUMN abi TEXT NOT NULL DEFAULT ''")
+	return nil
 }
 
 func (c *Controller) InsertReloc(siteAddr, targetAddr uint32) error {
@@ -1035,7 +1040,10 @@ func (c *Controller) FirstXrefTargetIn(start, end uint32) (uint32, bool) {
 	seg := c.SegOf(start)
 	var target uint32
 	err := c.conn.QueryRow(
-		"SELECT target_addr FROM xrefs WHERE seg = ?1 AND source_addr >= ?2 AND source_addr < ?3 LIMIT 1",
+		`SELECT target_addr FROM xrefs
+		 WHERE seg = ?1 AND source_addr >= ?2 AND source_addr < ?3
+		 ORDER BY CASE type WHEN 'CODE_CALL' THEN 0 WHEN 'CODE_BRANCH' THEN 1 WHEN 'DATA_ADDR' THEN 2 ELSE 3 END, source_addr ASC
+		 LIMIT 1`,
 		seg, start, end,
 	).Scan(&target)
 	if err != nil {
@@ -2315,4 +2323,108 @@ func (c *Controller) GetSpaceCellSpans() ([]CellSpan, error) {
 		out = append(out, CellSpan{Addr: addr, Size: size, Mnemonic: m})
 	}
 	return out, rows.Err()
+}
+
+// SetFunctionABI sets (or clears when abi == "") the ABI signature on a function entry,
+// creating the functions row if it does not yet exist.
+func (c *Controller) SetFunctionABI(entryAddr uint32, name, abi string) error {
+	seg := c.SegOf(entryAddr)
+	_, err := c.conn.Exec(
+		`INSERT INTO functions (seg, entry_addr, name, confidence, abi)
+		 VALUES (?1, ?2, ?3, 0, ?4)
+		 ON CONFLICT(seg, entry_addr) DO UPDATE SET abi = excluded.abi`,
+		seg, entryAddr, name, abi,
+	)
+	return err
+}
+
+// GetFunctionABI returns the manual ABI string recorded for entryAddr in the active space.
+func (c *Controller) GetFunctionABI(entryAddr uint32) string {
+	seg := c.SegOf(entryAddr)
+	var abi sql.NullString
+	_ = c.conn.QueryRow(
+		"SELECT abi FROM functions WHERE seg = ?1 AND entry_addr = ?2",
+		seg, entryAddr,
+	).Scan(&abi)
+	return abi.String
+}
+
+// GetAllFunctionABIs returns a map of entry_addr -> non-empty manual ABI strings across the active space.
+func (c *Controller) GetAllFunctionABIs() map[uint32]string {
+	out := make(map[uint32]string)
+	inClause := c.spaceSegInClause(false)
+	query := fmt.Sprintf(
+		"SELECT entry_addr, abi FROM functions WHERE seg IN (%s) AND abi != ''",
+		inClause,
+	)
+	rows, err := c.conn.Query(query)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var addr uint32
+		var abi sql.NullString
+		if rows.Scan(&addr, &abi) == nil && abi.String != "" {
+			out[addr] = abi.String
+		}
+	}
+	return out
+}
+
+// GetXrefsToRange returns all cross-references targeting [startAddr, endAddr] in the active space.
+// When externalOnly is true, references whose source_addr lies inside [startAddr, endAddr] are excluded.
+func (c *Controller) GetXrefsToRange(startAddr, endAddr uint32, externalOnly bool) []Xref {
+	var out []Xref
+	inEmpty := c.spaceSegInClause(true)
+	extClause := ""
+	if externalOnly {
+		extClause = " AND (source_addr < ?1 OR source_addr > ?2)"
+	}
+	query := fmt.Sprintf(
+		"SELECT seg, source_addr, target_addr, type FROM xrefs WHERE seg IN (%s) AND target_addr >= ?1 AND target_addr <= ?2%s ORDER BY target_addr ASC, source_addr ASC",
+		inEmpty, extClause,
+	)
+	rows, err := c.conn.Query(query, startAddr, endAddr)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if x, err := scanXref(rows); err == nil {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// UserCommentRow holds a non-auto inline and/or block comment created by the user or agent.
+type UserCommentRow struct {
+	Seg          string
+	Addr         uint32
+	Comment      string
+	BlockComment string
+}
+
+// GetUserComments returns all rows in `comments` in the active space that have a non-empty
+// manual `comment` or `block_comment` (excluding auto_comment-only rows).
+func (c *Controller) GetUserComments() []UserCommentRow {
+	var out []UserCommentRow
+	inEmpty := c.spaceSegInClause(true)
+	query := fmt.Sprintf(
+		"SELECT seg, addr, comment, block_comment FROM comments WHERE seg IN (%s) AND (comment != '' OR block_comment != '') ORDER BY addr ASC",
+		inEmpty,
+	)
+	rows, err := c.conn.Query(query)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r UserCommentRow
+		if rows.Scan(&r.Seg, &r.Addr, &r.Comment, &r.BlockComment) == nil {
+			out = append(out, r)
+		}
+	}
+	return out
 }

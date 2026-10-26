@@ -64,7 +64,7 @@ func AbsLongExtAddr(addr uint32, insn *m68k.Insn, opIdx int) uint32 {
 }
 
 func (a *Analyzer) isValidTarget(addr uint32) bool {
-	if a.IsInAnyProjectSegment(addr) {
+	if a.IsInAnyProjectSegment(addr) || a.IsInMemoryRegion(addr) {
 		return true
 	}
 	_, ok := amiga.GetAmigaHWLabel(addr)
@@ -154,6 +154,18 @@ func (a *Analyzer) ClassifyReference(addr uint32, insn *m68k.Insn, op m68k.Opera
 		}
 		target := op.UVal
 		if !a.isValidTarget(target) {
+			// In flat-binary mode, still record data read/write/addr XREFs to unmapped
+			// 24-bit Amiga memory addresses (e.g. $10xx, $6xxx) so `hunks xref` can
+			// query them even before a MemoryRegion is declared.
+			if !isCall && !isBranch && target > 0 && (target&0xFF000000) == 0 {
+				if isAddrCalc {
+					return RefType{Kind: RefDataAddr, Target: target}, true
+				}
+				if isWrite {
+					return RefType{Kind: RefDataWrite, Target: target}, true
+				}
+				return RefType{Kind: RefDataRead, Target: target}, true
+			}
 			return RefType{}, false
 		}
 		if isCall {
@@ -171,7 +183,30 @@ func (a *Analyzer) ClassifyReference(addr uint32, insn *m68k.Insn, op m68k.Opera
 		return RefType{Kind: RefDataRead, Target: target}, true
 
 	case m68k.EAAbsShort:
-		return RefType{}, false
+		// `pea ($xxxx).w` is the standard 68000 compiler idiom for pushing a 16-bit
+		// integer constant onto the stack, not a memory reference.
+		if insn.Op == m68k.OpPEA {
+			return RefType{}, false
+		}
+		target := uint32(int32(int16(uint16(op.UVal)))) & 0x00FFFFFF
+		if isCall {
+			return RefType{Kind: RefCodeCall, Target: target}, true
+		}
+		if isBranch {
+			return RefType{Kind: RefCodeBranch, Target: target, IsConditional: false}, true
+		}
+		if isAddrCalc {
+			// `lea ($xxxx).w,An` with tiny values or negative constants (-1).w is often a constant load,
+			// but still useful to record in xrefs when non-negative or in a valid target range.
+			if int16(uint16(op.UVal)) < 0 && !a.isValidTarget(target) {
+				return RefType{}, false
+			}
+			return RefType{Kind: RefDataAddr, Target: target}, true
+		}
+		if isWrite {
+			return RefType{Kind: RefDataWrite, Target: target}, true
+		}
+		return RefType{Kind: RefDataRead, Target: target}, true
 
 	case m68k.EAAddrInd, m68k.EADisp16, m68k.EAIndex:
 		if isCall || isBranch {

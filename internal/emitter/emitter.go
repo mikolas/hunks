@@ -295,6 +295,71 @@ type equateKV struct {
 	addr uint32
 }
 
+type structEquateKV struct {
+	structName string
+	name       string
+	offset     int64
+}
+
+func formatSignedEquHex(v int64) string {
+	if v < 0 {
+		return fmt.Sprintf("-$%X", -v)
+	}
+	return fmt.Sprintf("$%X", v)
+}
+
+func sortedStructEquates(structs map[string]map[string]string) []structEquateKV {
+	if len(structs) == 0 {
+		return nil
+	}
+	var out []structEquateKV
+	seenNames := make(map[string]bool)
+	for _, sname := range slices.Sorted(maps.Keys(structs)) {
+		sdef := structs[sname]
+		var fields []structEquateKV
+		for k, rawField := range sdef {
+			if k == "_size" {
+				continue
+			}
+			off, err := strconv.ParseInt(k, 10, 64)
+			if err != nil {
+				continue
+			}
+			fname, _ := project.StripFieldType(rawField)
+			if fname == "" || seenNames[fname] {
+				continue
+			}
+			seenNames[fname] = true
+			fields = append(fields, structEquateKV{
+				structName: sname,
+				name:       fname,
+				offset:     off,
+			})
+		}
+		slices.SortFunc(fields, func(a, b structEquateKV) int {
+			if c := cmp.Compare(a.offset, b.offset); c != 0 {
+				return c
+			}
+			return cmp.Compare(a.name, b.name)
+		})
+		out = append(out, fields...)
+		if szStr, ok := sdef["_size"]; ok {
+			if sz, err := strconv.ParseInt(szStr, 10, 64); err == nil && sz > 0 {
+				szName := sname + "_SIZEOF"
+				if !seenNames[szName] {
+					seenNames[szName] = true
+					out = append(out, structEquateKV{
+						structName: sname,
+						name:       szName,
+						offset:     sz,
+					})
+				}
+			}
+		}
+	}
+	return out
+}
+
 func sortedEquates(equates map[string]uint32) []equateKV {
 	vec := make([]equateKV, 0, len(equates))
 	for name, addr := range equates {
@@ -321,6 +386,14 @@ func (e *Emitter) GenerateItems(relocatable bool) error {
 	amiga.CollectUsedHWEquates(e.DB, equates)
 	for _, eq := range sortedEquates(equates) {
 		e.addItem(eq.name, "equ", fmt.Sprintf("$%X", eq.addr), "")
+	}
+
+	if structEqs := sortedStructEquates(e.Proj.Data.Structs); len(structEqs) > 0 {
+		e.addItem("", "", "", "")
+		e.addItem("", "", "", "; --- Struct Field Equates ---")
+		for _, seq := range structEqs {
+			e.addItem(seq.name, "equ", formatSignedEquHex(seq.offset), "")
+		}
 	}
 
 	e.addItem("", "", "", "")
@@ -556,6 +629,7 @@ func (e *Emitter) PopulateCellsItems() error {
 	if err != nil {
 		return err
 	}
+	abisMap := e.DB.GetAllFunctionABIs()
 
 	xrefsMap, err := e.buildXrefsMap(e.BaseAddr, endAddr, sc, allCells, true)
 	if err != nil {
@@ -714,6 +788,9 @@ func (e *Emitter) PopulateCellsItems() error {
 		}
 
 		ac := commentsMap[addr]
+		if abi := abisMap[addr]; abi != "" {
+			e.addItem("", "", "", "; ABI: "+abi)
+		}
 		if ac.BlockComment != "" {
 			for _, line := range strings.Split(ac.BlockComment, "\n") {
 				line = strings.TrimSuffix(line, "\r")
@@ -1139,7 +1216,11 @@ func (e *Emitter) GenerateModularHunkItems() error {
 		secMem = ""
 	}
 	secDirective := fmt.Sprintf("%s,%s%s", secName, secType, secMem)
-	e.addItem("", "SECTION", secDirective, "")
+	if !seg.Relocatable && seg.Base != 0 {
+		e.addItem("", "org", fmt.Sprintf("$%X", seg.Base), "")
+	} else {
+		e.addItem("", "SECTION", secDirective, "")
+	}
 	e.addItem("", "", "", "")
 
 	segEnd := max(seg.EndAddr(), seg.Base+1)
@@ -1277,6 +1358,12 @@ func EmitAllAmiga(proj *project.Project, outDir string, force bool) error {
 	}
 	for _, eq := range sortedEquates(equates) {
 		equatesLines = append(equatesLines, fmt.Sprintf("%s\tequ\t$%X", eq.name, eq.addr))
+	}
+	if structEqs := sortedStructEquates(proj.Data.Structs); len(structEqs) > 0 {
+		equatesLines = append(equatesLines, "", "; --- Struct Field Equates ---")
+		for _, seq := range structEqs {
+			equatesLines = append(equatesLines, fmt.Sprintf("%s\tequ\t%s", seq.name, formatSignedEquHex(seq.offset)))
+		}
 	}
 	if err := os.WriteFile(filepath.Join(srcDir, "equates.i"), []byte(strings.Join(equatesLines, "\n")+"\n"), 0o644); err != nil {
 		return err

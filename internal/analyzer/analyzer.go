@@ -62,6 +62,7 @@ type Analyzer struct {
 	ExportedCache       map[uint32]struct{}
 	OperandFormatsCache map[uint32]string
 	CustomEA            map[CustomEAKey]string
+	funcEntries         []uint32
 	cellRanges          []db.AddrRange
 	cellRangesLoaded    bool
 	insnCache           map[uint32]m68k.Insn
@@ -209,6 +210,7 @@ func (a *Analyzer) RefreshCaches() {
 	} else {
 		a.OperandFormatsCache = make(map[uint32]string)
 	}
+	a.funcEntries = a.DB.FunctionEntries()
 	a.cellRanges = nil
 	a.cellRangesLoaded = false
 }
@@ -319,6 +321,15 @@ func (a *Analyzer) GetOrDefaultLabel(addr uint32) string {
 	return a.Proj.AutoLabel(addr)
 }
 
+func (a *Analyzer) IsInMemoryRegion(addr uint32) bool {
+	for _, r := range a.Proj.Data.MemoryRegions {
+		if addr >= r.Start && addr < r.End {
+			return true
+		}
+	}
+	return false
+}
+
 // AddLabel ensures a symbolic label exists at targetAddr if it falls within an active
 // segment or declared memory region (and is not a dedicated Amiga hardware register).
 // When srcAddr belongs to a different segment than targetAddr, the label is marked
@@ -327,13 +338,7 @@ func (a *Analyzer) AddLabel(srcAddr *uint32, targetAddr uint32) {
 	if _, ok := amiga.GetAmigaHWLabel(targetAddr); ok {
 		return
 	}
-	inMemRegion := false
-	for _, r := range a.Proj.Data.MemoryRegions {
-		if targetAddr >= r.Start && targetAddr < r.End {
-			inMemRegion = true
-			break
-		}
-	}
+	inMemRegion := a.IsInMemoryRegion(targetAddr)
 	if !a.IsInAnySegment(targetAddr) && !inMemRegion {
 		return
 	}
@@ -473,7 +478,10 @@ func (a *Analyzer) runPipeline(entries []uint32) {
 	}
 
 	a.stage2DiscoverCode(entries, jumpTable)
-	a.propagateBaseRegs(jumpTable)
+	if newSeeds := a.propagateBaseRegs(jumpTable); len(newSeeds) > 0 {
+		a.stage2DiscoverCode(newSeeds, jumpTable)
+		_ = a.propagateBaseRegs(jumpTable)
+	}
 	a.stage3ClassifyData()
 	a.Stage3FormatOperands()
 	a.stage4FunctionMeta()

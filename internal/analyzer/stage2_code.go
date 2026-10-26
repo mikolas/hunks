@@ -186,8 +186,12 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 					case RefCodeCall:
 						target := ref.Target
 						_ = a.DB.InsertXref(addr, target, db.XrefCodeCall)
-						_ = a.DB.InsertEdge(addr, target, db.EdgeCall)
-						a.AddLabel(&src, target)
+						if op.Mode != m68k.EAAbsShort || a.IsInAnyProjectSegment(target) {
+							_ = a.DB.InsertEdge(addr, target, db.EdgeCall)
+							a.AddLabel(&src, target)
+						} else if a.IsInMemoryRegion(target) {
+							a.AddLabel(&src, target)
+						}
 						if a.IsInCodeSegment(target) {
 							labelName := a.GetOrDefaultLabel(target)
 							_ = a.DB.InsertFunction(target, labelName, confidence)
@@ -199,13 +203,17 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 					case RefCodeBranch:
 						target := ref.Target
 						_ = a.DB.InsertXref(addr, target, db.XrefCodeBranch)
-						if ref.IsConditional {
-							_ = a.DB.InsertEdge(addr, target, db.EdgeCondTrue)
-							_ = a.DB.InsertEdge(addr, addr+size, db.EdgeCondFalse)
-						} else {
-							_ = a.DB.InsertEdge(addr, target, db.EdgeUncond)
+						if op.Mode != m68k.EAAbsShort || a.IsInAnyProjectSegment(target) {
+							if ref.IsConditional {
+								_ = a.DB.InsertEdge(addr, target, db.EdgeCondTrue)
+								_ = a.DB.InsertEdge(addr, addr+size, db.EdgeCondFalse)
+							} else {
+								_ = a.DB.InsertEdge(addr, target, db.EdgeUncond)
+							}
+							a.AddLabel(&src, target)
+						} else if a.IsInMemoryRegion(target) {
+							a.AddLabel(&src, target)
 						}
-						a.AddLabel(&src, target)
 						if a.IsInCodeSegment(target) {
 							if _, seen := visited[target]; !seen {
 								worklist = append(worklist, workItem{addr: target, confidence: confidence})
@@ -215,22 +223,32 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 					case RefDataAddr:
 						target := ref.Target
 						_ = a.DB.InsertXref(addr, target, db.XrefDataAddr)
-						a.AddLabel(&src, target)
-						if a.IsInCodeSegment(target) && target%2 == 0 {
-							candidateCode = append(candidateCode, target)
+						if (op.Mode != m68k.EAAbsShort && a.IsInAnyProjectSegment(target)) || a.IsInMemoryRegion(target) {
+							a.AddLabel(&src, target)
+							if op.Mode != m68k.EAAbsShort && a.IsInCodeSegment(target) && target%2 == 0 {
+								candidateCode = append(candidateCode, target)
+							}
 						}
 
 					case RefDataRead:
 						target := ref.Target
 						_ = a.DB.InsertXref(addr, target, db.XrefDataRead)
-						a.AddLabel(&src, target)
-						dataReadTargets[target] = struct{}{}
+						if (op.Mode != m68k.EAAbsShort && a.IsInAnyProjectSegment(target)) || a.IsInMemoryRegion(target) {
+							a.AddLabel(&src, target)
+							if op.Mode != m68k.EAAbsShort && a.IsInAnyProjectSegment(target) {
+								dataReadTargets[target] = struct{}{}
+							}
+						}
 
 					case RefDataWrite:
 						target := ref.Target
 						_ = a.DB.InsertXref(addr, target, db.XrefDataWrite)
-						a.AddLabel(&src, target)
-						dataReadTargets[target] = struct{}{}
+						if (op.Mode != m68k.EAAbsShort && a.IsInAnyProjectSegment(target)) || a.IsInMemoryRegion(target) {
+							a.AddLabel(&src, target)
+							if op.Mode != m68k.EAAbsShort && a.IsInAnyProjectSegment(target) {
+								dataReadTargets[target] = struct{}{}
+							}
+						}
 
 					case RefIndirect:
 						if _, proc := processedIndirect[addr]; !proc {
@@ -363,14 +381,26 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 	// 6. Verify no CODE cell swallows an interior label in `labels`
 	allLabelAddrs := a.DB.LabelAddrs(nil)
 	var invalidCodeAddrs []uint32
+	var bogusInteriorLabels []uint32
 	codeCells.Ascend(func(cell db.Cell) bool {
 		cEnd := cell.Addr + cell.Size
 		idx, _ := slices.BinarySearch(allLabelAddrs, cell.Addr+1)
 		if idx < len(allLabelAddrs) && allLabelAddrs[idx] < cEnd {
+			lblAddr := allLabelAddrs[idx]
+			if _, isReloc := a.RelocTargets[lblAddr]; !isReloc && cell.Confidence <= ConfHigh {
+				if lblObj, err := a.DB.GetLabelFull(lblAddr); err == nil && lblObj != nil && lblObj.IsAuto {
+					bogusInteriorLabels = append(bogusInteriorLabels, lblAddr)
+					return true
+				}
+			}
 			invalidCodeAddrs = append(invalidCodeAddrs, cell.Addr)
 		}
 		return true
 	})
+	for _, lAddr := range bogusInteriorLabels {
+		_ = a.DB.DeleteLabelAt(lAddr)
+		delete(a.LabelsCache, lAddr)
+	}
 	for _, cAddr := range invalidCodeAddrs {
 		codeCells.Delete(db.Cell{Addr: cAddr})
 	}

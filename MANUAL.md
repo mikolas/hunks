@@ -62,13 +62,20 @@ cmp -l assets/disk.1 build/disk_1.bin   # 0 differences
 | `-m <module> analyze [--all \| -s, --segment NAME]` | Run unified 3-stage analysis across all module segments (whole hunk set for relocatable executables; standalone per-segment for flat binaries), or analyze a single segment with `-s/--segment NAME` |
 | `-m <module> analyze --trace [--budget N]` | Trace-driven analysis: run the binary from its entry point in the built-in sandboxed M68000 interpreter (`m68kemu`) + minimal Amiga chipset, then resolve indirect dispatch (trampolines, `d16(An)`/indexed computed calls), self-installed interrupt/trap handlers, and hardware-register accesses **by observation** and seed them into recursive descent. Opt-in, for **flat self-booting binaries** (games/demos); default `analyze` is unchanged. `--budget` caps the instruction count (default 20,000,000). All facts are non-byte-affecting (labels/edges/comments) — parity is preserved. |
 | `-m <module> emit [--amiga] [--all] [--relocatable] [--force]` | Emit modular Amiga assembly (`--amiga`: `src/<module>/hunk*.asm` + `disasm/<module>.asm` + shared `src/equates.i`) or single-file assembly (`disasm/<module>.asm`). Refuses to overwrite existing files unless `--force` is passed. |
-| `-m <module> callgraph` / `cg [TARGET] [FLAGS]` | Inspect multi-hunk call graphs, bottom-up worklists, string/HW anchors, and function disassembly |
+| `-m <module> callgraph` / `cg [TARGET...] [FLAGS]` | Inspect multi-hunk call graphs, bottom-up worklists, string/HW anchors, indirect dispatch sites (`--indirect`), and function disassembly |
+| `-m <module> search QUERY [-s SEG] [-n LIMIT] [--dense] [-f text\|json]` | Search instructions, operands, strings, labels, comments, bytes, hardware/math clusters (`cluster:<name>`), or self-modifying code (`smc`) |
+| `-m <module> data` / `inspect TARGET [--len N] [--copper] [--struct NAME [--count N]] [-f text\|json]` | Inspect non-code data, pointer tables, strings, Amiga Copper lists (`--copper`), or structured record arrays (`--struct`) |
+| `-m <module> xref TARGET_OR_RANGE [-f text\|json]` | Query all incoming cross-references to an address/label (`xref $1178`) or external references into an address/offset range (`xref $1000..$1FFF`, `xref +3DDEE..+3EFFF`) |
 | `-m <module> hint code TARGET` | Mark target as code entry (`confidence = 100`) and run incremental analysis |
 | `-m <module> hint data TARGET [COUNT] [--string] [--comment TEXT]` | Mark byte/data range or null-terminated string (`--string`) at `confidence = 100` |
-| `-m <module> hint pointer TARGET [COUNT] [--follow] [--comment TEXT]` | Mark 32-bit pointer(s) (`confidence = 100`), optionally tracing pointed-to code (`--follow`) |
+| `-m <module> hint pointer TARGET [COUNT] [--follow] [--comment TEXT]` | Mark 32-bit pointer(s) (`confidence = 100`), create target labels + `DATA_ADDR` xrefs, and seed code targets when `--follow` is passed |
 | `-m <module> hint base-reg REG BASE_HEX [--segment NAME] [--function LABEL]` | Declare a base-register invariant (`REG` = `a4`/`a5`/`a6`, e.g. `hint base-reg a6 0xDFF000`) so `d16(An)` accesses resolve to hardware names / global `DATA`/`BSS` xrefs. Scope is global, or limited to one `--segment` or `--function`; re-runs analysis |
 | `-m <module> rename OLD_NAME NEW_NAME` | Rename a symbol (or multiple `OLD=NEW` pairs, or `--file <path>` batch file) across all segments in a single transaction |
-| `-m <module> comment TARGET [TEXT] [--block]` | Set or clear inline comment or function/block header comment (`--block` / `-b`) |
+| `-m <module> comment TARGET [TEXT] [--block] [--batch FILE]` | Set or clear inline comment or function/block header comment (`--block` / `-b`), with strict cell-boundary & function-bounds validation and batch file support (`--batch` / `--file`) |
+| `-m <module> abi [TARGET [SIGNATURE]] [--verify] [--batch FILE] [-f text\|json]` | Set, inspect, or statically verify (`--verify`) a function's register call signature (`(a0=Model*) -> d0 \| clobbers: d1/a1`) |
+| `-m <module> struct add NAME [--size BYTES] OFFSET=FIELD[.b\|.w\|.l\|.p]...` | Define or update a named struct and its field offsets (`struct list [-f text\|json]`, `struct remove NAME`); emitted as `<field> equ <offset>` and `<Struct>_SIZEOF equ <size>` |
+| `-m <module> alias [REG STRUCT [--fn FUNC]]` | Bind an address register (`a0`..`a6`) globally or per-function (`--fn <func>`) to a struct so `d16(An)` renders symbolically (`alias list [-f text\|json]`, `alias remove REG [--fn FUNC]`) |
+| `-m <module> dump [-f text\|json] [--section SEC]` | Export all durable reverse-engineering state (`entry_points`, `memory_regions`, `renames`, non-auto `comments`, `structs`, `register_aliases`, `carves`) |
 | `-m <module> operand TARGET FORMAT` | Set operand numeric format (`HEX`, `DEC`, `BIN`) and reformat the instruction |
 | `-m <module> segment add --file F --base HEX --name N` | Add a binary segment to the module |
 | `-m <module> segment split PARENT --at OFF (--len N \| --to OFF) --base HEX --name N` | Slice an extent out of a segment into a new static-base part (`<name>.bin` + shared DB), filed into the active space |
@@ -119,9 +126,50 @@ Every CLI command that takes a `TARGET` (`callgraph`, `hint`, `comment`, `operan
 | `--anchors` | List functions that reference ASCII `STRING` cells or Amiga hardware registers (`$DFFxxx` / CIA) |
 | `--ready` | List **bottom-up ready** unrenamed functions (`LAB_*`) whose outgoing callees are 100% renamed |
 | `--suspect` | List functions that fall through into `DATA_*` / `STRING` cells without a terminator (`rts`/`jmp`/`bra`) |
+| `--indirect` | List all indirect/trampoline dispatch sites (`jsr (An)`, `jmp d16(An)`, `jmp d8(PC,Xn)`) and their resolved or `[UNRESOLVED]` status |
 | `-u, --unrenamed` | Filter worklists to show only unrenamed (`LAB_*`) functions |
 | `-n, --limit <N>` | Maximum functions to display in worklist modes (`0` = unlimited, default: `50`) |
 | `-f, --format <FMT>` | Output format: `text` (default), `json`, `dot` (Graphviz), or `mermaid` |
+
+---
+
+## Atomic Analysis & Annotation Primitives (`search`, `data`, `xref`, `struct`, `alias`, `abi`, `dump`)
+
+### 1. Code, Pattern & Cluster Search (`hunks search`)
+```bash
+hunks -m <module> search m:muls.w                       # mnemonic prefix match
+hunks -m <module> search 'o:$1178'                      # operand substring match
+hunks -m <module> search cluster:3dmath --dense         # dense pockets (>=3 hits in 24B) of muls/mulu/divs/divu
+hunks -m <module> search cluster:blitter                # blitter, copper, paula, bitplane, sprite, cia, dma
+hunks -m <module> search smc                            # self-modifying code writes into CODE cells
+```
+
+### 2. Data, Copper & Struct Array Inspection (`hunks data` / `inspect`)
+```bash
+hunks -m <module> data +001A4 --len 64                  # formatted dc.b/dc.w/dc.l/pointer/string cells
+hunks -m <module> data CopperList_Main --copper         # decode Amiga Copper MOVE/WAIT/SKIP words
+hunks -m <module> data 0x6B6E --struct Model --count 8  # decode N records using a defined struct stride
+```
+
+### 3. Cross-Reference & Region Rollup (`hunks xref`)
+```bash
+hunks -m <module> xref 0x1178                           # all CALL/BRANCH/READ/WRITE/ADDR/PTR refs to $1178
+hunks -m <module> xref '$1000..$1FFF'                   # rollup of all external refs into low-RAM range
+hunks -m <module> xref '+3DDEE..+3EFFF'                 # rollup of all external entries into a segment range
+```
+
+### 4. Structs, Scoped Register Aliases & Call ABI (`struct`, `alias`, `abi`)
+```bash
+hunks -m <module> struct add Model --size 18 0=Model_Radius.w 2=Model_Verts.p
+hunks -m <module> alias a0 Model --fn Poly_RenderObject # scope a0 -> Model to a single function
+hunks -m <module> abi Poly_RenderObject "(a0=Model*, d0.w=id) -> d0.l | clobbers: d1-d7/a1-a3"
+hunks -m <module> abi --verify                          # check all ABI strings against static ReadRegs/WriteRegs
+```
+
+### 5. Structured State Export (`hunks dump`)
+```bash
+hunks -m <module> dump -f json > findings_state.json    # export entries, regions, renames, comments, structs, aliases, carves
+```
 
 ---
 

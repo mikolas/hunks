@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/mikolas/hunks/internal/amiga"
 	"github.com/mikolas/hunks/internal/db"
@@ -13,6 +14,7 @@ import (
 type regKnown struct {
 	known bool
 	val   uint32 // meaningful iff known
+	slot  uint32 // non-zero when loaded from a static memory pointer slot
 }
 
 type regFile struct {
@@ -231,14 +233,14 @@ func (a *Analyzer) resolveSlotOrRelocTarget(slotAddr uint32, jumpTable map[uint3
 // A register `aN` (`a0..a6`) is auto-promoted to a global base-register invariant iff
 // every constant load into `aN` across the binary agrees on the same target address and
 // `aN` has zero non-constant writes (`!sawDynamicWrite[n]`) anywhere in the program.
-func (a *Analyzer) propagateBaseRegs(jumpTable map[uint32]uint32) {
+func (a *Analyzer) propagateBaseRegs(jumpTable map[uint32]uint32) []uint32 {
 	_ = a.DB.ClearAutoBaseRegs()
 
 	globalBase, hinted := a.hintedBaseRegs()
 
 	slots := a.DB.SpaceCellSlots()
 	if len(slots) == 0 {
-		return
+		return nil
 	}
 	if a.insnCache != nil && len(a.insnCache) == 0 {
 		a.insnCache = make(map[uint32]m68k.Insn, len(slots))
@@ -247,6 +249,7 @@ func (a *Analyzer) propagateBaseRegs(jumpTable map[uint32]uint32) {
 	var firstLoad [8]uint32
 	var hasLoad [8]bool
 	var sawDynamicWrite [8]bool
+	memSlotTargets := make(map[uint32][]uint32)
 	for _, slot := range slots {
 		if !slot.IsCode {
 			continue
@@ -258,6 +261,27 @@ func (a *Analyzer) propagateBaseRegs(jumpTable map[uint32]uint32) {
 		insn, ok := a.decodeCached(slot.Addr, raw)
 		if !ok {
 			continue
+		}
+		if insn.Op == m68k.OpMOVE && insn.Suffix == m68k.SizeL && insn.NumOps == 2 && insn.Ops[0].Mode == m68k.EAImm {
+			dst := insn.Ops[1]
+			if dst.Mode == m68k.EAAbsShort || dst.Mode == m68k.EAAbsLong {
+				var immTgt uint32
+				hasImmTgt := false
+				if len(a.Relocs) > 0 {
+					if rTgt, ok := a.Relocs[slot.Addr+2]; ok {
+						immTgt = rTgt
+						hasImmTgt = true
+					}
+				} else {
+					immTgt = insn.Ops[0].UVal
+					hasImmTgt = true
+				}
+				if hasImmTgt && immTgt%2 == 0 && a.IsInCodeSegment(immTgt) {
+					if !slices.Contains(memSlotTargets[dst.UVal], immTgt) {
+						memSlotTargets[dst.UVal] = append(memSlotTargets[dst.UVal], immTgt)
+					}
+				}
+			}
 		}
 		constReg, val, isConst := a.decodeConstAregLoad(slot.Addr, &insn)
 		if isConst {
@@ -288,7 +312,7 @@ func (a *Analyzer) propagateBaseRegs(jumpTable map[uint32]uint32) {
 		_ = a.DB.SetBaseReg("global", "", m68k.RegAName(r), first, "auto")
 	}
 
-	a.resolveBaseRelativeAccesses(slots, globalBase, jumpTable)
+	return a.resolveBaseRelativeAccesses(slots, globalBase, jumpTable, memSlotTargets)
 }
 
 func (a *Analyzer) decodeConstAregLoad(addr uint32, insn *m68k.Insn) (uint8, uint32, bool) {
@@ -339,7 +363,7 @@ func (a *Analyzer) decodeConstAregLoad(addr uint32, insn *m68k.Insn) (uint8, uin
 //     would shift the assembled displacement by `rv.val - $DFF000` and break binary parity.
 //  3. Small-data globals (`base + disp` landing in a `DATA` or `BSS` segment): seeds
 //     a label at the target and records a `DATA_READ` or `DATA_WRITE` XREF.
-func (a *Analyzer) resolveBaseRelativeAccesses(slots []db.CellSlot, globalBase regFile, jumpTable map[uint32]uint32) {
+func (a *Analyzer) resolveBaseRelativeAccesses(slots []db.CellSlot, globalBase regFile, jumpTable map[uint32]uint32, memSlotTargets map[uint32][]uint32) []uint32 {
 	state := globalBase
 
 	type addrComment struct {
@@ -347,9 +371,10 @@ func (a *Analyzer) resolveBaseRelativeAccesses(slots []db.CellSlot, globalBase r
 		frag string
 	}
 	type globalRef struct {
-		site    uint32
-		target  uint32
-		isWrite bool
+		site     uint32
+		target   uint32
+		isWrite  bool
+		addLabel bool
 	}
 	type jtEdge struct {
 		site   uint32
@@ -365,6 +390,18 @@ func (a *Analyzer) resolveBaseRelativeAccesses(slots []db.CellSlot, globalBase r
 	var globals []globalRef
 	var jtEdges []jtEdge
 	var customEAs []customEAEntry
+	var newSeeds []uint32
+
+	lookupSlotTargets := func(slotAddr uint32) []uint32 {
+		if len(memSlotTargets) == 0 {
+			return nil
+		}
+		if tgts := memSlotTargets[slotAddr]; len(tgts) > 0 {
+			return tgts
+		}
+		// Check 6-byte JMP xxx.L trampoline where $4EF9 is at slotAddr and target is at slotAddr+2.
+		return memSlotTargets[slotAddr+2]
+	}
 
 	for _, slot := range slots {
 		if !slot.IsCode {
@@ -380,6 +417,24 @@ func (a *Analyzer) resolveBaseRelativeAccesses(slots []db.CellSlot, globalBase r
 			continue
 		}
 
+		// Direct call/jump through a non-code memory slot / RAM trampoline (e.g. jsr $1034.w).
+		if (insn.Op == m68k.OpJSR || insn.Op == m68k.OpJMP) && insn.NumOps >= 1 {
+			op0 := insn.Ops[0]
+			if op0.Mode == m68k.EAAbsShort || op0.Mode == m68k.EAAbsLong {
+				if tgts := lookupSlotTargets(op0.UVal); len(tgts) > 0 && !a.isCodeCell(op0.UVal) {
+					isCall := insn.Op == m68k.OpJSR
+					if !slices.Contains(a.IndirectSites, slot.Addr) {
+						a.IndirectSites = append(a.IndirectSites, slot.Addr)
+					}
+					for _, tgt := range tgts {
+						jtEdges = append(jtEdges, jtEdge{site: slot.Addr, target: tgt, isCall: isCall})
+						tname := a.GetOrDefaultLabel(tgt)
+						comments = append(comments, addrComment{addr: slot.Addr, frag: fmt.Sprintf("-> %s (via $%X)", tname, op0.UVal)})
+					}
+				}
+			}
+		}
+
 		// Step 1: Use / resolve operands against pre-instruction register state.
 		for opIdx := uint8(0); opIdx < insn.NumOps; opIdx++ {
 			op := insn.Ops[opIdx]
@@ -392,11 +447,41 @@ func (a *Analyzer) resolveBaseRelativeAccesses(slots []db.CellSlot, globalBase r
 			}
 
 			if op.Mode == m68k.EAAddrInd && (insn.Op == m68k.OpJSR || insn.Op == m68k.OpJMP) {
+				isCall := insn.Op == m68k.OpJSR
+				if rv.slot != 0 {
+					if tgts := lookupSlotTargets(rv.slot); len(tgts) > 0 {
+						for _, tgt := range tgts {
+							jtEdges = append(jtEdges, jtEdge{site: slot.Addr, target: tgt, isCall: isCall})
+							tname := a.GetOrDefaultLabel(tgt)
+							comments = append(comments, addrComment{addr: slot.Addr, frag: fmt.Sprintf("-> %s (via $%X)", tname, rv.slot)})
+						}
+						continue
+					}
+				}
 				if finalTgt, ok := a.resolveDirectOrSlotTarget(rv.val, jumpTable); ok {
-					isCall := insn.Op == m68k.OpJSR
 					jtEdges = append(jtEdges, jtEdge{site: slot.Addr, target: finalTgt, isCall: isCall})
 					tname := a.GetOrDefaultLabel(finalTgt)
 					comments = append(comments, addrComment{addr: slot.Addr, frag: fmt.Sprintf("-> %s", tname)})
+				} else if tgts := lookupSlotTargets(rv.val); len(tgts) > 0 {
+					for _, tgt := range tgts {
+						jtEdges = append(jtEdges, jtEdge{site: slot.Addr, target: tgt, isCall: isCall})
+						tname := a.GetOrDefaultLabel(tgt)
+						comments = append(comments, addrComment{addr: slot.Addr, frag: fmt.Sprintf("-> %s (via $%X)", tname, rv.val)})
+					}
+				}
+				continue
+			}
+
+			if op.Mode == m68k.EAAddrInd && (op.Access&(m68k.AccessRead|m68k.AccessWrite)) != 0 {
+				target := rv.val
+				if _, isHW := amiga.GetAmigaHWLabelSub(target); !isHW {
+					if a.isInDataOrBss(target) || a.IsInMemoryRegion(target) {
+						isWrite := (op.Access & m68k.AccessWrite) != 0
+						globals = append(globals, globalRef{site: slot.Addr, target: target, isWrite: isWrite, addLabel: true})
+					} else if a.IsInAnySegment(target) {
+						isWrite := (op.Access & m68k.AccessWrite) != 0
+						globals = append(globals, globalRef{site: slot.Addr, target: target, isWrite: isWrite, addLabel: false})
+					}
 				}
 				continue
 			}
@@ -414,6 +499,15 @@ func (a *Analyzer) resolveBaseRelativeAccesses(slots []db.CellSlot, globalBase r
 					jtEdges = append(jtEdges, jtEdge{site: slot.Addr, target: finalTgt, isCall: isCall})
 					tname := a.GetOrDefaultLabel(finalTgt)
 					comments = append(comments, addrComment{addr: slot.Addr, frag: fmt.Sprintf("-> %s", tname)})
+					continue
+				}
+				if tgts := lookupSlotTargets(target); len(tgts) > 0 {
+					isCall := insn.Op == m68k.OpJSR
+					for _, tgt := range tgts {
+						jtEdges = append(jtEdges, jtEdge{site: slot.Addr, target: tgt, isCall: isCall})
+						tname := a.GetOrDefaultLabel(tgt)
+						comments = append(comments, addrComment{addr: slot.Addr, frag: fmt.Sprintf("-> %s (via $%X)", tname, target)})
+					}
 					continue
 				}
 			}
@@ -445,14 +539,26 @@ func (a *Analyzer) resolveBaseRelativeAccesses(slots []db.CellSlot, globalBase r
 						comments = append(comments, addrComment{addr: slot.Addr, frag: bf})
 					}
 				}
-			} else if a.isInDataOrBss(target) {
+			} else if a.isInDataOrBss(target) || a.IsInMemoryRegion(target) {
 				isWrite := (op.Access & m68k.AccessWrite) != 0
-				globals = append(globals, globalRef{site: slot.Addr, target: target, isWrite: isWrite})
+				globals = append(globals, globalRef{site: slot.Addr, target: target, isWrite: isWrite, addLabel: true})
+			} else if a.IsInAnySegment(target) {
+				isWrite := (op.Access & m68k.AccessWrite) != 0
+				globals = append(globals, globalRef{site: slot.Addr, target: target, isWrite: isWrite, addLabel: false})
 			}
 		}
 
 		// Steps 2-6: Compute definition, clobber WriteRegs, commit, call-clobber, terminator reset.
 		a.stepInsn(slot.Addr, &insn, &state, &globalBase)
+		if insn.Op == m68k.OpMOVEA && insn.Suffix == m68k.SizeL && insn.NumOps == 2 {
+			op0 := insn.Ops[0]
+			dstOp := insn.Ops[1]
+			if (op0.Mode == m68k.EAAbsShort || op0.Mode == m68k.EAAbsLong) && dstOp.Mode == m68k.EAAddrReg && dstOp.Reg < 7 {
+				if tgts := lookupSlotTargets(op0.UVal); len(tgts) > 0 {
+					state.a[dstOp.Reg] = regKnown{known: true, val: tgts[0], slot: op0.UVal}
+				}
+			}
+		}
 	}
 
 	for _, ce := range customEAs {
@@ -464,8 +570,10 @@ func (a *Analyzer) resolveBaseRelativeAccesses(slots []db.CellSlot, globalBase r
 			a.appendCellComment(c.addr, c.frag)
 		}
 		for _, g := range globals {
-			site := g.site
-			a.AddLabel(&site, g.target)
+			if g.addLabel {
+				site := g.site
+				a.AddLabel(&site, g.target)
+			}
 			xrefKind := db.XrefDataRead
 			if g.isWrite {
 				xrefKind = db.XrefDataWrite
@@ -475,17 +583,23 @@ func (a *Analyzer) resolveBaseRelativeAccesses(slots []db.CellSlot, globalBase r
 		for _, je := range jtEdges {
 			site := je.site
 			a.AddLabel(&site, je.target)
+			if !a.isCodeCell(je.target) && a.IsInCodeSegment(je.target) && !slices.Contains(newSeeds, je.target) {
+				newSeeds = append(newSeeds, je.target)
+			}
 			edgeKind := db.EdgeUncond
 			xrefKind := db.XrefCodeBranch
 			if je.isCall {
 				edgeKind = db.EdgeCall
 				xrefKind = db.XrefCodeCall
+				labelName := a.GetOrDefaultLabel(je.target)
+				_ = a.DB.InsertFunction(je.target, labelName, ConfHigh)
 			}
 			_ = a.DB.InsertEdge(je.site, je.target, edgeKind)
 			_ = a.DB.InsertXref(je.site, je.target, xrefKind)
 		}
 		a.DB.Commit()
 	}
+	return newSeeds
 }
 
 func (a *Analyzer) isInDataOrBss(addr uint32) bool {

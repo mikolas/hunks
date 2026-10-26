@@ -548,6 +548,20 @@ func (p *Project) QualifiedLabel(addr uint32, rawOrRenamed string) string {
 	return rawOrRenamed
 }
 
+// StripFieldType splits a struct field specification like "Ship_VX.w" or "Model_Vertices.p"
+// into its clean identifier ("Ship_VX", "Model_Vertices") and lowercase type suffix ("w", "p").
+func StripFieldType(field string) (string, string) {
+	trimmed := strings.TrimSpace(field)
+	if idx := strings.LastIndexByte(trimmed, '.'); idx > 0 {
+		suf := strings.ToLower(trimmed[idx+1:])
+		switch suf {
+		case "b", "w", "l", "p":
+			return trimmed[:idx], suf
+		}
+	}
+	return trimmed, ""
+}
+
 // ResolveTarget resolves a user/LLM target specifier into a synthetic project address.
 func (p *Project) ResolveTarget(ctrl *db.Controller, input string) (uint32, bool) {
 	s := strings.TrimSpace(input)

@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
 
 	"github.com/mikolas/hunks/internal/db"
@@ -199,6 +200,79 @@ func (a *Analyzer) stage4FunctionMeta() {
 	}
 
 	a.pruneNoreturnFallthroughs(allEdges, cellByAddr, noreturn)
+	a.annotateSMC(cells, cellByAddr, entries)
+}
+
+func (a *Analyzer) annotateSMC(codeCells []db.Cell, cellByAddr map[uint32]*db.Cell, entries []uint32) {
+	if len(codeCells) == 0 {
+		return
+	}
+	slices.SortFunc(codeCells, func(x, y db.Cell) int {
+		return cmp.Compare(x.Addr, y.Addr)
+	})
+	findCodeCell := func(addr uint32) *db.Cell {
+		lo, hi := 0, len(codeCells)
+		for lo < hi {
+			mid := int(uint(lo+hi) >> 1)
+			if codeCells[mid].Addr <= addr {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		if lo > 0 && addr < codeCells[lo-1].Addr+codeCells[lo-1].Size {
+			return &codeCells[lo-1]
+		}
+		return nil
+	}
+	findEnclosingFunc := func(addr uint32) (uint32, bool) {
+		lo, hi := 0, len(entries)
+		for lo < hi {
+			mid := int(uint(lo+hi) >> 1)
+			if entries[mid] <= addr {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		if lo > 0 && a.IsSameSegment(entries[lo-1], addr) {
+			return entries[lo-1], true
+		}
+		return 0, false
+	}
+
+	for _, x := range a.DB.AllXrefs() {
+		if x.Kind != db.XrefDataWrite {
+			continue
+		}
+		if cellByAddr[x.Source] == nil {
+			continue
+		}
+		tgtCell := findCodeCell(x.Target)
+		if tgtCell == nil {
+			continue
+		}
+		var frag string
+		if lbl, ok := a.LabelsCache[tgtCell.Addr]; ok && lbl != "" {
+			off := x.Target - tgtCell.Addr
+			if off > 0 {
+				frag = fmt.Sprintf("[SMC] writes code at %s+%X", lbl, off)
+			} else {
+				frag = fmt.Sprintf("[SMC] writes code at %s", lbl)
+			}
+		} else if fnEntry, ok := findEnclosingFunc(x.Target); ok {
+			fnLbl := a.GetOrDefaultLabel(fnEntry)
+			off := x.Target - fnEntry
+			if off > 0 {
+				frag = fmt.Sprintf("[SMC] writes code at %s+%X", fnLbl, off)
+			} else {
+				frag = fmt.Sprintf("[SMC] writes code at %s", fnLbl)
+			}
+		} else {
+			frag = fmt.Sprintf("[SMC] writes code at $%X", x.Target)
+		}
+		a.appendCellComment(x.Source, frag)
+	}
 }
 
 // pruneNoreturnFallthroughs removes the FALLTHROUGH edge inserted after a `jsr`/`bsr`

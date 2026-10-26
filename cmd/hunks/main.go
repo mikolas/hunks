@@ -906,10 +906,34 @@ func main() {
 						return err
 					}
 				}
+				an, err := analyzer.New(proj, ctrl)
+				if err != nil {
+					return err
+				}
+				var codeSeeds []uint32
 				if err := ctrl.WithTransaction(func() error {
 					for i := uint32(0); i < cnt; i++ {
-						if err := ctrl.MarkData(addrU32+(i*4), 4, db.CellPointer); err != nil {
+						slotAddr := addrU32 + (i * 4)
+						if err := ctrl.MarkData(slotAddr, 4, db.CellPointer); err != nil {
 							return err
+						}
+						var tgt uint32
+						hasTgt := false
+						if rTgt, ok := an.Relocs[slotAddr]; ok {
+							tgt = rTgt
+							hasTgt = true
+						} else if u32Tgt, ok := an.ReadU32(slotAddr); ok {
+							tgt = u32Tgt
+							hasTgt = true
+						}
+						if hasTgt && (an.IsInAnySegment(tgt) || an.IsInMemoryRegion(tgt)) {
+							an.AddLabel(&slotAddr, tgt)
+							_ = ctrl.InsertXref(slotAddr, tgt, db.XrefDataAddr)
+							lbl := an.GetOrDefaultLabel(tgt)
+							_ = ctrl.SetCellOp(slotAddr, lbl)
+							if hintFollow && tgt%2 == 0 && an.IsInCodeSegment(tgt) && !slices.Contains(codeSeeds, tgt) {
+								codeSeeds = append(codeSeeds, tgt)
+							}
 						}
 					}
 					if hintComment != "" {
@@ -919,7 +943,12 @@ func main() {
 				}); err != nil {
 					return err
 				}
-				fmt.Printf("Added pointer hint at 0x%X with count %d\n", addrU32, cnt)
+				for _, seed := range codeSeeds {
+					if _, err := analyzer.ApplyCodeHint(proj, ctrl, seed); err != nil {
+						return err
+					}
+				}
+				fmt.Printf("Added pointer hint at 0x%X with count %d (%d code target(s) followed)\n", addrU32, cnt, len(codeSeeds))
 			case "data":
 				size := uint32(1)
 				if countStr != "" {
@@ -1130,16 +1159,12 @@ func main() {
 
 	// --- comment ---
 	var commentBlock bool
+	var commentBatchFile string
 	commentCmd := &cobra.Command{
-		Use:   "comment <addr> [text]",
-		Short: "Set or remove an inline or block comment at an address",
-		Args:  cobra.RangeArgs(1, 2),
+		Use:   "comment [addr] [text]",
+		Short: "Set or remove an inline or block comment at an address (or batch via --batch/--file)",
+		Args:  cobra.RangeArgs(0, 2),
 		RunE: func(_ *cobra.Command, args []string) error {
-			addrStr := args[0]
-			var val string
-			if len(args) >= 2 {
-				val = args[1]
-			}
 			proj, err := loadTargetProject(getWorkspaceRoot(), moduleName)
 			if err != nil {
 				return err
@@ -1154,9 +1179,82 @@ func main() {
 			}
 			defer ctrl.Close()
 			proj.SyncDBScope(ctrl)
-			addrU32, err := resolveAddrOrLabel(proj, ctrl, addrStr)
+			cg, err := callgraph.Build(proj)
 			if err != nil {
 				return err
+			}
+
+			applyOne := func(addrStr, val string) error {
+				addrU32, note, err := resolveStrictCommentAddr(proj, ctrl, cg, addrStr)
+				if err != nil {
+					return err
+				}
+				if note != "" {
+					fmt.Fprintln(os.Stderr, note)
+				}
+				if commentBlock {
+					return ctrl.UpdateBlockComment(addrU32, val)
+				}
+				return ctrl.UpdateComment(addrU32, val)
+			}
+
+			if commentBatchFile != "" {
+				var r io.Reader
+				if commentBatchFile == "-" {
+					r = os.Stdin
+				} else {
+					f, err := os.Open(resolveCallerPath(commentBatchFile))
+					if err != nil {
+						return err
+					}
+					defer f.Close()
+					r = f
+				}
+				scanner := bufio.NewScanner(r)
+				count := 0
+				if err := ctrl.WithTransaction(func() error {
+					for scanner.Scan() {
+						line := strings.TrimSpace(scanner.Text())
+						if line == "" || strings.HasPrefix(line, "#") {
+							continue
+						}
+						var targetPart, textPart string
+						if b, a, ok := strings.Cut(line, "="); ok {
+							targetPart = strings.TrimSpace(b)
+							textPart = strings.TrimSpace(a)
+						} else if fields := strings.Fields(line); len(fields) >= 2 {
+							targetPart = fields[0]
+							textPart = strings.TrimSpace(line[len(fields[0]):])
+						} else {
+							continue
+						}
+						if err := applyOne(targetPart, textPart); err != nil {
+							return err
+						}
+						count++
+					}
+					return scanner.Err()
+				}); err != nil {
+					return err
+				}
+				fmt.Printf("Applied %d comment(s)\n", count)
+				return nil
+			}
+
+			if len(args) == 0 {
+				return fmt.Errorf("provide <addr> [text] or --batch <file>")
+			}
+			addrStr := args[0]
+			var val string
+			if len(args) >= 2 {
+				val = args[1]
+			}
+			addrU32, note, err := resolveStrictCommentAddr(proj, ctrl, cg, addrStr)
+			if err != nil {
+				return err
+			}
+			if note != "" {
+				fmt.Fprintln(os.Stderr, note)
 			}
 			if commentBlock {
 				if err := ctrl.UpdateBlockComment(addrU32, val); err != nil {
@@ -1181,6 +1279,8 @@ func main() {
 		},
 	}
 	commentCmd.Flags().BoolVarP(&commentBlock, "block", "b", false, "Set block comment (above function/instruction) instead of inline comment")
+	commentCmd.Flags().StringVar(&commentBatchFile, "batch", "", "Batch file containing '<addr_or_label+off> = <comment>' per line (use '-' for stdin)")
+	commentCmd.Flags().StringVar(&commentBatchFile, "file", "", "Alias for --batch")
 	rootCmd.AddCommand(commentCmd)
 
 	// --- operand ---
@@ -1241,17 +1341,13 @@ func main() {
 	// --- callgraph / cg ---
 	var cgSegment, cgFormat string
 	var cgDepth, cgUpDepth, cgLimit int
-	var cgCode, cgLeaves, cgAnchors, cgReady, cgSuspect, cgUnrenamed bool
+	var cgCode, cgLeaves, cgAnchors, cgReady, cgSuspect, cgIndirect, cgUnrenamed bool
 	cgCmd := &cobra.Command{
-		Use:     "callgraph [target]",
+		Use:     "callgraph [target...]",
 		Aliases: []string{"cg"},
 		Short:   "Query the static call graph",
-		Args:    cobra.MaximumNArgs(1),
+		Args:    cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			var target string
-			if len(args) > 0 {
-				target = args[0]
-			}
 			proj, err := loadTargetProject(getWorkspaceRoot(), moduleName)
 			if err != nil {
 				return err
@@ -1260,25 +1356,59 @@ func main() {
 			if err != nil {
 				return err
 			}
-			opts := &callgraph.Options{
-				Target:    target,
-				Segment:   cgSegment,
-				Depth:     cgDepth,
-				UpDepth:   cgUpDepth,
-				Code:      cgCode,
-				Leaves:    cgLeaves,
-				Anchors:   cgAnchors,
-				Ready:     cgReady,
-				Suspect:   cgSuspect,
-				Unrenamed: cgUnrenamed,
-				Limit:     cgLimit,
-				Format:    cgFormat,
+			renderOne := func(target string) (string, error) {
+				opts := &callgraph.Options{
+					Target:    target,
+					Segment:   cgSegment,
+					Depth:     cgDepth,
+					UpDepth:   cgUpDepth,
+					Code:      cgCode,
+					Leaves:    cgLeaves,
+					Anchors:   cgAnchors,
+					Ready:     cgReady,
+					Suspect:   cgSuspect,
+					Indirect:  cgIndirect,
+					Unrenamed: cgUnrenamed,
+					Limit:     cgLimit,
+					Format:    cgFormat,
+				}
+				out, err := cg.Render(proj, opts)
+				if err != nil && target != "" {
+					// Auto-fallback to non-code data + XREF inspection if target resolves to data/global.
+					if seg, sErr := requireSegment(proj); sErr == nil {
+						if ctrl, cErr := db.New(seg.DB); cErr == nil {
+							defer ctrl.Close()
+							proj.SyncDBScope(ctrl)
+							if addr, aErr := resolveAddrOrLabel(proj, ctrl, target); aErr == nil {
+								return renderDataInspection(proj, ctrl, cg, addr, 64, false, "", 1, cgFormat)
+							}
+						}
+					}
+				}
+				return out, err
 			}
-			output, err := cg.Render(proj, opts)
-			if err != nil {
-				return err
+			if len(args) <= 1 {
+				var target string
+				if len(args) == 1 {
+					target = args[0]
+				}
+				output, err := renderOne(target)
+				if err != nil {
+					return err
+				}
+				fmt.Print(output)
+				return nil
 			}
-			fmt.Print(output)
+			for i, t := range args {
+				if i > 0 {
+					fmt.Println()
+				}
+				output, err := renderOne(t)
+				if err != nil {
+					return err
+				}
+				fmt.Print(output)
+			}
 			return nil
 		},
 	}
@@ -1291,6 +1421,7 @@ func main() {
 	cgCmd.Flags().BoolVar(&cgAnchors, "anchors", false, "List functions anchored by STRING references or Amiga hardware registers")
 	cgCmd.Flags().BoolVar(&cgReady, "ready", false, "List unrenamed functions whose callees are all renamed (bottom-up frontier)")
 	cgCmd.Flags().BoolVar(&cgSuspect, "suspect", false, "List functions with suspect fallthrough into DATA/STRING without rts/jmp/bra")
+	cgCmd.Flags().BoolVar(&cgIndirect, "indirect", false, "List all indirect and trampoline call/jump dispatch sites (resolved and unresolved)")
 	cgCmd.Flags().BoolVarP(&cgUnrenamed, "unrenamed", "u", false, "Only show unrenamed functions (LAB_*) in worklist modes")
 	cgCmd.Flags().IntVarP(&cgLimit, "limit", "n", 50, "Maximum number of functions to list in worklist modes (0 = all)")
 	cgCmd.Flags().StringVarP(&cgFormat, "format", "f", "text", "Output format: text, json, dot, mermaid")
@@ -1901,6 +2032,7 @@ func main() {
 		},
 	}
 	rootCmd.AddCommand(tuiCmd)
+	registerAgentCommands(rootCmd, getWorkspaceRoot, &moduleName, resolveCallerPath)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

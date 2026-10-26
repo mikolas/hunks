@@ -161,10 +161,18 @@ func decodeEA(
 
 	switch mode {
 	case 0: // 000: Dn (Data Register Direct)
-		return Operand{Mode: EADataReg, Access: access, Reg: reg}, pos, RegD(reg), 0, true
+		var rMask RegMask
+		if (access & AccessRead) != 0 {
+			rMask = RegD(reg)
+		}
+		return Operand{Mode: EADataReg, Access: access, Reg: reg}, pos, rMask, 0, true
 
 	case 1: // 001: An (Address Register Direct)
-		return Operand{Mode: EAAddrReg, Access: access, Reg: reg}, pos, RegA(reg), 0, true
+		var rMask RegMask
+		if (access & AccessRead) != 0 {
+			rMask = RegA(reg)
+		}
+		return Operand{Mode: EAAddrReg, Access: access, Reg: reg}, pos, rMask, 0, true
 
 	case 2: // 010: (An) (Address Register Indirect)
 		return Operand{Mode: EAAddrInd, Access: access, Reg: reg}, pos, RegA(reg), 0, true
