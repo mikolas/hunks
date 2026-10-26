@@ -22,7 +22,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var version = "dev"
+var version = "v1.1.0"
 
 func parseHex(val string) (uint32, error) {
 	return project.ParseUint32(val)
