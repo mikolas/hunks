@@ -83,7 +83,7 @@ cmp -l assets/disk.1 build/disk_1.bin   # 0 differences
 | `-m <module> map load FILE` | Bulk-load `<addr> <name> [type]` label mappings from a text file |
 | `-m <module> status` | Show module byte coverage statistics |
 | `-m <module> tui` | Launch the interactive terminal UI |
-| `rip FILE` | Scan a raw binary/memory dump for embedded Amiga music/tracker modules (26 ExoticRipper recognizers) and report detected formats, offsets, and region bounds |
+| `rip FILE` | *(Experimental)* Scan a raw binary/memory dump for embedded Amiga music/tracker modules (26 ExoticRipper recognizers) and report detected formats, offsets, and region bounds |
 
 ---
 
@@ -504,7 +504,7 @@ Instructions that jump/call across hunks or through a register jump-vector table
 | `a` | Register alias editor (maps a base register to a struct for automatic `d16(An)` field substitution) |
 | `Ctrl-z` | Undo last edit (type-marking, carve/uncarve, rename, inline/block comment) |
 | `B` | Open interactive Bitplane Image Viewer at cursor address |
-| `M` | Open interactive Music Module Ripper (scan, browse, jump, rip, carve) |
+| `M` | *(Experimental)* Open interactive Music Module Ripper (scan, browse, jump, rip, carve) |
 | `?` | Help popup |
 | `q` | Quit |
 
@@ -554,9 +554,11 @@ The viewer queries the terminal text area pixel dimensions at startup via the cr
 | `K` | Carve bitplane byte range as `incbin` Virtual Segment (prompts for `gfx_<W>x<H>x<BPU>[i][h][ham]` label, writes `; Bitmap:` / `; Span:` / `; Regs:` / `; Planes:` / `; Pal:` block comment above the label; round-trips geometry, modulo, `VIS`/`SYNC` masks, plane pointers, and palette/invert/bias on `B`; flat binaries only; undoable via `Ctrl-z`) |
 | `Esc` / `q` | Close viewer and return immediately to disassembly listing |
 
-### Interactive Music Module Ripper (`M`)
+### Interactive Music Module Ripper (`M`) — Experimental
 
-Pressing `M` in the Disassembly view scans the active segment using the zero-dependency recognizer engine (`modules.Scan`) for embedded tracker and sound driver modules across 7 supported formats (ProTracker, SoundTracker 2.6, Old SoundTracker, Future Composer, David Whittaker, Delta Music 1.0, Final Music System).
+> **Note:** The Music Module Ripper (`M` in TUI and `hunks rip`) is currently **experimental**.
+
+Pressing `M` in the Disassembly view scans the active segment using the zero-dependency recognizer engine (`modules.Scan`) for embedded tracker and sound driver modules across 26 ExoticRipper-derived formats (including ProTracker, SoundTracker 2.6, Old SoundTracker, Future Composer, David Whittaker, Delta Music 1.0, Final Music System, ThePlayer, TFMX, OctaMED, and Jochen Hippel).
 
 If modules are detected, `ModalMusicRipper` displays all found songs and companion regions (e.g. StarTrekker sample banks) with format, variant, offset, and size:
 

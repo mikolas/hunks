@@ -217,9 +217,9 @@ preserved.
   register-context-resolved `d16(An)` hardware accesses are named
   (`INTREQR+1` etc.).
 
-## Music Module Recognizer Engine (`internal/modules/`)
+## Music Module Recognizer Engine (`internal/modules/`, Experimental)
 
-A self-contained recognizer subsystem (reverse-engineered from ExoticRipper
+A self-contained experimental recognizer subsystem (reverse-engineered from ExoticRipper
 V2.31) that operates directly on `[]byte` buffers without SQLite, `Project`, or
 I/O dependencies:
 

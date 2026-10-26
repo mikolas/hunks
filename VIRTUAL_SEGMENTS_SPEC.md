@@ -56,7 +56,7 @@
 3. **Round-Trip on `B`:**
    - Pressing `B` while the disassembly cursor is on a carved bitmap `incbin` row parses the `BlockComment` (or `gfx_<W>x<H>x<BPU>` label) and reopens the Bitplane Viewer with the saved geometry, `BPL1MOD`/`BPL2MOD` modulo, `VIS`/`SYNC` plane masks, plane pointers, and palette (`Grayscale`, `High-Contrast`, or custom `@+$offset`, plus `inv` and `bias`) restored.
 
-### 2.3 TUI Music Ripper (`M` $\rightarrow$ `ModalMusicRipper`)
+### 2.3 TUI Music Ripper (`M` $\rightarrow$ `ModalMusicRipper`, Experimental)
 1. **Scan & Browse (`M`):**
    - Pressing **`M`** in the disassembly view runs [`modules.Scan(a.BinaryData)`](internal/modules/modules.go) across the current segment and opens `ModalMusicRipper` listing all detected music modules (`ProTracker`, `Future Composer`, `Whittaker`, `SoundTracker 2.6`, `Old SoundTracker`, `Delta Music`, `Final Music System`) and their regions (`Primary`, `Samples`).
    - If no modules are detected in the segment, the status bar reports `"No music modules found in segment"`.
