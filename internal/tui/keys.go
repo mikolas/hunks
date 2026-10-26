@@ -229,6 +229,8 @@ func (a *App) HandleKey(key string) bool {
 		}
 	case "v":
 		a.ToggleSelection()
+	case "V":
+		a.SelectSubroutine()
 	case "esc":
 		if a.SelectionStart != nil {
 			a.SelectionStart = nil

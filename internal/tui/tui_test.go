@@ -1250,3 +1250,181 @@ func TestMusicRipperModalAndCarve(t *testing.T) {
 		t.Fatalf("expected cursor at 0x%X, got 0x%X (ok=%v)", 0x10000+modOffset, curAddr, ok)
 	}
 }
+
+func TestBlockAndSubroutineCycles(t *testing.T) {
+	// Subroutine 1 at 0x10000:
+	//   0x10000: moveq #0,d0    (0x7000) -> 4 (1/0) cyc
+	//   0x10002: addq.w #1,d0   (0x5240) -> 4 (1/0) cyc
+	//   0x10004: rts            (0x4E75) -> 16 (4/0) cyc
+	// Total Subroutine 1 = 6B, 3 insns, 24 (6/0) cyc
+	//
+	// Subroutine 2 at 0x10006 (contains variable-timing muls.w):
+	//   0x10006: muls.w d1,d0   (0xC1C1) -> 38-70 (1/0) cyc
+	//   0x10008: rts            (0x4E75) -> 16 (4/0) cyc
+	// Total Subroutine 2 = 4B, 2 insns, 54-86 (5/0) cyc
+	//
+	// Subroutine 3 at 0x1000A (has internal branch label LAB_10014 and a jmp skipped by beq.s):
+	//   0x1000A: tst.w d0       (0x4A40)
+	//   0x1000C: beq.s $10014   (0x6706) -> branches past jmp to 0x10014
+	//   0x1000E: jmp $10000.l   (0x4EF9 0x00010000) -> skipped by beq.s, must NOT end Sub3!
+	//   0x10014: addq.w #1,d0   (0x5240) [LAB_10014 with XrefCodeBranch]
+	//   0x10016: rts            (0x4E75) -> actual end of Sub3
+	//
+	// Subroutine 4 at 0x10018 (ends via unskipped tail-call jmp):
+	//   0x10018: moveq #1,d0    (0x7001)
+	//   0x1001A: jmp $10000.l   (0x4EF9 0x00010000) -> unskipped tail-call jmp ends Sub4!
+	//
+	// Trailing data at 0x10020..0x10023 (4 bytes)
+	raw := []byte{
+		0x70, 0x00,
+		0x52, 0x40,
+		0x4E, 0x75,
+		0xC1, 0xC1,
+		0x4E, 0x75,
+		0x4A, 0x40,
+		0x67, 0x06,
+		0x4E, 0xF9, 0x00, 0x01, 0x00, 0x00,
+		0x52, 0x40,
+		0x4E, 0x75,
+		0x70, 0x01,
+		0x4E, 0xF9, 0x00, 0x01, 0x00, 0x00,
+		0xAA, 0xBB, 0xCC, 0xDD,
+	}
+
+	tmpDir := t.TempDir()
+	proj := project.New(filepath.Join(tmpDir, "project.json"))
+	proj.WorkspaceRoot = tmpDir
+	proj.Data.Segments = []project.Segment{{
+		Name:      "hunk0",
+		HunkIndex: 0,
+		HunkType:  hunk.HunkTypeCode,
+		Base:      0x10000,
+		AllocSize: uint32(len(raw)),
+	}}
+	proj.Data.Spaces = []project.Space{{Name: "default", Segments: []string{"hunk0"}}}
+	proj.Data.ActiveSpace = "default"
+	proj.ActiveSegmentName = "hunk0"
+
+	ctrl, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ctrl.Close() })
+	proj.SyncDBScope(ctrl)
+
+	mustInsertCode := func(addr uint32, rawBytes []byte, mnem, op string) {
+		m := mnem
+		o := op
+		if err := ctrl.InsertCell(&db.Cell{
+			Seg:      "hunk0",
+			Addr:     addr,
+			Size:     uint32(len(rawBytes)),
+			Type:     db.CellCode,
+			Mnemonic: &m,
+			OpStr:    &o,
+			RawBytes: rawBytes,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustInsertCode(0x10000, raw[0:2], "moveq", "#0,d0")
+	mustInsertCode(0x10002, raw[2:4], "addq.w", "#1,d0")
+	mustInsertCode(0x10004, raw[4:6], "rts", "")
+	mustInsertCode(0x10006, raw[6:8], "muls.w", "d1,d0")
+	mustInsertCode(0x10008, raw[8:10], "rts", "")
+	mustInsertCode(0x1000A, raw[10:12], "tst.w", "d0")
+	mustInsertCode(0x1000C, raw[12:14], "beq.s", "LAB_10014")
+	mustInsertCode(0x1000E, raw[14:20], "jmp", "$10000.l")
+	mustInsertCode(0x10014, raw[20:22], "addq.w", "#1,d0")
+	mustInsertCode(0x10016, raw[22:24], "rts", "")
+	mustInsertCode(0x10018, raw[24:26], "moveq", "#1,d0")
+	mustInsertCode(0x1001A, raw[26:32], "jmp", "$10000.l")
+
+	_ = ctrl.SetLabel(0x10014, "LAB_10014", db.LabelLab, true)
+	_ = ctrl.InsertXref(0x1000C, 0x10014, db.XrefCodeBranch)
+
+	_ = ctrl.InsertFunction(0x10000, "Sub1", 255)
+	_ = ctrl.UpdateFunctionMetadataBatch([]db.FunctionMeta{{
+		Entry:   0x10000,
+		EndAddr: 0x10006,
+		HasEnd:  true,
+	}})
+
+	app, err := NewApp(proj, ctrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.BinaryData = raw
+	if err := app.LoadData(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Manual range selection ('v' + move down 1 row) across first 2 instructions of Sub1
+	app.GotoAddress(0x10000)
+	app.HandleKey("v")
+	app.HandleKey("j")
+	status := app.GetStatusLine()
+	if !strings.Contains(status, "(4B, 2 insns) │ 8 (2/0) cyc") {
+		t.Fatalf("expected 4B, 2 insns, 8 (2/0) cyc in status line, got %q", status)
+	}
+	app.HandleKey("esc")
+	if app.SelectionStart != nil {
+		t.Fatalf("expected selection cleared on esc")
+	}
+
+	// 2. Press 'V' inside Sub1 (at 0x10002) -> selects [0x10000..0x10004]
+	app.GotoAddress(0x10002)
+	app.HandleKey("V")
+	selStart, selEnd, ok := app.GetSelectionRange()
+	if !ok || selStart != 0x10000 || selEnd != 0x10004 {
+		t.Fatalf("expected Sub1 selection [0x10000..0x10004], got [0x%X..0x%X] ok=%v", selStart, selEnd, ok)
+	}
+	status = app.GetStatusLine()
+	if !strings.Contains(status, "(6B, 3 insns) │ 24 (6/0) cyc") {
+		t.Fatalf("expected Sub1 status '(6B, 3 insns) │ 24 (6/0) cyc', got %q", status)
+	}
+
+	// Pressing 'V' again toggles/cancels the subroutine selection
+	app.HandleKey("V")
+	if app.SelectionStart != nil {
+		t.Fatalf("expected second 'V' to cancel selection")
+	}
+
+	// 3. Press 'V' inside Sub2 (at 0x10008) -> selects [0x10006..0x10008]
+	app.GotoAddress(0x10008)
+	app.HandleKey("V")
+	selStart, selEnd, ok = app.GetSelectionRange()
+	if !ok || selStart != 0x10006 || selEnd != 0x10008 {
+		t.Fatalf("expected Sub2 selection [0x10006..0x10008], got [0x%X..0x%X] ok=%v", selStart, selEnd, ok)
+	}
+	status = app.GetStatusLine()
+	if !strings.Contains(status, "(4B, 2 insns) │ 54-86 (5/0) cyc") {
+		t.Fatalf("expected Sub2 variable timing '(4B, 2 insns) │ 54-86 (5/0) cyc', got %q", status)
+	}
+	app.HandleKey("esc")
+
+	// 4. Press 'V' inside Sub3 (at 0x1000A) -> walks across LAB_10014 and skipped jmp to rts at 0x10016
+	app.GotoAddress(0x1000A)
+	app.HandleKey("V")
+	selStart, selEnd, ok = app.GetSelectionRange()
+	if !ok || selStart != 0x1000A || selEnd != 0x10016 {
+		t.Fatalf("expected Sub3 selection [0x1000A..0x10016] across internal label and skipped jmp, got [0x%X..0x%X] ok=%v", selStart, selEnd, ok)
+	}
+	app.HandleKey("esc")
+
+	// 5. Press 'V' inside Sub4 (at 0x10018) -> stops at unskipped tail-call jmp at 0x1001A
+	app.GotoAddress(0x10018)
+	app.HandleKey("V")
+	selStart, selEnd, ok = app.GetSelectionRange()
+	if !ok || selStart != 0x10018 || selEnd != 0x1001A {
+		t.Fatalf("expected Sub4 selection [0x10018..0x1001A] ending at tail-call jmp, got [0x%X..0x%X] ok=%v", selStart, selEnd, ok)
+	}
+	app.HandleKey("esc")
+
+	// 6. Press 'V' on data-only row -> clears/refuses with "No subroutine at cursor"
+	app.GotoAddress(0x10020)
+	app.HandleKey("V")
+	if app.SelectionStart != nil || app.StatusMsg != "No subroutine at cursor" {
+		t.Fatalf("expected 'No subroutine at cursor' on data row, got StatusMsg=%q", app.StatusMsg)
+	}
+}
