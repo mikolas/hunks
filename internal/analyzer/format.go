@@ -129,6 +129,12 @@ func (a *Analyzer) formatOperand(addr uint32, insn *m68k.Insn, op m68k.Operand, 
 		if hw, ok := amiga.GetAmigaHWOperand(target); ok {
 			return hw + ".w"
 		}
+		if (!hunkMode || !a.IsInAnyProjectSegment(target)) && insn.Op != m68k.OpPEA && int16(uint16(target)) > 0 {
+			label := a.GetLabelName(target)
+			if label != "" && !a.PointsMidCell(target) {
+				return label + ".w"
+			}
+		}
 		return op.FormatASM(insn.Op)
 
 	case m68k.EAAbsLong:

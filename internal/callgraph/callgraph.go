@@ -412,7 +412,7 @@ func Build(proj *project.Project) (*CallGraph, error) {
 	}
 	for lAddr, lName := range labels {
 		rawName := rawLabels[lAddr]
-		if (lName != rawName || !strings.HasPrefix(lName, "LAB_")) && !branchTargets[lAddr] && isCodeAt(lAddr) {
+		if (lName != rawName || !project.IsAutoLabel(lName)) && !branchTargets[lAddr] && isCodeAt(lAddr) {
 			funcStartsSet[lAddr] = true
 		}
 	}
@@ -535,7 +535,7 @@ func Build(proj *project.Project) (*CallGraph, error) {
 		if !ok || name == "" {
 			name = rawName
 		}
-		isRenamed := name != rawName || !strings.HasPrefix(name, "LAB_")
+		isRenamed := name != rawName || !project.IsAutoLabel(name)
 		isExported := exportedSet[entryAddr]
 
 		var blockComment *string
