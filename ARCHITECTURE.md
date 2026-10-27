@@ -10,20 +10,22 @@
        │                    │                          │
        ▼                    ▼                          ▼
 ┌───────────────────────────────────────────────────────────────────┐
-│                    Unified 3-Stage Analyzer                        │
+│                    Unified 4-Stage Analyzer                        │
 │  Stage 1: Ground-Truth Seeding (HUNK_RELOC32, XDEF, Entry Points, │
 │           LAB_<hunk>_<offset> / LAB_<addr> Labels)                │
 │  Stage 2: Unified Worklist Code Tracer + Jump/Vector/Trampoline   │
-│           Tables + Monotonic Sandbox-Validated Gap Sweep          │
+│           Tables + Sandbox Gap Sweep + Base-Reg Propagation       │
 │  Stage 3: Label/Reloc-Bounded Data Classification &               │
 │           Relocation-Exact Operand Formatting                     │
+│  Stage 4: Subroutine Boundary, Stack-Frame & No-Return Inference  │
 └───────────────┬───────────────────────────────┬───────────────────┘
                 │                               │
                 ▼                               ▼
 ┌───────────────────────────────┐ ┌─────────────────────────────────┐
-│  CallGraph (`internal/callgraph`) │ │   Emitter (`internal/emitter`)  │
-│  Subroutine & d16(a5) vector  │ │  Slices unified address space   │
-│  inference, worklists, --code │ │  + source-linkable `; XREF:`    │
+│  CallGraph & Agent CLI        │ │   Emitter (`internal/emitter`)  │
+│  `cg` (`--indirect`, `--code`),│ │  Slices unified address space   │
+│  `xref`, `data`, `search`,    │ │  + `; XREF:`, `ABI:`, & struct  │
+│  `abi --verify`, `dump`       │ │  field displacement rendering   │
 └───────────────────────────────┘ └─────────────┬───────────────────┘
                                                 │
                                  ┌──────────────┴──────────────┐
@@ -39,15 +41,16 @@
 ```
 cmd/
 └── hunks/
-    └── main.go             CLI entry point (cobra), command dispatch (`init`, `analyze`, `emit`, `cg`, `tui`, ...)
+    ├── main.go             CLI entry point (cobra), core dispatch (`init`, `analyze`, `emit`, `cg`, `hint`, `rename`, `comment`, `tui`, ...)
+    └── agent_cmds.go       Query, inspection & annotation commands (`xref`, `data --copper/--struct`, `search`, `abi`, `region`, `dump`)
 internal/
 ├── hunk/
 │   └── parser.go           AmigaOS Hunk executable parser (CODE/DATA/BSS, RELOC32/DREL32, CHIP/FAST)
 ├── project/
-│   └── project.go          Project config: segments, HunkType, MemoryType, spaces, AutoLabel & ResolveTarget
+│   └── project.go          Project config: segments, spaces, `MemoryRegion`, `Structs`, global/scoped `RegisterAliases`, `FunctionABIs`, `AutoLabel` & `ResolveTarget`
 ├── db/
 │   ├── types.go            Domain enums (`CellType`, `EdgeKind`, `XrefKind`, `LabelKind`)
-│   └── controller.go       Shared SQLite persistence layer (`modernc.org/sqlite`) + jump-vector XREF resolution
+│   └── controller.go       Shared SQLite persistence layer (`modernc.org/sqlite`) + jump-vector XREF & range queries
 ├── amiga/
 │   └── equates.go          Hardware register/vector name tables & `equates.i` generator
 ├── m68k/
@@ -59,15 +62,15 @@ internal/
 │   ├── classify.go         RefType classification + M68000 relocation/instruction validator (`internal/m68k`)
 │   ├── stage2_code.go      Unified worklist descent, jump/vector/trampoline tables, sandbox gap sweep
 │   ├── stage3_data.go      Label/relocation-bounded data & BSS classification
-│   ├── stage4_funcmeta.go  Subroutine boundary & register liveness / metadata inference
+│   ├── stage4_funcmeta.go  Subroutine boundary, no-return status & stack-frame metadata inference
 │   ├── format.go           Relocation-exact (Hunk mode) & range-validated (Flat mode) operand formatter
-│   ├── baseregs.go         Base-register (`a4`/`a5`/`a6`) invariant resolution
+│   ├── baseregs.go         Base-register (`a0`..`a6`) invariant & custom hardware displacement resolution
 │   ├── trace.go            Trace-driven analysis (`analyze --trace`): `m68kemu` sandbox recorder + analysis bus
 │   └── chipset.go          Minimal 6-level Amiga OCS/ECS chipset state machine (Agnus/Denise/Paula/Blitter/Copper/CIA)
 ├── emitter/
-│   └── emitter.go          Single-file & modular multi-hunk assembly generator + source-linkable XREFs
+│   └── emitter.go          Single-file & modular multi-hunk assembly generator + source-linkable `; XREF:`, `ABI:` headers, and struct field aliases
 ├── callgraph/
-│   └── callgraph.go        Subroutine inference, d16(An) jump-vector resolution, worklists, DOT/Mermaid/JSON/text
+│   └── callgraph.go        Subroutine inference, d16(An) jump-vector & `--indirect` dispatch resolution, static ABI verification (`VerifyABI`), worklists, `--code`
 ├── modules/
 │   ├── modules.go          Pure byte-buffer module recognizer registry (`Recognizer`, `Match`, `Region`, `Scan`)
 │   ├── sandbox.go          Bounded M68000 (`m68kemu`) scratch-RAM probe for self-executing drivers
@@ -81,11 +84,11 @@ internal/
 │   └── ...                 19 additional ExoticRipper format recognizers (ThePlayer, TFMX, OctaMED, Hippel, ...)
 └── tui/
     ├── types.go            Enums, structs (`Modal`, `ListingRow`, `SubRowKind`, `UndoEntry`, `TextInput`)
-    ├── listing.go          `BuildListingRows`: Sub-Row Code View builder, 16-byte `dc.b` coalescer, 3-tier EOL comment priority
+    ├── listing.go          `BuildListingRows`: Sub-Row Code View builder, 16-byte `dc.b` coalescer, `ABI:` headers/call-site hints, struct aliases, 3-tier EOL comment priority
     ├── app.go              `App` (`tea.Model`) + segment/status management
-    ├── actions.go          Interactive type marking (`c`/`b`/`w`/`l`/`p`/`s`/`u`), virtual segment carve/uncarve (`K`), bitplane/music ripper actions (`B`/`M`), & transactional undo (`Ctrl-z`)
-    ├── nav.go              Cursor, byte-offset (`←`/`→`), & automatic cross-hunk / jump-vector reference navigation
-    ├── popups.go           XREFs (`x`), Functions (`f`), Search (`/`), Structs (`t`), and Segment/Space popups
+    ├── actions.go          Interactive type marking (`c`/`b`/`w`/`l`/`p`/`s`/`u`), rename (`n`), ABI (`A`), virtual segment carve/uncarve (`K`), bitplane/music ripper (`B`/`M`), & undo (`Ctrl-z`)
+    ├── nav.go              Cursor, byte-offset (`←`/`→`), `cluster:` search presets, & automatic cross-hunk / jump-vector reference navigation
+    ├── popups.go           XREFs (`x`), Functions (`f`), Search (`/`), Structs (`t`), ABI (`A`), and Segment/Space popups
     ├── keys.go             Keyboard/mouse event handling
     ├── bitplane.go         Interactive Amiga Bitplane Image Viewer (`B`), `BPLCON0`/modulo geometry, planar/EHB/HAM6 decoder, `FORM ILBM` encoder, `XTWINOPS` (`\x1b[14t`) pixel sizing, & block comment round-trip
     ├── pixelgfx.go         Terminal pixel graphics encoders (`Kitty`, `iTerm2`, `Sixel`, Unicode `Half-Block`)
@@ -103,12 +106,18 @@ internal/
   "entry_points": [
     { "addr": 0, "name": "LAB_0_00000", "segment": "hunk0" }
   ],
-  "memory_regions": [],
+  "memory_regions": [
+    { "base": 4096, "size": 4096, "name": "Globals_LowRAM", "comment": "Zero-page / .w globals" }
+  ],
   "structs": {
-    "ShipObj": { "90": "so_Type" }
+    "ShipObj": { "_size": "128", "90": "so_Type" }
   },
   "register_aliases": {
-    "a0": "ShipObj"
+    "a0": "ShipObj",
+    "UpdateShip:a1": "ShipObj"
+  },
+  "function_abis": {
+    "UpdateShip": "(a1=ShipObj* -> d0=status | clobbers: d1/a0)"
   },
   "segments": [
     {
@@ -129,6 +138,12 @@ internal/
   "active_space": "default"
 }
 ```
+
+**Live project metadata (`memory_regions`, `structs`, `register_aliases`, `function_abis`).**
+Non-byte-affecting reverse-engineering metadata lives in `project.json` and is applied dynamically at view/emit time (`cg --code`, `xref`, `data`, `emit`, and `tui`) without re-running `analyze`:
+- `memory_regions`: Named address ranges outside (or inside) the loaded binary (e.g. BSS, low-RAM `.w` globals, custom buffers) resolved by `xref` and `data`.
+- `structs` & `register_aliases`: Struct definitions (with optional `_size` stride for `data --struct`) and global (`"a0"`) or function-scoped (`"FuncName:a1"`) base-register bindings rendered into symbolic `Struct.field(An)` operands via `ApplyStructAliasesToOpStr`.
+- `function_abis`: Human/agent-authored subroutine ABI envelopes (`(inputs -> outputs | clobbers: ...)`) rendered as `; ABI:` header banners and `[ABI: ...]` call-site annotations, and automatically re-keyed across CLI/TUI renames (`ReKeyFunctionABI`).
 
 **Segments, spaces, split & carve.** The project owns a flat pool of all
 `segments`; a `Space` is a named, ordered selection of them that forms one
@@ -158,16 +173,17 @@ Every segment-scoped table includes `seg TEXT NOT NULL` as the leading primary-k
 - **`operand_formats`** — per-instruction numeric base overrides (`HEX`, `DEC`, `BIN`), keyed by `(seg, addr)`
 - **`base_regs`** — base-register (`a4`/`a5`/`a6`) invariants, keyed by `(scope_kind, scope_key, reg)`
 
-## Analyzer Internals (Unified 3-Stage Pipeline)
+## Analyzer Internals (Unified 4-Stage Pipeline)
 
 ### Stage 1: Ground-Truth Seeding & Relocation Invariant
 1. **Relocation Table Authority:** In multi-hunk executables, every `HUNK_RELOC32` entry is stored in `relocs` (`site_addr -> target_addr`). All relocation targets receive a deterministic `LAB_{tgt_hunk}_{offset:05X}` label, and any cross-segment reference sets `is_exported = 1` (`XDEF`).
 2. **M68000 Relocation Invariant:** Because the first 2 bytes of every M68000 instruction is the opcode word (never 32-bit relocated), no instruction can ever start inside `[site_addr .. site_addr + 4)`, and any relocation falling inside an instruction `[addr + 1 .. addr + size)` must align with a valid 32-bit immediate or `.l` extension word of that instruction.
 
-### Stage 2: Unified Worklist Code Tracer + Sandbox-Validated Gap Sweep
+### Stage 2: Unified Worklist Code Tracer, Sandbox Gap Sweep & Base-Register Propagation
 1. **Worklist Recursive Descent (`ConfDefinite` / `ConfHigh`):**
    - Pops addresses from a single shared worklist spanning all `Code` segments.
    - Follows direct branches/calls (`BSR`, `JSR`, `BRA`, `JMP`, `Bcc`, `DBcc`), PC-relative word-offset jump tables (`JMP`/`JSR d8(PC,Xn)`), and contiguous trampoline/vector tables (`JMP target.L`, `BRA.W target`).
+   - Records `xrefs` across both mapped segments and unmapped/low-RAM regions (including sign-extended `.w` `EAAbsShort` globals, `$DFFxxx`/`$BFxxxx` hardware registers, and 24-bit `movea.l #imm,An` address loads in flat mode), while creating `LAB_` auto-labels only for in-segment non-`.w` references so `.w` instruction sizing is never perturbed.
    - Pushes code-segment addresses referenced via `HUNK_RELOC32` or `LEA`/`PEA`/`#imm` into `candidateCode`.
 2. **Monotonic Sandbox-Validated Gap Sweep (`ConfMedium`):**
    - Evaluates `candidateCode` and walks unmapped `Code` gaps using per-segment monotonic cursors.
@@ -175,6 +191,8 @@ Every segment-scoped table includes `seg TEXT NOT NULL` as the leading primary-k
      - Brief extension word bits `10..8 == 0` (`(ext_word & 0x0700) == 0`) on indexed memory modes (`d8(An,Xn)` and `d8(PC,Xn)`).
      - Byte-immediate extension word high-byte zero (`bytes[2] == 0`) on `.b` immediate instructions and static bit ops (`btst`/`bchg`/`bclr`/`bset`).
      - No interior label or relocation overlap, and clean termination at `RTS`/`RTE`/`RTR`/`BRA`/`JMP` or verified `CODE`.
+3. **Base-Register Propagation (`propagateBaseRegs`):**
+   - Propagates invariant `a0`..`a6` base registers across the CFG to resolve `d16(An)` jump-vector calls, global data XREFs, and custom hardware register displacements (`$DFF000`).
 
 ### Stage 3: Label/Relocation-Bounded Data Classification & Operand Formatting
 1. **Data Gap Classification:**
@@ -184,6 +202,9 @@ Every segment-scoped table includes `seg TEXT NOT NULL` as the leading primary-k
    - Re-decodes every `CODE` cell from `raw_bytes`.
    - In **Hunk Mode**, formats `.l` immediate/absolute operands as `LAB_{hunk}_{offset:05X}` **if and only if** the operand's extension-word address is in `relocs`.
    - In **Flat Mode**, in-segment `.l` operands matching valid segment labels are formatted symbolically at analysis time, while out-of-segment `.l` targets stay numeric in `cells.op_str` and are resolved dynamically against the active `Space`'s `all_labels` at view/emit time (`ResolveFlatCrossSegOperands` + external `equ` directives).
+
+### Stage 4: Subroutine Boundary, Stack-Frame & No-Return Inference
+- Infers subroutine entry points and contiguous instruction bounds (`functions` table), detects `LINK`/`PEA` stack-frame sizes and non-returning subroutines, and prunes unreachable fallthrough edges past non-returning calls.
 
 ## Trace-Driven Analysis (`analyze --trace`)
 
