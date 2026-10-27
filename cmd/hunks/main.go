@@ -1382,7 +1382,10 @@ func main() {
 							defer ctrl.Close()
 							proj.SyncDBScope(ctrl)
 							if addr, aErr := resolveAddrOrLabel(proj, ctrl, target); aErr == nil {
-								return renderDataInspection(proj, ctrl, cg, addr, 64, false, "", 1, cgFormat)
+								if proj.SegmentAtAddr(addr) != nil {
+									return renderDataInspection(proj, ctrl, cg, addr, 64, false, "", 1, cgFormat)
+								}
+								return runXrefCommand(proj, ctrl, cg, fmt.Sprintf("0x%X", addr), cgFormat)
 							}
 						}
 					}

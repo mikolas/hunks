@@ -723,11 +723,18 @@ func (p *Project) ResolveTarget(ctrl *db.Controller, input string) (uint32, bool
 		}
 	}
 
-	// 2. Check `<base>+<disp>`
+	// 2. Check `<base>+<disp>` and `<base>-<disp>`
 	if basePart, dispPart, hasPlus := strings.Cut(s, "+"); hasPlus && strings.TrimSpace(basePart) != "" {
 		if baseAddr, ok := p.ResolveTarget(ctrl, strings.TrimSpace(basePart)); ok {
 			if disp, err := ParseHex(dispPart); err == nil {
 				return baseAddr + disp, true
+			}
+		}
+	}
+	if basePart, dispPart, hasMinus := strings.Cut(s, "-"); hasMinus && strings.TrimSpace(basePart) != "" {
+		if baseAddr, ok := p.ResolveTarget(ctrl, strings.TrimSpace(basePart)); ok {
+			if disp, err := ParseHex(dispPart); err == nil && baseAddr >= disp {
+				return baseAddr - disp, true
 			}
 		}
 	}

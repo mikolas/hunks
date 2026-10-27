@@ -378,6 +378,13 @@ func registerAgentCommands(
 	rootCmd.AddCommand(dumpCmd)
 }
 
+func formatFnOffset(addr, entryAddr uint32) string {
+	if addr >= entryAddr {
+		return fmt.Sprintf("+%X", addr-entryAddr)
+	}
+	return fmt.Sprintf("-%X", entryAddr-addr)
+}
+
 func parseSignedOffset(s string) (int64, error) {
 	clean := strings.TrimSpace(s)
 	neg := false
@@ -655,7 +662,7 @@ func runSearchCommand(
 		if fAddr, ok := cg.InsnToFunc[addr]; ok {
 			if f, ok := cg.Functions[fAddr]; ok {
 				fnName = f.Name
-				fnOffStr = fmt.Sprintf("+%X", addr-f.EntryAddr)
+				fnOffStr = formatFnOffset(addr, f.EntryAddr)
 			}
 		}
 		cmt := cg.Comments[addr].EffectiveComment()
@@ -718,12 +725,12 @@ func renderDataInspection(
 ) (string, error) {
 	seg := proj.SegmentAtAddr(addr)
 	if seg == nil {
-		// Unmapped / MemoryRegion / hardware address: fall back to XREFs
-		return runXrefCommand(proj, ctrl, cg, fmt.Sprintf("0x%X", addr), format)
+		return "", fmt.Errorf("address $%X is not in any mapped binary segment (no file bytes to dump); use 'hunks xref $%X' to inspect references", addr, addr)
 	}
 	segBytes := seg.LoadBinaryData()
 	if addr < seg.Base || int(addr-seg.Base) >= len(segBytes) {
-		return runXrefCommand(proj, ctrl, cg, fmt.Sprintf("0x%X", addr), format)
+		return "", fmt.Errorf("address $%X is outside segment '%s' file payload ($%X..$%X); use 'hunks xref $%X' to inspect references",
+			addr, seg.Name, seg.Base, seg.Base+uint32(len(segBytes)), addr)
 	}
 	relOff := int(addr - seg.Base)
 	if byteLen <= 0 {
@@ -1377,7 +1384,7 @@ func formatXrefHits(
 		if fAddr, ok := cg.InsnToFunc[x.Source]; ok {
 			if f, ok := cg.Functions[fAddr]; ok {
 				fnName = f.Name
-				fnOff = fmt.Sprintf("+%X", x.Source-f.EntryAddr)
+				fnOff = formatFnOffset(x.Source, f.EntryAddr)
 			}
 		}
 		kindStr := "ADDR"
@@ -1837,7 +1844,7 @@ func runDumpCommand(proj *project.Project, section string, format string) (strin
 			if fAddr, ok := cg.InsnToFunc[addr]; ok {
 				if f, ok := cg.Functions[fAddr]; ok {
 					fnName = f.Name
-					fnOff = fmt.Sprintf("+%X", addr-f.EntryAddr)
+					fnOff = formatFnOffset(addr, f.EntryAddr)
 				}
 			}
 			userComments = append(userComments, commentEntry{

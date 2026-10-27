@@ -102,7 +102,10 @@ func TestAgentWorkflowCommands(t *testing.T) {
 		t.Fatalf("unexpected xref range json output:\n%s", xrefRange)
 	}
 
-	// 2. Test `data --copper` and `data --struct`
+	// 2. Test `data --copper`, `data --struct`, and out-of-segment error
+	if _, err := renderDataInspection(proj, ctrl, cg, 0x6B6E, 16, false, "", 1, "text"); err == nil {
+		t.Fatalf("expected out-of-segment data 0x6B6E to return an error")
+	}
 	copOut, err := renderDataInspection(proj, ctrl, cg, 0x1000C, 12, true, "", 1, "text")
 	if err != nil {
 		t.Fatal(err)
@@ -116,6 +119,12 @@ func TestAgentWorkflowCommands(t *testing.T) {
 	}
 	if !strings.Contains(structOut, "reg") || !strings.Contains(structOut, "$0180") {
 		t.Fatalf("unexpected struct decode output:\n%s", structOut)
+	}
+	if got := formatFnOffset(0x464A8, 0x465E6); got != "-13E" {
+		t.Fatalf("expected formatFnOffset(0x464A8, 0x465E6) == \"-13E\", got %q", got)
+	}
+	if warns := callgraph.VerifyABI("(d0=bogus) -> void", []string{"d1", "d2", "d3"}, []string{"d0"}, nil); len(warns) == 0 {
+		t.Fatalf("expected VerifyABI to warn when claimed input d0 is overwritten before being read")
 	}
 
 	// 3. Test `resolveStrictCommentAddr`

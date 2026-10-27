@@ -137,8 +137,12 @@ func VerifyABI(abiStr string, inRegs, modRegs, savedRegs []string) []string {
 
 	var warnings []string
 	for _, r := range extractRegs(inSection) {
-		if !slices.Contains(inRegs, r) && !slices.Contains(modRegs, r) && !slices.Contains(savedRegs, r) {
-			warnings = append(warnings, fmt.Sprintf("claimed input register %s is never read in function body", r))
+		if !slices.Contains(inRegs, r) {
+			if slices.Contains(modRegs, r) {
+				warnings = append(warnings, fmt.Sprintf("claimed input register %s is overwritten before being read in function body", r))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("claimed input register %s is never read in function body", r))
+			}
 		}
 	}
 	for _, r := range extractRegs(modSection) {
@@ -359,6 +363,12 @@ func Build(proj *project.Project) (*CallGraph, error) {
 			funcStartsSet[pt] = true
 		}
 	}
+	for lAddr, lName := range labels {
+		rawName := rawLabels[lAddr]
+		if (lName != rawName || !strings.HasPrefix(lName, "LAB_")) && !branchTargets[lAddr] && isCodeAt(lAddr) {
+			funcStartsSet[lAddr] = true
+		}
+	}
 
 	hwEquates := make(map[string]bool)
 	for k := range amiga.GetAllEquates() {
@@ -418,7 +428,9 @@ func Build(proj *project.Project) (*CallGraph, error) {
 			if !ok || cell.Type != db.CellCode {
 				continue
 			}
-			insnToFunc[addr] = entryAddr
+			if _, owned := insnToFunc[addr]; !owned {
+				insnToFunc[addr] = entryAddr
+			}
 
 			mnem := cell.MnemonicStr()
 			isTerm := isTerminator(mnem)
@@ -1243,16 +1255,17 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 		if opts.Code {
 			for _, ia := range f.InsnAddrs {
 				if c, ok := cg.Cells[ia]; ok {
-					var off, fnOff uint32
+					var off uint32
 					if ia > segBase {
 						off = ia - segBase
 					}
-					if ia > f.EntryAddr {
-						fnOff = ia - f.EntryAddr
+					fnOffStr := fmt.Sprintf("+%03X", ia-f.EntryAddr)
+					if ia < f.EntryAddr {
+						fnOffStr = fmt.Sprintf("-%03X", f.EntryAddr-ia)
 					}
 					codeLines = append(codeLines, codeLine{
 						Offset:   fmt.Sprintf("+%05X", off),
-						FnOffset: fmt.Sprintf("+%03X", fnOff),
+						FnOffset: fnOffStr,
 						Label:    cg.Labels[ia],
 						Mnemonic: c.MnemonicStr(),
 						Operands: c.OpStrVal(),
@@ -1436,14 +1449,15 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 						break
 					}
 				}
-				var off, fnOff uint32
+				var off uint32
 				if ia > segBase {
 					off = ia - segBase
 				}
-				if ia > f.EntryAddr {
-					fnOff = ia - f.EntryAddr
+				fnOffStr := fmt.Sprintf("+%03X", ia-f.EntryAddr)
+				if ia < f.EntryAddr {
+					fnOffStr = fmt.Sprintf("-%03X", f.EntryAddr-ia)
 				}
-				fmt.Fprintf(&out, "  +%05X (+%03X)  %-8s %s%s\n", off, fnOff, mnem, ops, cmt)
+				fmt.Fprintf(&out, "  +%05X (%s)  %-8s %s%s\n", off, fnOffStr, mnem, ops, cmt)
 			}
 		}
 		if f.SuspectCutoff != nil {
