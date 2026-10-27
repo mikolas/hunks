@@ -169,6 +169,7 @@ const (
 	ModalBitplaneGeometry
 	ModalBitplanePalette
 	ModalMusicRipper
+	ModalABI
 )
 
 // SearchHit represents a single search result row.
@@ -189,6 +190,7 @@ type FuncItem struct {
 	Addr   uint32
 	Name   string
 	Cycles string
+	ABI    string
 }
 
 // SubroutineCycles holds precomputed self and inclusive cycle bounds for a subroutine.
@@ -306,6 +308,7 @@ type Modal struct {
 	Bitplane          *BitplaneState
 	PixelProtocol     PixelProtocol
 	MusicRipper       MusicRipperState
+	ABIFuncLabel      string
 }
 
 // UndoKind identifies the kind of undo entry.

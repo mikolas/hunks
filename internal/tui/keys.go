@@ -31,6 +31,7 @@ func ContextMenuItems() []string {
 		"Rename            (n)",
 		"Comment           (;)",
 		"Block Comment     (:)",
+		"Function ABI      (A)",
 		"Cycle Format      (#)",
 		"───────────────────────",
 		"Export ASM        (e)",
@@ -74,9 +75,40 @@ func (a *App) executeContextAction(idx int) {
 	case 13:
 		a.openCommentModal(true)
 	case 14:
+		a.openABIModal()
+	case 15:
 		a.CycleOperandFormat()
-	case 16:
+	case 17:
 		a.ExportASM()
+	}
+}
+
+func (a *App) openABIModal() {
+	addr, ok := a.CursorAddr()
+	if !ok {
+		return
+	}
+	fnEntries := a.DB.FunctionEntries()
+	fnAddr := addr
+	if len(fnEntries) > 0 {
+		idx, found := slices.BinarySearch(fnEntries, addr)
+		if !found && idx > 0 {
+			fnAddr = fnEntries[idx-1]
+		}
+	}
+	orig, hasLbl, _ := a.DB.GetLabel(fnAddr)
+	if !hasLbl || orig == "" {
+		orig = a.Proj.AutoLabel(fnAddr)
+	}
+	current := orig
+	if ren, hasRen, _ := a.DB.GetRename(orig); hasRen && ren != "" {
+		current = ren
+	}
+	existing := a.Proj.GetFunctionABI(current, orig, a.Proj.AutoLabel(fnAddr))
+	a.Modal = Modal{
+		Kind:         ModalABI,
+		Input:        NewTextInput(existing),
+		ABIFuncLabel: current,
 	}
 }
 
@@ -176,6 +208,8 @@ func (a *App) HandleKey(key string) bool {
 		a.openCommentModal(false)
 	case ":":
 		a.openCommentModal(true)
+	case "A":
+		a.openABIModal()
 	case "#":
 		a.CycleOperandFormat()
 	case "c":
@@ -280,12 +314,40 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 					orig = a.Proj.AutoLabel(addr)
 					_ = a.DB.SetLabel(addr, orig, db.LabelLab, true)
 				}
+				oldRen, hasOldRen, _ := a.DB.GetRename(orig)
+				var oldPtr *string
+				if hasOldRen {
+					oldCopy := oldRen
+					oldPtr = &oldCopy
+				}
+				a.pushUndo(UndoEntry{Kind: UndoRename, Key: orig, OldStr: oldPtr})
 				_ = a.DB.SetRename(orig, val)
+				a.Proj.ReKeyFunctionABI(orig, val)
+				if hasOldRen && oldRen != "" {
+					a.Proj.ReKeyFunctionABI(oldRen, val)
+				}
 				_ = a.Proj.Save()
 				if an, err := analyzer.New(a.Proj, a.DB); err == nil {
 					an.ReanalyzeXrefs(addr)
 				}
 				a.ReloadAtCursor()
+			}
+		case ComponentContinue:
+			a.Modal = modal
+		}
+	case ModalABI:
+		status, val := modal.Input.HandleKey(key)
+		switch status {
+		case ComponentDone:
+			if modal.ABIFuncLabel != "" {
+				a.Proj.SetFunctionABI(modal.ABIFuncLabel, strings.TrimSpace(val))
+				_ = a.Proj.Save()
+				a.ReloadAtCursor()
+				if strings.TrimSpace(val) == "" {
+					a.StatusMsg = fmt.Sprintf("Cleared ABI for %s", modal.ABIFuncLabel)
+				} else {
+					a.StatusMsg = fmt.Sprintf("Set ABI for %s: %s", modal.ABIFuncLabel, strings.TrimSpace(val))
+				}
 			}
 		case ComponentContinue:
 			a.Modal = modal
@@ -722,12 +784,14 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 						}
 						st.Fields = append(st.Fields[:st.Selected], st.Fields[st.Selected+1:]...)
 						_ = a.Proj.Save()
+						a.ReloadAtCursor()
 					}
 				} else if st.Selected >= 0 && st.Selected < len(st.Structs) {
 					name := st.Structs[st.Selected]
 					st.Structs = append(st.Structs[:st.Selected], st.Structs[st.Selected+1:]...)
 					delete(a.Proj.Data.Structs, name)
 					_ = a.Proj.Save()
+					a.ReloadAtCursor()
 				}
 				a.Modal = modal
 			case "enter":
@@ -737,6 +801,9 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 					st.Fields = nil
 					if sMap, ok := a.Proj.Data.Structs[name]; ok {
 						for k, v := range sMap {
+							if k == "_size" {
+								continue
+							}
 							st.Fields = append(st.Fields, StructField{Offset: k, Name: v})
 						}
 						slices.SortFunc(st.Fields, func(x, y StructField) int {
@@ -832,6 +899,7 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 						return cmp.Compare(xi, yi)
 					})
 					_ = a.Proj.Save()
+					a.ReloadAtCursor()
 				}
 				st.InputMode = StructInputNone
 				st.Input = ""
@@ -869,6 +937,7 @@ func (a *App) handleModalKey(modal Modal, key string) bool {
 			if modal.ListSelect >= 0 && modal.ListSelect < len(keys) {
 				delete(a.Proj.Data.RegisterAliases, keys[modal.ListSelect])
 				_ = a.Proj.Save()
+				a.ReloadAtCursor()
 			}
 			a.Modal = modal
 		default:

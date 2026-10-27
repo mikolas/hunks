@@ -217,4 +217,24 @@ func TestBuildListingRowsSubRowOrderXrefsCoalescingAndPriority(t *testing.T) {
 		len(strRow.RawBytes) != 0 || strRow.ASCIIBox != "" || strRow.Comment != "" {
 		t.Fatalf("unexpected SubRowString at $1024: %+v", strRow)
 	}
+
+	// 5. Verify FunctionABI header row at $1006 and call-site [ABI: ...] hint at $1000
+	_ = ctrl.InsertFunction(0x1006, "SubTarget", 0)
+	proj.SetFunctionABI("SubTarget", "(d0.l=val) -> void")
+	rowsABI, _, err := BuildListingRows(proj, ctrl, seg, 120)
+	if err != nil {
+		t.Fatalf("BuildListingRows with ABI failed: %v", err)
+	}
+	var foundABIHeader, foundCallABI bool
+	for _, r := range rowsABI {
+		if r.Addr != nil && *r.Addr == 0x1006 && r.Kind == SubRowBlockComment && strings.Contains(r.Comment, "ABI: (d0.l=val) -> void") {
+			foundABIHeader = true
+		}
+		if r.Addr != nil && *r.Addr == 0x1000 && r.IsPrimary && strings.Contains(r.Comment, "[ABI: (d0.l=val) -> void]") {
+			foundCallABI = true
+		}
+	}
+	if !foundABIHeader || !foundCallABI {
+		t.Fatalf("expected ABI header at $1006 (%v) and call-site ABI at $1000 (%v)", foundABIHeader, foundCallABI)
+	}
 }

@@ -38,28 +38,168 @@ func (p AddrStringPair) MarshalJSON() ([]byte, error) {
 }
 
 type FunctionNode struct {
-	EntryAddr     uint32           `json:"entry_addr"`
-	Name          string           `json:"name"`
-	RawName       string           `json:"raw_name"`
-	IsRenamed     bool             `json:"is_renamed"`
-	IsExported    bool             `json:"is_exported"`
-	Segment       string           `json:"segment"`
-	OffsetInSeg   uint32           `json:"offset_in_seg"`
-	InsnAddrs     []uint32         `json:"insn_addrs"`
-	ByteSize      uint32           `json:"byte_size"`
-	SelfMinCycles uint32           `json:"self_min_cycles"`
-	SelfMaxCycles uint32           `json:"self_max_cycles"`
-	InclMinCycles uint32           `json:"incl_min_cycles"`
-	InclMaxCycles uint32           `json:"incl_max_cycles"`
-	HasLoop       bool             `json:"has_loop"`
-	HasIndirect   bool             `json:"has_indirect"`
-	BlockComment  *string          `json:"block_comment"`
-	Callers       []CallSite       `json:"callers"`
-	Callees       []CallSite       `json:"callees"`
-	Strings       []AddrStringPair `json:"strings"`
-	HWRegs        []string         `json:"hw_regs"`
-	IndirectCalls []AddrStringPair `json:"indirect_calls"`
-	SuspectCutoff *AddrStringPair  `json:"suspect_cutoff"`
+	EntryAddr      uint32           `json:"entry_addr"`
+	Name           string           `json:"name"`
+	RawName        string           `json:"raw_name"`
+	IsRenamed      bool             `json:"is_renamed"`
+	IsExported     bool             `json:"is_exported"`
+	Segment        string           `json:"segment"`
+	OffsetInSeg    uint32           `json:"offset_in_seg"`
+	InsnAddrs      []uint32         `json:"insn_addrs"`
+	ByteSize       uint32           `json:"byte_size"`
+	SelfMinCycles  uint32           `json:"self_min_cycles"`
+	SelfMaxCycles  uint32           `json:"self_max_cycles"`
+	InclMinCycles  uint32           `json:"incl_min_cycles"`
+	InclMaxCycles  uint32           `json:"incl_max_cycles"`
+	HasLoop        bool             `json:"has_loop"`
+	HasIndirect    bool             `json:"has_indirect"`
+	HasSMC         bool             `json:"has_smc,omitempty"`
+	ABI            string           `json:"abi,omitempty"`
+	InRegs         []string         `json:"in_regs,omitempty"`
+	ModRegs        []string         `json:"mod_regs,omitempty"`
+	SavedRegs      []string         `json:"saved_regs,omitempty"`
+	BlockComment   *string          `json:"block_comment"`
+	Callers        []CallSite       `json:"callers"`
+	Callees        []CallSite       `json:"callees"`
+	Strings        []AddrStringPair `json:"strings"`
+	HWRegs         []string         `json:"hw_regs"`
+	GlobalsRead    []AddrStringPair `json:"globals_read,omitempty"`
+	GlobalsWritten []AddrStringPair `json:"globals_written,omitempty"`
+	DataAddrs      []AddrStringPair `json:"data_addrs,omitempty"`
+	IndirectCalls  []AddrStringPair `json:"indirect_calls"`
+	SuspectCutoff  *AddrStringPair  `json:"suspect_cutoff"`
+}
+
+func regMaskNames(mask m68k.RegMask) []string {
+	var out []string
+	for r := uint8(0); r < 8; r++ {
+		if (mask & m68k.RegD(r)) != 0 {
+			out = append(out, m68k.RegDName(r))
+		}
+	}
+	for r := uint8(0); r < 7; r++ {
+		if (mask & m68k.RegA(r)) != 0 {
+			out = append(out, m68k.RegAName(r))
+		}
+	}
+	return out
+}
+
+func (f *FunctionNode) StaticABISummary() string {
+	var parts []string
+	if len(f.InRegs) > 0 {
+		parts = append(parts, "in: "+strings.Join(f.InRegs, ","))
+	} else {
+		parts = append(parts, "in: none")
+	}
+	if len(f.ModRegs) > 0 {
+		parts = append(parts, "mod: "+strings.Join(f.ModRegs, ","))
+	} else {
+		parts = append(parts, "mod: none")
+	}
+	if len(f.SavedRegs) > 0 {
+		parts = append(parts, "saved: "+strings.Join(f.SavedRegs, ","))
+	}
+	return strings.Join(parts, " | ")
+}
+
+// VerifyABI checks a free-form ABI string against statically inferred InRegs and ModRegs
+// and returns human-readable contradiction warnings (or nil if consistent).
+func VerifyABI(abiStr string, inRegs, modRegs, savedRegs []string) []string {
+	lower := strings.ToLower(abiStr)
+	inSection := lower
+	var modSection string
+	for _, sep := range []string{"clobbers:", "clobber:", "mod:", "modifies:"} {
+		if before, after, ok := strings.Cut(inSection, sep); ok {
+			inSection = before
+			modSection = after
+			break
+		}
+	}
+	if before, _, ok := strings.Cut(inSection, "->"); ok {
+		inSection = before
+	}
+
+	isValidReg := func(tok string) bool {
+		if len(tok) != 2 {
+			return false
+		}
+		if tok[0] == 'd' {
+			return tok[1] >= '0' && tok[1] <= '7'
+		}
+		if tok[0] == 'a' {
+			return tok[1] >= '0' && tok[1] <= '6'
+		}
+		return false
+	}
+
+	extractRegs := func(s string) []string {
+		tokens := strings.FieldsFunc(s, func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-'
+		})
+		var regs []string
+		addReg := func(r string) {
+			if isValidReg(r) && !slices.Contains(regs, r) {
+				regs = append(regs, r)
+			}
+		}
+		for _, tok := range tokens {
+			if startR, endR, hasDash := strings.Cut(tok, "-"); hasDash {
+				if isValidReg(startR) {
+					if len(endR) == 1 && endR[0] >= '0' && endR[0] <= '7' {
+						endR = string(startR[0]) + endR
+					}
+					if isValidReg(endR) && startR[0] == endR[0] && startR[1] <= endR[1] {
+						for ch := startR[1]; ch <= endR[1]; ch++ {
+							addReg(string([]byte{startR[0], ch}))
+						}
+						continue
+					}
+				}
+				for _, sub := range strings.Split(tok, "-") {
+					addReg(sub)
+				}
+				continue
+			}
+			addReg(tok)
+		}
+		return regs
+	}
+
+	var warnings []string
+	for _, r := range extractRegs(inSection) {
+		if !slices.Contains(inRegs, r) {
+			if slices.Contains(modRegs, r) {
+				warnings = append(warnings, fmt.Sprintf("claimed input register %s is overwritten before being read in function body", r))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("claimed input register %s is never read in function body", r))
+			}
+		}
+	}
+	for _, r := range extractRegs(modSection) {
+		if !slices.Contains(modRegs, r) {
+			warnings = append(warnings, fmt.Sprintf("claimed clobbered register %s is never written (or is callee-saved)", r))
+		}
+	}
+	return warnings
+}
+
+type IndirectSiteInfo struct {
+	Addr        uint32   `json:"addr"`
+	Segment     string   `json:"segment"`
+	OffsetInSeg uint32   `json:"offset_in_seg"`
+	FuncName    string   `json:"func_name"`
+	FnOffset    string   `json:"fn_offset"`
+	InsnText    string   `json:"insn"`
+	Status      string   `json:"status"`
+	Targets     []string `json:"targets"`
+}
+
+func formatFnOffset(addr, entryAddr uint32) string {
+	if addr >= entryAddr {
+		return fmt.Sprintf("+%X", addr-entryAddr)
+	}
+	return fmt.Sprintf("-%X", entryAddr-addr)
 }
 
 func formatCycleSpan(lo, hi uint32) string {
@@ -106,14 +246,15 @@ func (f *FunctionNode) FormatLoc() string {
 }
 
 type CallGraph struct {
-	Functions  map[uint32]*FunctionNode
-	FuncAddrs  []uint32
-	InsnToFunc map[uint32]uint32
-	Cells      map[uint32]db.Cell
-	Comments   map[uint32]db.AddressComment
-	CellsTree  *btree.BTreeG[db.Cell]
-	Labels     map[uint32]string
-	RawLabels  map[uint32]string
+	Functions     map[uint32]*FunctionNode
+	FuncAddrs     []uint32
+	InsnToFunc    map[uint32]uint32
+	Cells         map[uint32]db.Cell
+	Comments      map[uint32]db.AddressComment
+	CellsTree     *btree.BTreeG[db.Cell]
+	Labels        map[uint32]string
+	RawLabels     map[uint32]string
+	IndirectSites []IndirectSiteInfo
 }
 
 type Options struct {
@@ -126,6 +267,7 @@ type Options struct {
 	Anchors   bool
 	Ready     bool
 	Suspect   bool
+	Indirect  bool
 	Unrenamed bool
 	Limit     int
 	Format    string
@@ -134,6 +276,11 @@ type Options struct {
 type edgeTarget struct {
 	target uint32
 	kind   db.EdgeKind
+}
+
+type xrefTarget struct {
+	addr uint32
+	kind db.XrefKind
 }
 
 // Build constructs the complete CallGraph for `proj`'s active address space.
@@ -156,7 +303,7 @@ func Build(proj *project.Project) (*CallGraph, error) {
 	edgesBySrc := make(map[uint32][]edgeTarget)
 	callTargets := make(map[uint32]bool)
 	branchTargets := make(map[uint32]bool)
-	xrefsBySrc := make(map[uint32][]AddrStringPair)
+	xrefsBySrc := make(map[uint32][]xrefTarget)
 	pointerTargets := make(map[uint32]bool)
 	jmpTableBases := make(map[string]uint32)
 
@@ -166,56 +313,60 @@ func Build(proj *project.Project) (*CallGraph, error) {
 			continue
 		}
 		seenDBs[seg.DB] = true
-		ctrl, err := db.New(seg.DB)
-		if err != nil {
+		if err := func(dbPath string) error {
+			ctrl, err := db.New(dbPath)
+			if err != nil {
+				return err
+			}
+			defer ctrl.Close()
+			proj.SyncDBScope(ctrl)
+
+			allCells, err := ctrl.GetAllCells()
+			if err != nil {
+				return err
+			}
+			for _, c := range allCells {
+				cells[c.Addr] = c
+				cellsTree.ReplaceOrInsert(c)
+			}
+
+			for _, lb := range ctrl.AllLabelsWithExport() {
+				rawLabels[lb.Addr] = lb.Name
+				if lb.IsExported {
+					exportedSet[lb.Addr] = true
+				}
+			}
+
+			if resolvedMap, err := ctrl.GetAllLabelsResolved(); err == nil {
+				maps.Copy(labels, resolvedMap)
+			}
+			if cmts, err := ctrl.GetAllTargetComments(); err == nil {
+				maps.Copy(comments, cmts)
+			}
+
+			for _, e := range ctrl.AllEdgesNoFallthrough() {
+				if e.Kind == db.EdgeCall {
+					callTargets[e.Target] = true
+				} else {
+					branchTargets[e.Target] = true
+				}
+				edgesBySrc[e.Source] = append(edgesBySrc[e.Source], edgeTarget{target: e.Target, kind: e.Kind})
+			}
+
+			for _, x := range ctrl.AllXrefs() {
+				if srcCell, ok := cells[x.Source]; ok && srcCell.Type == db.CellPointer {
+					pointerTargets[x.Target] = true
+				}
+				xrefsBySrc[x.Source] = append(xrefsBySrc[x.Source], xrefTarget{
+					addr: x.Target,
+					kind: x.Kind,
+				})
+			}
+			maps.Copy(jmpTableBases, ctrl.DetectJumpVectorBases())
+			return nil
+		}(seg.DB); err != nil {
 			return nil, err
 		}
-		proj.SyncDBScope(ctrl)
-
-		allCells, err := ctrl.GetAllCells()
-		if err != nil {
-			_ = ctrl.Close()
-			return nil, err
-		}
-		for _, c := range allCells {
-			cells[c.Addr] = c
-			cellsTree.ReplaceOrInsert(c)
-		}
-
-		for _, lb := range ctrl.AllLabelsWithExport() {
-			rawLabels[lb.Addr] = lb.Name
-			if lb.IsExported {
-				exportedSet[lb.Addr] = true
-			}
-		}
-
-		if resolvedMap, err := ctrl.GetAllLabelsResolved(); err == nil {
-			maps.Copy(labels, resolvedMap)
-		}
-		if cmts, err := ctrl.GetAllTargetComments(); err == nil {
-			maps.Copy(comments, cmts)
-		}
-
-		for _, e := range ctrl.AllEdgesNoFallthrough() {
-			if e.Kind == db.EdgeCall {
-				callTargets[e.Target] = true
-			} else {
-				branchTargets[e.Target] = true
-			}
-			edgesBySrc[e.Source] = append(edgesBySrc[e.Source], edgeTarget{target: e.Target, kind: e.Kind})
-		}
-
-		for _, x := range ctrl.AllXrefs() {
-			if srcCell, ok := cells[x.Source]; ok && srcCell.Type == db.CellPointer {
-				pointerTargets[x.Target] = true
-			}
-			xrefsBySrc[x.Source] = append(xrefsBySrc[x.Source], AddrStringPair{
-				Addr: x.Target,
-				Text: x.Kind.AsStr(),
-			})
-		}
-		maps.Copy(jmpTableBases, ctrl.DetectJumpVectorBases())
-		_ = ctrl.Close()
 	}
 
 	activeSegs := proj.ActiveSegments()
@@ -259,6 +410,12 @@ func Build(proj *project.Project) (*CallGraph, error) {
 			funcStartsSet[pt] = true
 		}
 	}
+	for lAddr, lName := range labels {
+		rawName := rawLabels[lAddr]
+		if (lName != rawName || !strings.HasPrefix(lName, "LAB_")) && !branchTargets[lAddr] && isCodeAt(lAddr) {
+			funcStartsSet[lAddr] = true
+		}
+	}
 
 	hwEquates := make(map[string]bool)
 	for k := range amiga.GetAllEquates() {
@@ -283,7 +440,7 @@ func Build(proj *project.Project) (*CallGraph, error) {
 			}
 		}
 		if trampXrefs := xrefsBySrc[trampAddr+2]; len(trampXrefs) > 0 {
-			return regStr, disp, trampXrefs[0].Addr, true
+			return regStr, disp, trampXrefs[0].addr, true
 		}
 		if isCodeAt(trampAddr) {
 			return regStr, disp, trampAddr, true
@@ -318,7 +475,9 @@ func Build(proj *project.Project) (*CallGraph, error) {
 			if !ok || cell.Type != db.CellCode {
 				continue
 			}
-			insnToFunc[addr] = entryAddr
+			if _, owned := insnToFunc[addr]; !owned {
+				insnToFunc[addr] = entryAddr
+			}
 
 			mnem := cell.MnemonicStr()
 			isTerm := isTerminator(mnem)
@@ -391,11 +550,16 @@ func Build(proj *project.Project) (*CallGraph, error) {
 
 		stringMap := make(map[uint32]string)
 		hwSet := make(map[string]bool)
+		globalsReadMap := make(map[uint32]string)
+		globalsWriteMap := make(map[uint32]string)
+		dataAddrMap := make(map[uint32]string)
 		var indirectCalls []AddrStringPair
 		var selfMinCyc, selfMaxCyc uint32
+		var inMask, modMask, savedMask m68k.RegMask
 		hasLoop := false
+		hasSMC := false
 
-		for _, ia := range insnAddrs {
+		for insnIdx, ia := range insnAddrs {
 			cell, ok := cells[ia]
 			if !ok {
 				continue
@@ -417,6 +581,20 @@ func Build(proj *project.Project) (*CallGraph, error) {
 				}
 			}
 			if insn, ok := m68k.Decode(raw, ia); ok {
+				isEntrySave := insnIdx <= 2 && insn.Op == m68k.OpMOVEM && insn.NumOps == 2 && insn.Ops[1].Mode == m68k.EAPreDec && insn.Ops[1].Reg == 7
+				isExitRestore := insn.Op == m68k.OpMOVEM && insn.NumOps == 2 && insn.Ops[0].Mode == m68k.EAPostInc && insn.Ops[0].Reg == 7
+				if isEntrySave {
+					savedMask |= insn.ReadRegs &^ m68k.RegA(7)
+				} else if !isExitRestore {
+					rMask := insn.ReadRegs &^ m68k.RegA(7)
+					if (insn.Op == m68k.OpSUB || insn.Op == m68k.OpEOR) && insn.NumOps == 2 &&
+						insn.Ops[0].Mode == insn.Ops[1].Mode && insn.Ops[0].Reg == insn.Ops[1].Reg {
+						rMask = 0
+					}
+					inMask |= rMask &^ modMask
+					modMask |= insn.WriteRegs &^ m68k.RegA(7)
+				}
+
 				t := insn.Timing()
 				switch t.Kind {
 				case m68k.TimingBranch, m68k.TimingRange:
@@ -469,23 +647,58 @@ func Build(proj *project.Project) (*CallGraph, error) {
 					hwSet[tok] = true
 				}
 			}
+			if ac, ok := comments[ia]; ok && strings.Contains(ac.EffectiveComment(), "[SMC]") {
+				hasSMC = true
+			}
 
 			for subAddr := ia; subAddr < ia+cell.Size; subAddr++ {
 				for _, xr := range xrefsBySrc[subAddr] {
-					if tgtCell, ok := cells[xr.Addr]; ok && tgtCell.Type == db.CellStr {
-						sVal := extractStringPreview(proj, xr.Addr, &tgtCell, segDataCache)
+					if _, isHW := amiga.GetAmigaHWLabel(xr.addr); isHW {
+						continue
+					}
+					if xr.addr >= 0xDFF000 && xr.addr <= 0xDFF1FF {
+						continue
+					}
+					if tgtCell, ok := cells[xr.addr]; ok && tgtCell.Type == db.CellStr {
+						sVal := extractStringPreview(proj, xr.addr, &tgtCell, segDataCache)
 						if sVal != "" {
-							stringMap[xr.Addr] = sVal
+							stringMap[xr.addr] = sVal
+							continue
 						}
+					}
+					lbl := labels[xr.addr]
+					switch xr.kind {
+					case db.XrefDataRead:
+						globalsReadMap[xr.addr] = lbl
+					case db.XrefDataWrite:
+						globalsWriteMap[xr.addr] = lbl
+						if tgtCell, ok := cells[xr.addr]; ok && tgtCell.Type == db.CellCode {
+							hasSMC = true
+						}
+					case db.XrefDataAddr:
+						dataAddrMap[xr.addr] = lbl
 					}
 				}
 			}
 		}
+		modMask &^= savedMask
 
 		strAddrs := slices.Sorted(maps.Keys(stringMap))
 		stringsList := make([]AddrStringPair, len(strAddrs))
 		for i, a := range strAddrs {
 			stringsList[i] = AddrStringPair{Addr: a, Text: stringMap[a]}
+		}
+
+		toSortedPairs := func(m map[uint32]string) []AddrStringPair {
+			if len(m) == 0 {
+				return nil
+			}
+			keys := slices.Sorted(maps.Keys(m))
+			res := make([]AddrStringPair, len(keys))
+			for i, a := range keys {
+				res[i] = AddrStringPair{Addr: a, Text: m[a]}
+			}
+			return res
 		}
 
 		hwRegs := slices.Sorted(maps.Keys(hwSet))
@@ -500,28 +713,36 @@ func Build(proj *project.Project) (*CallGraph, error) {
 		}
 
 		return &FunctionNode{
-			EntryAddr:     entryAddr,
-			Name:          name,
-			RawName:       rawName,
-			IsRenamed:     isRenamed,
-			IsExported:    isExported,
-			Segment:       segName,
-			OffsetInSeg:   offsetInSeg,
-			InsnAddrs:     insnAddrs,
-			ByteSize:      byteSize,
-			SelfMinCycles: selfMinCyc,
-			SelfMaxCycles: selfMaxCyc,
-			InclMinCycles: selfMinCyc,
-			InclMaxCycles: selfMaxCyc,
-			HasLoop:       hasLoop,
-			HasIndirect:   len(indirectCalls) > 0,
-			BlockComment:  blockComment,
-			Callers:       []CallSite{},
-			Callees:       []CallSite{},
-			Strings:       stringsList,
-			HWRegs:        hwRegs,
-			IndirectCalls: indirectCalls,
-			SuspectCutoff: suspectCutoff,
+			EntryAddr:      entryAddr,
+			Name:           name,
+			RawName:        rawName,
+			IsRenamed:      isRenamed,
+			IsExported:     isExported,
+			Segment:        segName,
+			OffsetInSeg:    offsetInSeg,
+			InsnAddrs:      insnAddrs,
+			ByteSize:       byteSize,
+			SelfMinCycles:  selfMinCyc,
+			SelfMaxCycles:  selfMaxCyc,
+			InclMinCycles:  selfMinCyc,
+			InclMaxCycles:  selfMaxCyc,
+			HasLoop:        hasLoop,
+			HasIndirect:    len(indirectCalls) > 0,
+			HasSMC:         hasSMC,
+			ABI:            proj.GetFunctionABI(name, rawName, proj.AutoLabel(entryAddr)),
+			InRegs:         regMaskNames(inMask),
+			ModRegs:        regMaskNames(modMask),
+			SavedRegs:      regMaskNames(savedMask),
+			BlockComment:   blockComment,
+			Callers:        []CallSite{},
+			Callees:        []CallSite{},
+			Strings:        stringsList,
+			HWRegs:         hwRegs,
+			GlobalsRead:    toSortedPairs(globalsReadMap),
+			GlobalsWritten: toSortedPairs(globalsWriteMap),
+			DataAddrs:      toSortedPairs(dataAddrMap),
+			IndirectCalls:  indirectCalls,
+			SuspectCutoff:  suspectCutoff,
 		}
 	}
 
@@ -705,15 +926,101 @@ func Build(proj *project.Project) (*CallGraph, error) {
 		f.HasIndirect = res.hasIndirect
 	}
 
+	// Collect all indirect/trampoline dispatch sites across active functions.
+	indirectSiteSet := make(map[uint32]bool)
+	for _, s := range proj.Data.Analysis.IndirectAddressing {
+		if a, err := project.ParseHex(s); err == nil {
+			indirectSiteSet[a] = true
+		}
+	}
+	for _, fAddr := range funcAddrs {
+		f := functions[fAddr]
+		for _, ic := range f.IndirectCalls {
+			indirectSiteSet[ic.Addr] = true
+		}
+		for _, ia := range f.InsnAddrs {
+			if c, ok := cells[ia]; ok {
+				mnem := c.MnemonicStr()
+				opStr := c.OpStrVal()
+				if mnem == "jsr" || mnem == "jmp" {
+					if strings.Contains(opStr, "(") {
+						indirectSiteSet[ia] = true
+					}
+				}
+			}
+		}
+	}
+	var indirectSites []IndirectSiteInfo
+	for _, ia := range slices.Sorted(maps.Keys(indirectSiteSet)) {
+		c, ok := cells[ia]
+		if !ok || c.Type != db.CellCode {
+			continue
+		}
+		seg := proj.SegmentAtAddr(ia)
+		segName := "?"
+		var offInSeg uint32
+		if seg != nil {
+			segName = seg.Name
+			if ia >= seg.Base {
+				offInSeg = ia - seg.Base
+			}
+		}
+		var fnName, fnOff string
+		if fAddr, ok := insnToFunc[ia]; ok {
+			if f, ok := functions[fAddr]; ok {
+				fnName = f.QualifiedName()
+				fnOff = formatFnOffset(ia, f.EntryAddr)
+			}
+		}
+		mnem := c.MnemonicStr()
+		opStr := c.OpStrVal()
+		var targets []string
+		for _, e := range edgesBySrc[ia] {
+			if e.kind == db.EdgeCall || e.kind == db.EdgeUncond {
+				lbl := labels[e.target]
+				if lbl == "" {
+					lbl = proj.AutoLabel(e.target)
+				}
+				if !slices.Contains(targets, lbl) {
+					targets = append(targets, lbl)
+				}
+			}
+		}
+		if len(targets) == 0 {
+			if _, _, realTgt, ok := resolveVectoredCall(opStr); ok {
+				lbl := labels[realTgt]
+				if lbl == "" {
+					lbl = proj.AutoLabel(realTgt)
+				}
+				targets = append(targets, lbl)
+			}
+		}
+		status := "unresolved"
+		if len(targets) > 0 {
+			status = "resolved"
+		}
+		indirectSites = append(indirectSites, IndirectSiteInfo{
+			Addr:        ia,
+			Segment:     segName,
+			OffsetInSeg: offInSeg,
+			FuncName:    fnName,
+			FnOffset:    fnOff,
+			InsnText:    strings.TrimSpace(mnem + " " + opStr),
+			Status:      status,
+			Targets:     targets,
+		})
+	}
+
 	return &CallGraph{
-		Functions:  functions,
-		FuncAddrs:  funcAddrs,
-		InsnToFunc: insnToFunc,
-		Cells:      cells,
-		Comments:   comments,
-		CellsTree:  cellsTree,
-		Labels:     labels,
-		RawLabels:  rawLabels,
+		Functions:     functions,
+		FuncAddrs:     funcAddrs,
+		InsnToFunc:    insnToFunc,
+		Cells:         cells,
+		Comments:      comments,
+		CellsTree:     cellsTree,
+		Labels:        labels,
+		RawLabels:     rawLabels,
+		IndirectSites: indirectSites,
 	}, nil
 }
 
@@ -907,6 +1214,9 @@ func (cg *CallGraph) ResolveTarget(proj *project.Project, target string, segFilt
 
 func (cg *CallGraph) Render(proj *project.Project, opts *Options) (string, error) {
 	normSeg := NormalizeSegmentFilter(opts.Segment)
+	if opts.Indirect {
+		return cg.renderIndirect(opts, normSeg)
+	}
 	if opts.Target != "" {
 		funcAddr, ok := cg.ResolveTarget(proj, opts.Target, normSeg)
 		if !ok {
@@ -917,6 +1227,49 @@ func (cg *CallGraph) Render(proj *project.Project, opts *Options) (string, error
 	return cg.renderWorklist(opts, normSeg)
 }
 
+func (cg *CallGraph) renderIndirect(opts *Options, normSeg string) (string, error) {
+	var sites []IndirectSiteInfo
+	var resolvedCnt, unresolvedCnt int
+	for _, s := range cg.IndirectSites {
+		if normSeg != "" && !strings.EqualFold(s.Segment, normSeg) {
+			continue
+		}
+		if s.Status == "resolved" {
+			resolvedCnt++
+		} else {
+			unresolvedCnt++
+		}
+		sites = append(sites, s)
+	}
+	if opts.Format == "json" {
+		payload := map[string]any{
+			"total":      len(sites),
+			"resolved":   resolvedCnt,
+			"unresolved": unresolvedCnt,
+			"sites":      sites,
+		}
+		b, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+	var out strings.Builder
+	fmt.Fprintf(&out, "=== Indirect Dispatch Sites (%d total: %d resolved, %d unresolved) ===\n", len(sites), resolvedCnt, unresolvedCnt)
+	for _, s := range sites {
+		fnCtx := ""
+		if s.FuncName != "" {
+			fnCtx = fmt.Sprintf("[%s%s]", s.FuncName, s.FnOffset)
+		}
+		if s.Status == "resolved" {
+			fmt.Fprintf(&out, "  +%05X  %-24s %-22s -> %s (resolved)\n", s.OffsetInSeg, fnCtx, s.InsnText, strings.Join(s.Targets, ", "))
+		} else {
+			fmt.Fprintf(&out, "  +%05X  %-24s %-22s -> [UNRESOLVED]\n", s.OffsetInSeg, fnCtx, s.InsnText)
+		}
+	}
+	return out.String(), nil
+}
+
 func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *Options) (string, error) {
 	f := cg.Functions[funcAddr]
 	segBase := f.EntryAddr - f.OffsetInSeg
@@ -924,6 +1277,7 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 	if opts.Format == "json" {
 		type codeLine struct {
 			Offset   string `json:"offset"`
+			FnOffset string `json:"fn_offset"`
 			Label    string `json:"label"`
 			Mnemonic string `json:"mnemonic"`
 			Operands string `json:"operands"`
@@ -937,12 +1291,36 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 					if ia > segBase {
 						off = ia - segBase
 					}
+					fnOffStr := fmt.Sprintf("+%03X", ia-f.EntryAddr)
+					if ia < f.EntryAddr {
+						fnOffStr = fmt.Sprintf("-%03X", f.EntryAddr-ia)
+					}
+					ops := proj.ApplyStructAliasesToOpStr(c.OpStrVal(), f.Name, f.RawName)
+					cmt := cg.Comments[ia].EffectiveComment()
+					for _, site := range f.Callees {
+						if site.CallInsn == ia {
+							if tf, ok := cg.Functions[site.TargetFunc]; ok {
+								if cmt == "" && (tf.Segment != f.Segment || strings.Contains(ops, "(")) {
+									cmt = fmt.Sprintf("-> %s", tf.QualifiedName())
+								}
+								if tf.ABI != "" && !strings.Contains(cmt, "ABI:") {
+									if cmt == "" {
+										cmt = fmt.Sprintf("[ABI: %s]", tf.ABI)
+									} else {
+										cmt += fmt.Sprintf(" [ABI: %s]", tf.ABI)
+									}
+								}
+							}
+							break
+						}
+					}
 					codeLines = append(codeLines, codeLine{
 						Offset:   fmt.Sprintf("+%05X", off),
+						FnOffset: fnOffStr,
 						Label:    cg.Labels[ia],
 						Mnemonic: c.MnemonicStr(),
-						Operands: c.OpStrVal(),
-						Comment:  cg.Comments[ia].EffectiveComment(),
+						Operands: ops,
+						Comment:  cmt,
 					})
 				}
 			}
@@ -1004,6 +1382,12 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 			fmt.Fprintf(&out, "  ; %s\n", line)
 		}
 	}
+	if f.ABI != "" {
+		fmt.Fprintf(&out, "  ABI:            %s\n", f.ABI)
+	}
+	if staticABI := f.StaticABISummary(); staticABI != "" {
+		fmt.Fprintf(&out, "  Regs (static):  %s\n", staticABI)
+	}
 	if len(f.Strings) > 0 {
 		strs := make([]string, len(f.Strings))
 		for i, sp := range f.Strings {
@@ -1053,6 +1437,35 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 		cg.fmtCalleesTree(&out, funcAddr, 1, opts.Depth, visited)
 	}
 
+	if len(f.GlobalsRead) > 0 || len(f.GlobalsWritten) > 0 || len(f.DataAddrs) > 0 {
+		out.WriteString("\n=== Globals & Memory Flow ===\n")
+		fmtGlobals := func(items []AddrStringPair) string {
+			limit := min(12, len(items))
+			parts := make([]string, limit)
+			for i, p := range items[:limit] {
+				if p.Text != "" {
+					parts[i] = fmt.Sprintf("$%X (%s)", p.Addr, p.Text)
+				} else {
+					parts[i] = fmt.Sprintf("$%X", p.Addr)
+				}
+			}
+			s := strings.Join(parts, ", ")
+			if len(items) > limit {
+				s += fmt.Sprintf(" (+%d more)", len(items)-limit)
+			}
+			return s
+		}
+		if len(f.GlobalsRead) > 0 {
+			fmt.Fprintf(&out, "  Reads:     %s\n", fmtGlobals(f.GlobalsRead))
+		}
+		if len(f.GlobalsWritten) > 0 {
+			fmt.Fprintf(&out, "  Writes:    %s\n", fmtGlobals(f.GlobalsWritten))
+		}
+		if len(f.DataAddrs) > 0 {
+			fmt.Fprintf(&out, "  Addresses: %s\n", fmtGlobals(f.DataAddrs))
+		}
+	}
+
 	// 4. Optional Disassembly & Caller Context (--code)
 	if opts.Code {
 		out.WriteString("\n=== Disassembly ===\n")
@@ -1065,28 +1478,37 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 				if mnem == "" {
 					mnem = "?"
 				}
-				ops := cell.OpStrVal()
+				ops := proj.ApplyStructAliasesToOpStr(cell.OpStrVal(), f.Name, f.RawName)
 				var cmt string
 				if eff := cg.Comments[ia].EffectiveComment(); eff != "" {
 					cmt = fmt.Sprintf(" ; %s", eff)
 				}
-				if cmt == "" {
-					for _, site := range f.Callees {
-						if site.CallInsn == ia {
-							if tf, ok := cg.Functions[site.TargetFunc]; ok {
-								if tf.Segment != f.Segment || strings.Contains(ops, "(") {
-									cmt = fmt.Sprintf(" ; -> %s", tf.QualifiedName())
+				for _, site := range f.Callees {
+					if site.CallInsn == ia {
+						if tf, ok := cg.Functions[site.TargetFunc]; ok {
+							if cmt == "" && (tf.Segment != f.Segment || strings.Contains(ops, "(")) {
+								cmt = fmt.Sprintf(" ; -> %s", tf.QualifiedName())
+							}
+							if tf.ABI != "" && !strings.Contains(cmt, "ABI:") {
+								if cmt == "" {
+									cmt = fmt.Sprintf(" ; [ABI: %s]", tf.ABI)
+								} else {
+									cmt += fmt.Sprintf(" [ABI: %s]", tf.ABI)
 								}
 							}
-							break
 						}
+						break
 					}
 				}
 				var off uint32
 				if ia > segBase {
 					off = ia - segBase
 				}
-				fmt.Fprintf(&out, "  +%05X  %-8s %s%s\n", off, mnem, ops, cmt)
+				fnOffStr := fmt.Sprintf("+%03X", ia-f.EntryAddr)
+				if ia < f.EntryAddr {
+					fnOffStr = fmt.Sprintf("-%03X", f.EntryAddr-ia)
+				}
+				fmt.Fprintf(&out, "  +%05X (%s)  %-8s %s%s\n", off, fnOffStr, mnem, ops, cmt)
 			}
 		}
 		if f.SuspectCutoff != nil {
@@ -1100,7 +1522,7 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 				if mnem == "" {
 					mnem = cell.Type.AsStr()
 				}
-				ops := cell.OpStrVal()
+				ops := proj.ApplyStructAliasesToOpStr(cell.OpStrVal(), f.Name, f.RawName)
 				var off uint32
 				if cell.Addr > segBase {
 					off = cell.Addr - segBase
@@ -1137,13 +1559,18 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 							if ca == site.CallInsn {
 								marker = ">>"
 							}
+							var cmt string
+							if eff := cg.Comments[ca].EffectiveComment(); eff != "" {
+								cmt = fmt.Sprintf(" ; %s", eff)
+							}
 							fmt.Fprintf(
 								&out,
-								"  %s +%05X: %-8s %s\n",
+								"  %s +%05X: %-8s %s%s\n",
 								marker,
 								ca-cfSegBase,
 								cell.MnemonicStr(),
 								cell.OpStrVal(),
+								cmt,
 							)
 						}
 						return true
@@ -1228,6 +1655,12 @@ func (cg *CallGraph) fmtCalleesTree(
 				n := min(4, len(tf.HWRegs))
 				hwTag = fmt.Sprintf(" | HW: %s", strings.Join(tf.HWRegs[:n], ","))
 			}
+			abiTag := ""
+			if tf.ABI != "" {
+				abiTag = fmt.Sprintf(" | ABI: %s", tf.ABI)
+			} else if len(tf.InRegs) > 0 {
+				abiTag = fmt.Sprintf(" | in:%s", strings.Join(tf.InRegs, ","))
+			}
 			cmtTag := ""
 			if tf.BlockComment != nil && *tf.BlockComment != "" {
 				firstLine, _, _ := strings.Cut(*tf.BlockComment, "\n")
@@ -1240,13 +1673,14 @@ func (cg *CallGraph) fmtCalleesTree(
 			}
 			fmt.Fprintf(
 				out,
-				"%s├──► %s (%s | %d insts%s%s%s)%s\n",
+				"%s├──► %s (%s | %d insts%s%s%s%s)%s\n",
 				indent,
 				tf.QualifiedName(),
 				site.Kind,
 				len(tf.InsnAddrs),
 				leafTag,
 				hwTag,
+				abiTag,
 				cyc,
 				cmtTag,
 			)

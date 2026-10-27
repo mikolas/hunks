@@ -221,7 +221,12 @@ func (a *App) OpenFunctions() {
 		if sc, ok := a.SubCycles[addr]; ok {
 			cycStr = sc.FormatSummary()
 		}
-		funcs[i] = FuncItem{Addr: addr, Name: name, Cycles: cycStr}
+		funcs[i] = FuncItem{
+			Addr:   addr,
+			Name:   name,
+			Cycles: cycStr,
+			ABI:    a.Proj.GetFunctionABI(name, a.Proj.AutoLabel(addr)),
+		}
 	}
 	a.Modal = Modal{
 		Kind:       ModalFunctions,
@@ -411,17 +416,27 @@ func (a *App) searchBytes(content string, targetSeg *project.Segment, rng *db.Ad
 
 func (a *App) searchCluster(preset string, rng *db.AddrRange) []SearchHit {
 	var sig clusterSig
-	switch strings.TrimSpace(preset) {
-	case "3dmath":
+	switch strings.ToLower(strings.TrimSpace(preset)) {
+	case "3dmath", "math", "trig", "sin", "cos":
 		sig = clusterSig{mnems: []string{"mul", "div"}}
+	case "mul":
+		sig = clusterSig{mnems: []string{"mul"}}
+	case "div":
+		sig = clusterSig{mnems: []string{"div"}}
 	case "blitter":
 		sig = clusterSig{offs: [][2]uint16{{0x040, 0x074}}}
 	case "copper":
 		sig = clusterSig{offs: [][2]uint16{{0x080, 0x08A}}}
-	case "bitplane":
-		sig = clusterSig{offs: [][2]uint16{{0x08E, 0x094}, {0x0E0, 0x0FE}, {0x100, 0x10A}}}
-	case "audio":
-		sig = clusterSig{offs: [][2]uint16{{0x0A0, 0x0DF}}}
+	case "bitplane", "display", "video":
+		sig = clusterSig{offs: [][2]uint16{{0x08E, 0x094}, {0x0E0, 0x0FE}, {0x100, 0x10A}, {0x180, 0x1BE}}}
+	case "audio", "paula":
+		sig = clusterSig{offs: [][2]uint16{{0x0A0, 0x0DF}, {0x09E, 0x09E}}}
+	case "sprite", "sprites":
+		sig = clusterSig{offs: [][2]uint16{{0x120, 0x17E}}}
+	case "dma":
+		sig = clusterSig{offs: [][2]uint16{{0x002, 0x002}, {0x096, 0x096}}}
+	case "irq", "interrupt":
+		sig = clusterSig{offs: [][2]uint16{{0x01C, 0x01E}, {0x09A, 0x09C}}}
 	default:
 		return nil
 	}

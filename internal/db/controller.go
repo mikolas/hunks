@@ -1035,7 +1035,10 @@ func (c *Controller) FirstXrefTargetIn(start, end uint32) (uint32, bool) {
 	seg := c.SegOf(start)
 	var target uint32
 	err := c.conn.QueryRow(
-		"SELECT target_addr FROM xrefs WHERE seg = ?1 AND source_addr >= ?2 AND source_addr < ?3 LIMIT 1",
+		`SELECT target_addr FROM xrefs
+		 WHERE seg = ?1 AND source_addr >= ?2 AND source_addr < ?3
+		 ORDER BY CASE type WHEN 'CODE_CALL' THEN 0 WHEN 'CODE_BRANCH' THEN 1 WHEN 'DATA_ADDR' THEN 2 ELSE 3 END, source_addr ASC
+		 LIMIT 1`,
 		seg, start, end,
 	).Scan(&target)
 	if err != nil {
@@ -2315,4 +2318,61 @@ func (c *Controller) GetSpaceCellSpans() ([]CellSpan, error) {
 		out = append(out, CellSpan{Addr: addr, Size: size, Mnemonic: m})
 	}
 	return out, rows.Err()
+}
+
+// GetXrefsToRange returns all cross-references targeting [startAddr, endAddr] in the active space.
+// When externalOnly is true, references whose source_addr lies inside [startAddr, endAddr] are excluded.
+func (c *Controller) GetXrefsToRange(startAddr, endAddr uint32, externalOnly bool) []Xref {
+	var out []Xref
+	inEmpty := c.spaceSegInClause(true)
+	extClause := ""
+	if externalOnly {
+		extClause = " AND (source_addr < ?1 OR source_addr > ?2)"
+	}
+	query := fmt.Sprintf(
+		"SELECT seg, source_addr, target_addr, type FROM xrefs WHERE seg IN (%s) AND target_addr >= ?1 AND target_addr <= ?2%s ORDER BY target_addr ASC, source_addr ASC",
+		inEmpty, extClause,
+	)
+	rows, err := c.conn.Query(query, startAddr, endAddr)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if x, err := scanXref(rows); err == nil {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// UserCommentRow holds a non-auto inline and/or block comment created by the user or agent.
+type UserCommentRow struct {
+	Seg          string
+	Addr         uint32
+	Comment      string
+	BlockComment string
+}
+
+// GetUserComments returns all rows in `comments` in the active space that have a non-empty
+// manual `comment` or `block_comment` (excluding auto_comment-only rows).
+func (c *Controller) GetUserComments() []UserCommentRow {
+	var out []UserCommentRow
+	inEmpty := c.spaceSegInClause(true)
+	query := fmt.Sprintf(
+		"SELECT seg, addr, comment, block_comment FROM comments WHERE seg IN (%s) AND (comment != '' OR block_comment != '') ORDER BY addr ASC",
+		inEmpty,
+	)
+	rows, err := c.conn.Query(query)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r UserCommentRow
+		if rows.Scan(&r.Seg, &r.Addr, &r.Comment, &r.BlockComment) == nil {
+			out = append(out, r)
+		}
+	}
+	return out
 }

@@ -1,6 +1,7 @@
 package callgraph
 
 import (
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -245,5 +246,134 @@ func TestCallGraphInferenceAndModes(t *testing.T) {
 	}
 	if !strings.Contains(overview, "◄── callers: hunk0:LAB_01000") {
 		t.Fatalf("overview missing callers: %s", overview)
+	}
+}
+
+func TestCallGraphStaticRegsABIAndDualOffsets(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "project.db")
+
+	// 0x1000: movem.l d2-d3,-(a7)    48 E7 30 00 (4B)
+	// 0x1004: move.w  2(a0),d0       30 28 00 02 (4B) -> reads a0, writes d0
+	// 0x1008: add.w   $1034.w,d0     D0 78 10 34 (4B) -> reads $1034, rw d0
+	// 0x100C: move.w  d0,$1038.w     31 C0 10 38 (4B) -> reads d0, writes $1038
+	// 0x1010: movem.l (a7)+,d2-d3    4C DF 00 0C (4B)
+	// 0x1014: rts                    4E 75       (2B)
+	rawBytes := []byte{
+		0x48, 0xE7, 0x30, 0x00,
+		0x30, 0x28, 0x00, 0x02,
+		0xD0, 0x78, 0x10, 0x34,
+		0x31, 0xC0, 0x10, 0x38,
+		0x4C, 0xDF, 0x00, 0x0C,
+		0x4E, 0x75,
+	}
+	binPath := filepath.Join(tmpDir, "seg.bin")
+	if err := os.WriteFile(binPath, rawBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	proj := project.New(filepath.Join(tmpDir, "project.json"))
+	proj.Data.Segments = []project.Segment{
+		{
+			Name:        "main",
+			HunkIndex:   0,
+			HunkType:    hunk.HunkTypeCode,
+			MemoryType:  hunk.MemoryPublic,
+			AllocSize:   uint32(len(rawBytes)),
+			File:        &binPath,
+			Base:        0x1000,
+			DB:          dbPath,
+			Relocatable: false,
+		},
+	}
+	proj.Data.Spaces = []project.Space{{Name: "default", Segments: []string{"main"}}}
+	proj.Data.ActiveSpace = "default"
+	proj.Data.EntryPoints = []project.EntryPoint{{Addr: 0x1000, Name: "CalcStep", Segment: "main"}}
+
+	ctrl, err := db.New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrl.Close()
+	proj.SyncDBScope(ctrl)
+
+	_ = ctrl.SetLabel(0x1000, "CalcStep", db.LabelLab, false)
+	_ = ctrl.InsertFunction(0x1000, "CalcStep", 0)
+	proj.SetFunctionABI("CalcStep", "(a0=obj, a1=unused) -> d0 | clobbers: d0, d4")
+
+	insns := []struct {
+		addr uint32
+		size uint32
+		mnem string
+		op   string
+	}{
+		{0x1000, 4, "movem.l", "d2-d3,-(a7)"},
+		{0x1004, 4, "move.w", "2(a0),d0"},
+		{0x1008, 4, "add.w", "$1034.w,d0"},
+		{0x100C, 4, "move.w", "d0,$1038.w"},
+		{0x1010, 4, "movem.l", "(a7)+,d2-d3"},
+		{0x1014, 2, "rts", ""},
+	}
+	for _, in := range insns {
+		m := in.mnem
+		o := in.op
+		_ = ctrl.InsertCell(&db.Cell{
+			Seg:      "main",
+			Addr:     in.addr,
+			Size:     in.size,
+			Type:     db.CellCode,
+			Mnemonic: &m,
+			OpStr:    &o,
+			RawBytes: rawBytes[in.addr-0x1000 : in.addr-0x1000+in.size],
+		})
+		if in.addr < 0x1014 {
+			_ = ctrl.InsertEdge(in.addr, in.addr+in.size, db.EdgeFallthrough)
+		}
+	}
+	_ = ctrl.InsertXref(0x1008, 0x1034, db.XrefDataRead)
+	_ = ctrl.InsertXref(0x100C, 0x1038, db.XrefDataWrite)
+
+	cg, err := Build(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := cg.Functions[0x1000]
+	if fn == nil {
+		t.Fatalf("missing function at 0x1000")
+	}
+	if !slices.Equal(fn.InRegs, []string{"a0"}) {
+		t.Fatalf("expected InRegs=[a0], got %v", fn.InRegs)
+	}
+	if !slices.Equal(fn.ModRegs, []string{"d0"}) {
+		t.Fatalf("expected ModRegs=[d0], got %v", fn.ModRegs)
+	}
+	if !slices.Equal(fn.SavedRegs, []string{"d2", "d3"}) {
+		t.Fatalf("expected SavedRegs=[d2 d3], got %v", fn.SavedRegs)
+	}
+	warnings := VerifyABI(fn.ABI, fn.InRegs, fn.ModRegs, fn.SavedRegs)
+	if len(warnings) != 2 {
+		t.Fatalf("expected 2 ABI verification warnings (a1 never read, d4 never modified), got %v", warnings)
+	}
+	rangeWarnings := VerifyABI("(a0=obj, d7=count) -> d0 | clobbers: d0-d2", fn.InRegs, fn.ModRegs, fn.SavedRegs)
+	if len(rangeWarnings) != 3 {
+		t.Fatalf("expected 3 warnings for d7 input and d1/d2 range clobbers, got %v", rangeWarnings)
+	}
+
+	rendered, err := cg.Render(proj, &Options{
+		Target:  "CalcStep",
+		Code:    true,
+		Depth:   2,
+		UpDepth: 2,
+		Limit:   50,
+		Format:  "text",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rendered, "=== Globals & Memory Flow ===") {
+		t.Fatalf("missing Globals & Memory Flow section:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "+00004 (+004)  move.w") {
+		t.Fatalf("missing dual offset +00004 (+004) in disassembly:\n%s", rendered)
 	}
 }

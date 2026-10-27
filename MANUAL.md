@@ -62,13 +62,20 @@ cmp -l assets/disk.1 build/disk_1.bin   # 0 differences
 | `-m <module> analyze [--all \| -s, --segment NAME]` | Run unified 3-stage analysis across all module segments (whole hunk set for relocatable executables; standalone per-segment for flat binaries), or analyze a single segment with `-s/--segment NAME` |
 | `-m <module> analyze --trace [--budget N]` | Trace-driven analysis: run the binary from its entry point in the built-in sandboxed M68000 interpreter (`m68kemu`) + minimal Amiga chipset, then resolve indirect dispatch (trampolines, `d16(An)`/indexed computed calls), self-installed interrupt/trap handlers, and hardware-register accesses **by observation** and seed them into recursive descent. Opt-in, for **flat self-booting binaries** (games/demos); default `analyze` is unchanged. `--budget` caps the instruction count (default 20,000,000). All facts are non-byte-affecting (labels/edges/comments) — parity is preserved. |
 | `-m <module> emit [--amiga] [--all] [--relocatable] [--force]` | Emit modular Amiga assembly (`--amiga`: `src/<module>/hunk*.asm` + `disasm/<module>.asm` + shared `src/equates.i`) or single-file assembly (`disasm/<module>.asm`). Refuses to overwrite existing files unless `--force` is passed. |
-| `-m <module> callgraph` / `cg [TARGET] [FLAGS]` | Inspect multi-hunk call graphs, bottom-up worklists, string/HW anchors, and function disassembly |
+| `-m <module> callgraph` / `cg [TARGET...] [FLAGS]` | Inspect multi-hunk call graphs, bottom-up worklists, string/HW anchors, indirect dispatch sites (`--indirect`), and function disassembly |
+| `-m <module> search QUERY [-s SEG] [-n LIMIT] [--dense] [-f text\|json]` | Search instructions, operands, strings, labels, comments, bytes, hardware/math clusters (`cluster:<name>`), or self-modifying code (`smc`) |
+| `-m <module> data` / `inspect TARGET [--len N] [--copper] [--struct NAME [--count N]] [-f text\|json]` | Inspect non-code data, pointer tables, strings, Amiga Copper lists (`--copper`), or structured record arrays (`--struct`) |
+| `-m <module> xref TARGET_OR_RANGE [-f text\|json]` | Query all incoming cross-references to an address/label (`xref $1178`) or external references into an address/offset range (`xref $1000..$1FFF`, `xref +3DDEE..+3EFFF`) |
 | `-m <module> hint code TARGET` | Mark target as code entry (`confidence = 100`) and run incremental analysis |
 | `-m <module> hint data TARGET [COUNT] [--string] [--comment TEXT]` | Mark byte/data range or null-terminated string (`--string`) at `confidence = 100` |
-| `-m <module> hint pointer TARGET [COUNT] [--follow] [--comment TEXT]` | Mark 32-bit pointer(s) (`confidence = 100`), optionally tracing pointed-to code (`--follow`) |
+| `-m <module> hint pointer TARGET [COUNT] [--follow] [--comment TEXT]` | Mark 32-bit pointer(s) (`confidence = 100`), create target labels + `DATA_ADDR` xrefs, and seed code targets when `--follow` is passed |
 | `-m <module> hint base-reg REG BASE_HEX [--segment NAME] [--function LABEL]` | Declare a base-register invariant (`REG` = `a4`/`a5`/`a6`, e.g. `hint base-reg a6 0xDFF000`) so `d16(An)` accesses resolve to hardware names / global `DATA`/`BSS` xrefs. Scope is global, or limited to one `--segment` or `--function`; re-runs analysis |
 | `-m <module> rename OLD_NAME NEW_NAME` | Rename a symbol (or multiple `OLD=NEW` pairs, or `--file <path>` batch file) across all segments in a single transaction |
-| `-m <module> comment TARGET [TEXT] [--block]` | Set or clear inline comment or function/block header comment (`--block` / `-b`) |
+| `-m <module> comment TARGET [TEXT] [--block] [--batch FILE]` | Set or clear inline comment or function/block header comment (`--block` / `-b`), with strict cell-boundary & function-bounds validation and batch file support (`--batch` / `--file`) |
+| `-m <module> abi [TARGET [SIGNATURE]] [--verify] [--batch FILE] [-f text\|json]` | Set, inspect, or statically verify (`--verify`) a function's register call signature (`(a0=Model*) -> d0 \| clobbers: d1/a1`) |
+| `-m <module> struct add NAME [--size BYTES] OFFSET=FIELD[.b\|.w\|.l\|.p]...` | Define or update a named struct and its field offsets (`struct list [-f text\|json]`, `struct remove NAME`); emitted as `<field> equ <offset>` and `<Struct>_SIZEOF equ <size>` |
+| `-m <module> alias [REG STRUCT [--fn FUNC]]` | Bind an address register (`a0`..`a6`) globally or per-function (`--fn <func>`) to a struct so `d16(An)` renders symbolically (`alias list [-f text\|json]`, `alias remove REG [--fn FUNC]`) |
+| `-m <module> dump [-f text\|json] [--section SEC]` | Export all durable reverse-engineering state (`entry_points`, `memory_regions`, `renames`, non-auto `comments`, `structs`, `register_aliases`, `carves`) |
 | `-m <module> operand TARGET FORMAT` | Set operand numeric format (`HEX`, `DEC`, `BIN`) and reformat the instruction |
 | `-m <module> segment add --file F --base HEX --name N` | Add a binary segment to the module |
 | `-m <module> segment split PARENT --at OFF (--len N \| --to OFF) --base HEX --name N` | Slice an extent out of a segment into a new static-base part (`<name>.bin` + shared DB), filed into the active space |
@@ -119,9 +126,270 @@ Every CLI command that takes a `TARGET` (`callgraph`, `hint`, `comment`, `operan
 | `--anchors` | List functions that reference ASCII `STRING` cells or Amiga hardware registers (`$DFFxxx` / CIA) |
 | `--ready` | List **bottom-up ready** unrenamed functions (`LAB_*`) whose outgoing callees are 100% renamed |
 | `--suspect` | List functions that fall through into `DATA_*` / `STRING` cells without a terminator (`rts`/`jmp`/`bra`) |
+| `--indirect` | List all indirect/trampoline dispatch sites (`jsr (An)`, `jmp d16(An)`, `jmp d8(PC,Xn)`) and their resolved or `[UNRESOLVED]` status |
 | `-u, --unrenamed` | Filter worklists to show only unrenamed (`LAB_*`) functions |
 | `-n, --limit <N>` | Maximum functions to display in worklist modes (`0` = unlimited, default: `50`) |
 | `-f, --format <FMT>` | Output format: `text` (default), `json`, `dot` (Graphviz), or `mermaid` |
+
+---
+
+## Atomic Analysis & Annotation Primitives (`search`, `data`, `xref`, `struct`, `alias`, `abi`, `dump`)
+
+### 1. Code, Pattern & Cluster Search (`hunks search`)
+```bash
+hunks -m <module> search m:muls.w                       # mnemonic prefix match
+hunks -m <module> search 'o:$1178'                      # operand substring match
+hunks -m <module> search cluster:3dmath --dense         # dense pockets (>=3 hits in 24B) of muls/mulu/divs/divu
+hunks -m <module> search cluster:blitter                # presets: 3dmath, mul, div, trig, blitter, copper, paula, bitplane, sprite, cia, dma, irq
+hunks -m <module> search smc                            # self-modifying code writes into CODE cells
+```
+
+### 2. Data, Copper & Struct Array Inspection (`hunks data` / `inspect`)
+```bash
+hunks -m <module> data +001A4 --len 64                  # formatted dc.b/dc.w/dc.l/pointer/string cells
+hunks -m <module> data CopperList_Main --copper         # decode Amiga Copper MOVE/WAIT/SKIP words
+hunks -m <module> data 0x6B6E --struct Model --count 8  # decode N records using a defined struct stride
+```
+
+### 3. Cross-Reference & Region Rollup (`hunks xref`)
+```bash
+hunks -m <module> xref 0x1178                           # all CALL/BRANCH/READ/WRITE/ADDR/PTR refs to $1178
+hunks -m <module> xref '$1000..$1FFF'                   # rollup of all external refs into low-RAM range
+hunks -m <module> xref '+3DDEE..+3EFFF'                 # rollup of all external entries into a segment range
+```
+
+### 4. Structs, Scoped Register Aliases & Call ABI (`struct`, `alias`, `abi`)
+```bash
+hunks -m <module> struct add Model --size 18 0=Model_Radius.w 2=Model_Verts.p
+hunks -m <module> alias a0 Model --fn Poly_RenderObject # scope a0 -> Model to a single function
+hunks -m <module> abi Poly_RenderObject "(a0=Model*, d0.w=id) -> d0.l | clobbers: d1-d7/a1-a3"
+hunks -m <module> abi --verify                          # check all ABI strings against static ReadRegs/WriteRegs
+```
+
+### 5. Structured State Export (`hunks dump`)
+```bash
+hunks -m <module> dump -f json > findings_state.json    # export entries, regions, renames, comments, structs, aliases, abis, carves
+```
+
+---
+
+## Agent Reverse-Engineering Playbook
+
+This playbook defines the standard workflow for AI coding/reverse-engineering agents working on an Amiga binary with `hunks`. Every command is atomic and read-only (or a fast metadata mutation) — **do not write ad-hoc Python/shell scripts to grep raw bytes or scrape full assembly dumps when a `hunks` primitive answers the question directly**, and **never run `emit` just to text-search the listing** — `search`/`xref`/`data` answer those questions against `project.db`.
+
+### 0. Recommended Order (Optimized Cold-Start Path)
+
+For a freshly `init`'d binary, work top-down to the spine, then bottom-up to name it:
+
+```
+1. analyze --trace            seed code/vectors/dispatch on a self-booting binary
+2. xref '$64..$7C'            find installed interrupt vectors (async call-graph roots)
+3. cg --indirect              map the dispatch spine (state machines, jump tables)
+4. search cluster:<...>       locate each subsystem (3dmath/blitter/copper/paula/...)
+5. cg <hot> --code            read a routine + its "Globals & Memory Flow" block
+   + xref <global>            map every producer/consumer of each global it touches
+6. data --struct <N> --count  decode record arrays AND verify fields against real bytes
+7. rename -> abi -> comment   bottom-up, only after reading each body (Section 4)
+8. dump -f json               reconcile DB state with your FINDINGS.md
+```
+
+**Three principles that prevent wrong turns:**
+- **`xref` is the data-flow oracle; `search o:` is only substring text.** To map a global use
+  `xref <addr>` (returns typed `READ`/`WRITE`/`ADDR`/`CALL`/`BRANCH`); fall back to `search 'o:$addr'`
+  only for the textual operand form or when `xref` is empty.
+- **Trace resolves only what the playthrough exercised.** `[UNRESOLVED]` sites in `cg --indirect`
+  after `analyze --trace` are **normal** for data-driven dispatch (e.g. per-song audio step routines) —
+  resolve them statically with `hint pointer --follow` when a table is obvious, otherwise document the
+  table and move on. Do not treat unresolved as failure.
+- **Verify every structural guess against bytes.** After `struct add`, always
+  `data --struct --count N` and sanity-check: do `.p` fields resolve to labels, are counts plausible,
+  does the stride line up? A wrong `--size`/field type is caught here, not later.
+
+### 1. Command Selection Matrix (What to Use and When)
+
+| Question / Goal | Command to Run |
+|-----------------|----------------|
+| Where are the entry points, high-fan-in leaves, or hardware/string anchors? | `hunks -m <mod> cg --anchors --unrenamed -n 30`<br>`hunks -m <mod> cg --leaves --unrenamed -n 30` |
+| Which functions have all their callees already understood and are ready to name next? | `hunks -m <mod> cg --ready -n 30` |
+| Are any functions cut off early by unreached branches or inline data tables? | `hunks -m <mod> cg --suspect -n 20` |
+| What indirect calls (`jsr (An)`, `jmp d16(An)`, `jmp d8(PC,Xn)`) exist and which are unresolved? | `hunks -m <mod> cg --indirect [-f json]` |
+| How does function `X` work, what registers/globals does it read/write, and how do callers invoke it? | `hunks -m <mod> cg <X> --code` |
+| Where are 3D math, Blitter, Copper, Paula audio, bitplane, sprite, CIA, or DMA routines? | `hunks -m <mod> search cluster:<3dmath\|blitter\|copper\|paula\|bitplane\|sprite\|cia\|dma> [--dense]` |
+| Where does the program use a specific opcode (`muls.w`, `divs.w`, `movem.l`) or operand (`$1178`)? | `hunks -m <mod> search m:divs.w`<br>`hunks -m <mod> search 'o:$1178'` |
+| Does this program use self-modifying code (SMC), and what code addresses are patched? | `hunks -m <mod> search smc` |
+| What is inside a non-code table, string block, Copper list, or array of structs? | `hunks -m <mod> data <target> [--len N]`<br>`hunks -m <mod> data <target> --copper`<br>`hunks -m <mod> data <target> --struct <Name> --count <N>` |
+| What reads, writes, or calls a specific variable/function or a whole memory/code region? | `hunks -m <mod> xref <addr_or_label>`<br>`hunks -m <mod> xref '$1000..$1FFF'`<br>`hunks -m <mod> xref '+3DDEE..+3EFFF'` |
+| A jump/pointer table in `DATA` points to unseeded subroutines — how do I mark & trace them? | `hunks -m <mod> hint pointer <addr> <count> --follow` |
+| How do I make `d16(An)` struct offsets readable in `cg --code` and emitted `.asm`? | `hunks -m <mod> struct add <Name> --size <N> 0=field.w ...`<br>`hunks -m <mod> alias <a0..a6> <Name> [--fn <Func>]` |
+| How do I record and statically verify a function's register calling convention? | `hunks -m <mod> abi <Func> "(a0=Model*, d0.w=id) -> d0.l \| clobbers: d1-d3/a1"`<br>`hunks -m <mod> abi --verify` |
+| How do I reconcile all renames, comments, ABIs, structs, and regions with `FINDINGS.md`? | `hunks -m <mod> dump -f json` |
+
+---
+
+### 2. Dissecting the Application Main Run Loop & Dispatch Architecture
+
+When starting on a newly initialized module, map the top-level control flow before diving into leaf math or rendering kernels:
+
+1. **Trace from the Entry Point (`main`):**
+   ```bash
+   hunks -m <mod> cg main --code
+   ```
+   - If `main` is a small self-relocating stub or copies a jump trampoline to low RAM (e.g. `jmp $300.w` or `jsr $1034.w`) and stops, run trace-seeded analysis on flat self-booting binaries:
+     ```bash
+     hunks -m <mod> analyze --trace
+     ```
+     `RunTrace` steps through low-RAM bounce stubs and hardware setup to seed the real entry points and interrupt vectors automatically.
+2. **Locate OS Takeover & Interrupt Vectors:**
+   ```bash
+   hunks -m <mod> search cluster:dma
+   hunks -m <mod> xref '$64..$7C'
+   ```
+   - Look for writes to `DMACON`/`INTENA` and the 68000 autovector slots (`$68` Level 2 CIA-A keyboard/ports, `$6C` Level 3 VBlank/Copper/Blitter, `$70` Level 4 Paula audio, `$78` Level 6 CIA-B).
+   - Every handler installed into `$68`/`$6C`/`$70`/`$78` is an asynchronous root of the call graph — rename those roots early (e.g. `Irq_Level3_VBlank`, `Irq_Level2_Keyboard`).
+3. **Audit Indirect Dispatch & State Machines (`cg --indirect`):**
+   ```bash
+   hunks -m <mod> cg --indirect
+   ```
+   - Many games drive their main loop or per-entity update via a state-machine jump table (`move.l Table(pc,d0.w),a0; jsr (a0)`) or a function pointer in low RAM (`jsr (a4)`).
+   - For any `[UNRESOLVED]` site in `cg --indirect`, inspect the enclosing function with `cg <Func> --code`, inspect the table address with `hunks -m <mod> data <table_addr> --len 64`, and mark pointer tables with `hunks -m <mod> hint pointer <table_addr> <count> --follow` so all state handlers enter the call graph.
+   - **Expect residual `[UNRESOLVED]` sites.** `analyze --trace` only resolves dispatch the playthrough actually took; data-driven callbacks (per-song audio step routines, rarely-hit menu branches) legitimately stay unresolved. Resolve the ones backed by an obvious pointer table, document the rest — unresolved is not a failure.
+4. **Identify the Per-Frame Run Loop or Mode Dispatcher:**
+   - The frame driver is often **not** a `VPOSR`/VBlank-wait loop but a **mode-code state dispatcher**: a handler that reads a mode byte and branches per value (`move.w $mode,d0; cmp.b #'E',d0hi; beq ...; cmp.b #'_',d0hi; beq ...`). Each matched mode is a separate top-level pipeline (menu / flight / debrief / map); map and name each handler independently.
+   - Otherwise locate the loop by `+loop` in `cg` plus a frame-sync call (VBlank flag or `VPOSR`/`VHPOSR` wait).
+   - The direct callees of the active handler give the spine of the application: **Input/AI Update $\rightarrow$ Camera/World Transform $\rightarrow$ Scene/Object Cull & Sort $\rightarrow$ Rasterize/Blit $\rightarrow$ Copper/Page Flip $\rightarrow$ Audio Tick**.
+
+---
+
+### 3. Figuring Out Subsystems, Algorithms & Their Relationships
+
+Use cluster queries, mnemonic searches, and region XREF rollups to isolate each subsystem and trace how data flows between them:
+
+#### A. 3D / Fixed-Point Math, Transforms & Projection
+1. **Find dense arithmetic pockets:**
+   ```bash
+   hunks -m <mod> search cluster:3dmath --dense
+   hunks -m <mod> search m:divs.w
+   ```
+   - Functions with 6–9 `muls.w` instructions and `add.l` + shift/swap normalization (`lsl.l #2,dN; swap dN` for 2.14 fixed-point, or `asr.l #8,dN`) are **3×3 matrix × vector** or **matrix × matrix** routines.
+   - Functions pairing `muls.w` / `asl.l` with `divs.w` are **perspective projection** (`sx = (X * focal) / Z + centerX`) or **edge slope (`dx/dy`)** calculators.
+   - Functions computing `x1*y2 - y1*x2` (`muls.w` + `sub.l`) are **2D cross-product Winding / Backface Culling** tests.
+2. **Trace the transformation matrix & scratch workspace:**
+   - Inspect a math routine with `cg <MathFunc> --code` and check its **`=== Globals & Memory Flow ===`** block (e.g. `Reads: $1178, $117A...` / `Writes: $10E6...`).
+   - Run `hunks -m <mod> xref 0x1178` (or `hunks -m <mod> xref '$1060..$1210'`) to find every producer that writes the matrix/workspace and every consumer that reads it.
+
+#### B. Rendering, Blitter & CPU Fill Kernels
+1. **Locate Blitter & CPU rasterizer kernels:**
+   ```bash
+   hunks -m <mod> search cluster:blitter
+   hunks -m <mod> search smc
+   ```
+   - `search smc` finds **true opcode-patching** — instructions that write into `CODE` cells: boot
+     relocators/decompressors, `rts`-toggle self-enable tricks, and the rarer dynamically-patched
+     immediate/branch. Expect **few** hits; treat each as a genuine runtime code mutation.
+   - **Unrolled fill kernels are usually NOT self-modifying.** CPU span fillers, line drawers, and
+     bitplane clearers are typically a **bank of unrolled or jump-table-dispatched kernels** (one per
+     color/length/slope), reached by a computed `jmp (pc,d.w)` — find those with `cg --indirect`
+     (resolved jump tables) and `search cluster:blitter`, not `search smc`.
+   - When you find a contiguous bank of unrolled fill kernels or edge-mask tables (e.g. `+3DDEE..+3EFFF`), run a **region XREF rollup** to see every dispatcher that enters the bank without querying dozens of individual addresses:
+     ```bash
+     hunks -m <mod> xref '+3DDEE..+3EFFF'
+     ```
+
+#### C. Display, Copper Lists & Double/Triple Buffering
+1. **Find Copper & Bitplane setup:**
+   ```bash
+   hunks -m <mod> search cluster:copper
+   hunks -m <mod> search cluster:bitplane
+   ```
+2. **Decode Copper lists directly:**
+   - Once you find the address loaded into `COP1LCH` (or a Copper buffer pointer), decode its `MOVE`/`WAIT`/`SKIP` stream:
+     ```bash
+     hunks -m <mod> data <copper_addr> --copper --len 256
+     ```
+
+#### D. Mapping Data Structures & Connecting Producer $\leftrightarrow$ Consumer Subsystems
+1. **Name low-RAM / BSS regions (`map region`):**
+   - When `xref '$1000..$1FFF'` reveals a cluster of shared globals, declare the region so `hunks` tracks it explicitly:
+     ```bash
+     hunks -m <mod> map region geo_workvars 0x1060 0x1210
+     ```
+2. **Decode record arrays and bind register aliases (`struct` + `data --struct` + `alias`):**
+   - When a dispatcher indexes a table by `id * stride` (e.g. `mulu.w #18,d0; lea $6B6E(pc),a0; adda.l d0,a0`), define the struct with `--size` and field type suffixes (`.b`, `.w`, `.l`, `.p` for pointers):
+     ```bash
+     hunks -m <mod> struct add ModelRec --size 18 0=Model_Radius.w 2=Model_Verts.p 6=Model_Faces.p 10=Model_NumVerts.w
+     ```
+   - Dump the entire table as decoded records and **verify before trusting the layout** — this step catches a wrong `--size` stride or mis-typed field immediately (do `.p` fields resolve to labels? are counts plausible? does record[1] start where record[0] ends?):
+     ```bash
+     hunks -m <mod> data 0x6B6E --struct ModelRec --count 16
+     ```
+     If a field looks wrong (a `.p` that doesn't resolve, a count of thousands), adjust `--size`/field
+     types and re-decode. Never document a struct you haven't byte-verified this way.
+   - Bind the base register **scoped to the consuming function** (`--fn`) so `2(a0)` renders as `Model_Verts(a0)` in `Poly_RenderObject` without polluting unrelated uses of `a0` elsewhere:
+     ```bash
+     hunks -m <mod> alias a0 ModelRec --fn Poly_RenderObject
+     ```
+3. **Use `cg --suspect` to find table boundaries, not just bugs:**
+   - A function flagged `SUSPECT:DATA_*@+off` (fallthrough into data) is frequently the exact boundary
+     between a routine and an adjacent **vertex/pointer/jump table**. Inspect the suspect address with
+     `data <addr>` / `data <addr> --struct ...`; if it is a pointer table, `hint pointer <addr> N --follow`;
+     if a record array, define a struct. Suspects are structure-discovery leads, not only cutoff errors.
+
+---
+
+### 4. How and When to Rename, Comment, and Add ABI Envelopes
+
+Follow a strict **bottom-up verification discipline** so annotations remain accurate and never drift from the machine code:
+
+#### Rule 1: When and How to Rename (`hunks rename`)
+- **Work bottom-up:** Start from `cg --anchors --unrenamed` and `cg --leaves --unrenamed`, then repeatedly query `cg --ready` (functions whose outgoing callees are 100% renamed).
+- **Never rename from caller context alone:** Always run `hunks -m <mod> cg <Target> --code` and read the function body before renaming. A call that looks like "clear buffer" from one caller may actually be a general-purpose memory fill or Blitter wait.
+- **Use `<Subsystem>_<Action>` naming:** Group related routines by prefix (`Math_`, `Geo_`, `Poly_`, `Span_`, `Blit_`, `Cop_`, `Audio_`, `Input_`, `Obj_`, `Irq_`) so `cg` trees read like an architectural diagram.
+- **Batch when appropriate:** Rename multiple verified symbols in one atomic transaction (`hunks -m <mod> rename LAB_47172=Geo_RotateVertices LAB_47204=Geo_ProjectPerspective`).
+
+#### Rule 2: How and When to Add an ABI Envelope (`hunks abi`)
+- **Why ABI envelopes matter:** In M68000 assembly, arguments are passed in arbitrary registers (`d0`–`d7`, `a0`–`a6`) or scratch memory slots. Recording a function's ABI attaches `; [ABI: ...]` to every `jsr`/`bsr` call site in `cg --code` and `; ABI: ...` to emitted `.asm` function headers, eliminating the need to re-read callees when analyzing higher-level callers.
+- **Canonical signature grammar** (one form everywhere, so `--verify` can parse it):
+  `(in_reg=role, ...) -> out_reg=role | clobbers: regs`. Inputs/outputs may be registers
+  (`d0.w`, `a0`) or memory globals (`$10E4=count`); `clobbers:` lists registers trashed and not
+  restored. Omit any empty section (`(a0=desc) -> void`). Keep it one line.
+- **Always check `Regs (static)` first:** Every `cg <Func>` output displays the statically inferred register envelope:
+  ```text
+  Regs (static):  in: d0,a0 | mod: d0,d1,a0,a1 | saved: d2,d3,a2
+  ```
+  - `in:` lists registers read before being written in the function body.
+  - `mod:` lists registers modified and not restored via `movem.l (sp)+,...`.
+  - `saved:` lists registers preserved on the stack via `movem.l ...,−(sp)`.
+- **Set the ABI as soon as you rename a function:**
+  ```bash
+  hunks -m <mod> abi Geo_RotateVertices "(in: $10E4.w=count, $10FA..$1102=srcXYZ, $1178=mat3x3) -> ($10E6..$10EE=dstXYZ) | clobbers: d0-d6/a1-a6"
+  # Or for a register-argument routine:
+  hunks -m <mod> abi Math_SinCos "(d0.w=angle_bam) -> d0.w=sin_2_14, d1.w=cos_2_14 | clobbers: d2/a0"
+  ```
+- **Verify against static register usage:** `hunks abi` automatically warns if a register you claim in the input `( ... )` section is never read or if a register in `clobbers:` is never written. Run `hunks -m <mod> abi --verify` after a batch of annotations to audit all ABI envelopes across the module.
+- **Label-tied persistence:** ABI envelopes live in `project.json` keyed by **label name** (not raw address), and are automatically re-keyed if you later rename the function with `hunks rename`.
+
+#### Rule 3: How and When to Comment (`hunks comment`)
+- **Function Header Block Comments (`--block`):**
+  Add a block comment on every non-trivial function entry explaining:
+  1. What the algorithm does and its mathematical/hardware invariants (e.g. fixed-point scale `2.14`, screen coordinates, Blitter minterm).
+  2. Any low-RAM globals read or written if passed via memory rather than registers.
+  ```bash
+  hunks -m <mod> comment Geo_RotateVertices --block "Transforms (count=$10E4) model vertices by 3x3 2.14 matrix at $1178..$1188 + translation $116C..$1170."
+  ```
+- **Instruction Inline Comments (`<Func>+<fn_off>`):**
+  - Comment **why**, not *what* (never comment `addq.w #1,d0` with `"increment d0"`). Comment fixed-point shifts (`"2.14 * 2.14 -> 4.28; lsl #2 + swap extracts signed 16-bit integer"`), bitmask tricks, hardware trigger writes, and loop termination conditions.
+  - **Always use the function-relative offset `(+fn_off)`** shown in parentheses in the second column of `cg <Func> --code`:
+    ```text
+    +3FB4A (+048)  lsl.l    #$2,d3
+    +3FB4C (+04A)  swap     d3
+    ```
+    Target `+048` as `Geo_RotateVertices+48` (or segment offset `+3FB4A`):
+    ```bash
+    hunks -m <mod> comment Geo_RotateVertices+48 "2.14 fixed-point normalize: (sum << 2) >> 16"
+    ```
+  - `hunks comment` enforces strict instruction-boundary and function-bounds validation: if an offset lands mid-instruction, it rejects the edit and prints the nearest valid instruction offsets.
+- **Exporting & Reconciling State (`hunks dump`):**
+  When writing or updating a project findings document (`FINDINGS.md`), run `hunks -m <mod> dump -f json` to export all renames, user comments, ABI signatures, structs, aliases, and memory regions in one structured payload.
 
 ---
 
@@ -489,9 +757,10 @@ Instructions that jump/call across hunks or through a register jump-vector table
 
 | Key | Action |
 |-----|--------|
-| `n` | Rename label at cursor (propagates across all segments) |
+| `n` | Rename label at cursor (propagates across all segments and re-keys function ABIs/aliases) |
 | `;` | Edit inline comment at cursor (on `STRING` rows, opens the block comment editor so comments appear cleanly above `dc.b "...",0`) |
 | `:` | Edit block comment (emitted on its own `; ...` line(s) above the instruction/label/string) |
+| `A` | Set or edit function ABI signature for the enclosing function (displayed above the function label, in `f` Functions list, and on `JSR`/`BSR` call rows) |
 | `#` | Cycle operand format (`HEX` → `DEC` → `BIN`) |
 
 ### Project & Tool Keys
@@ -600,7 +869,7 @@ The TUI uses a built-in dark truecolor palette out of the box. You can override 
 
 | File | Purpose |
 |------|---------|
-| `work/<target>/project.json` | Target metadata (`target_name`, segments, entry points, spaces, structs, register aliases, memory regions) |
+| `work/<target>/project.json` | Target metadata (`target_name`, segments, entry points, spaces, structs, register aliases, function ABIs, memory regions) |
 | `work/<target>/project.db` | Target SQLite database (`cells`, `labels`, `relocs`, `xrefs`, `edges`, `renames`, `operand_formats`) |
 | `work/<target>/hunk*.bin` | Extracted binary payloads for each `CODE`/`DATA` hunk of `<target>` |
 | `disasm/<target>.asm` | Master assembly file (`opt o-,a-` + `include "src/equates.i"` + `include "src/<target>/hunk*.asm"`, or flat binary output) |

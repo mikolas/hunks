@@ -168,11 +168,19 @@ func (a *App) Undo() {
 		}
 		_ = a.DB.UpdateBlockComment(entry.Addr, cmt)
 	case UndoRename:
+		curRen, hasCur, _ := a.DB.GetRename(entry.Key)
 		if entry.OldStr != nil {
 			_ = a.DB.SetRename(entry.Key, *entry.OldStr)
+			if hasCur && curRen != "" {
+				a.Proj.ReKeyFunctionABI(curRen, *entry.OldStr)
+			}
 		} else {
 			_ = a.DB.DeleteRename(entry.Key)
+			if hasCur && curRen != "" {
+				a.Proj.ReKeyFunctionABI(curRen, entry.Key)
+			}
 		}
+		_ = a.Proj.Save()
 	}
 	a.ReloadAtCursor()
 	a.StatusMsg = "Undone"

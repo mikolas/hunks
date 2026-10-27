@@ -526,3 +526,150 @@ func BenchmarkEmitPipeline(b *testing.B) {
 		_ = em.FormatLines()
 	}
 }
+
+func TestStructEquatesAndABIEmission(t *testing.T) {
+	tmpDir := t.TempDir()
+	// 0x10000: move.w 2(a0),d0  30 28 00 02
+	// 0x10004: rts              4E 75
+	codeBytes := []byte{0x30, 0x28, 0x00, 0x02, 0x4E, 0x75}
+	binPath := filepath.Join(tmpDir, "main.bin")
+	if err := os.WriteFile(binPath, codeBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(tmpDir, "main.db")
+	ctrl, err := db.New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrl.Close()
+
+	proj := project.New(filepath.Join(tmpDir, "project.json"))
+	proj.Data.Segments = append(proj.Data.Segments, project.Segment{
+		Name:        "main",
+		HunkIndex:   0,
+		HunkType:    hunk.HunkTypeCode,
+		MemoryType:  hunk.MemoryPublic,
+		AllocSize:   uint32(len(codeBytes)),
+		File:        &binPath,
+		Base:        0x10000,
+		DB:          dbPath,
+		Relocatable: false,
+	})
+	proj.Data.Spaces = append(proj.Data.Spaces, project.Space{
+		Name:     "default",
+		Segments: []string{"main"},
+	})
+	proj.Data.ActiveSpace = "default"
+	proj.Data.Structs = map[string]map[string]string{
+		"Model": {
+			"0":     "Model_Radius.w",
+			"2":     "Model_VX.w",
+			"_size": "18",
+		},
+	}
+	proj.Data.RegisterAliases = map[string]string{
+		"a0": "Model",
+	}
+
+	an, err := analyzer.New(proj, ctrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	an.Analyze([]uint32{0x10000})
+	proj.SetFunctionABI("LAB_10000", "(a0=Model*) -> d0=vx")
+
+	em, err := New(proj, ctrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := em.GenerateItems(false); err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Join(em.FormatLines(), "\n")
+	if !strings.Contains(text, "Model_Radius\tequ\t$0") {
+		t.Fatalf("expected Model_Radius equ $0 in emitted asm:\n%s", text)
+	}
+	if !strings.Contains(text, "Model_VX\tequ\t$2") {
+		t.Fatalf("expected Model_VX equ $2 in emitted asm:\n%s", text)
+	}
+	if !strings.Contains(text, "Model_SIZEOF\tequ\t$12") {
+		t.Fatalf("expected Model_SIZEOF equ $12 in emitted asm:\n%s", text)
+	}
+	if !strings.Contains(text, "; ABI: (a0=Model*) -> d0=vx") {
+		t.Fatalf("expected ABI comment in emitted asm:\n%s", text)
+	}
+	if !strings.Contains(text, "move.w\tModel_VX(a0),d0") {
+		t.Fatalf("expected Model_VX(a0),d0 in emitted asm:\n%s", text)
+	}
+}
+
+func TestIncbinInteriorLabelsEmitEquates(t *testing.T) {
+	tmpDir := t.TempDir()
+	// 0x10000: lea $1000C.l,a0   41 F9 00 01 00 0C
+	// 0x10006: rts               4E 75
+	// 0x10008..0x10010: 8-byte data blob with interior label at 0x1000C
+	codeBytes := []byte{
+		0x41, 0xF9, 0x00, 0x01, 0x00, 0x0C,
+		0x4E, 0x75,
+		0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44,
+	}
+	binPath := filepath.Join(tmpDir, "main.bin")
+	if err := os.WriteFile(binPath, codeBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(tmpDir, "main.db")
+	ctrl, err := db.New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrl.Close()
+
+	proj := project.New(filepath.Join(tmpDir, "project.json"))
+	proj.WorkspaceRoot = tmpDir
+	proj.Data.Segments = append(proj.Data.Segments, project.Segment{
+		Name:        "main",
+		HunkIndex:   0,
+		HunkType:    hunk.HunkTypeCode,
+		MemoryType:  hunk.MemoryPublic,
+		AllocSize:   uint32(len(codeBytes)),
+		File:        &binPath,
+		Base:        0x10000,
+		DB:          dbPath,
+		Relocatable: false,
+	})
+	proj.Data.Spaces = append(proj.Data.Spaces, project.Space{
+		Name:     "default",
+		Segments: []string{"main"},
+	})
+	proj.Data.ActiveSpace = "default"
+
+	an, err := analyzer.New(proj, ctrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	an.Analyze([]uint32{0x10000})
+
+	// Carve 0x10008..0x10010 (spanning over LAB_1000C) as INCBIN.
+	_ = ctrl.DeleteCellsInRange(0x10008, 0x10010)
+	_ = ctrl.SetLabel(0x10008, "CarvedBlob", db.LabelLab, true)
+	fileStr := "assets/CarvedBlob.bin"
+	_ = ctrl.InsertCell(&db.Cell{
+		Addr:     0x10008,
+		Size:     8,
+		Type:     db.CellIncbin,
+		OpStr:    &fileStr,
+		RawBytes: codeBytes[8:16],
+	})
+
+	em, err := New(proj, ctrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := em.GenerateItems(false); err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Join(em.FormatLines(), "\n")
+	if !strings.Contains(text, "LAB_1000C\tequ\tCarvedBlob+$4") {
+		t.Fatalf("expected interior label LAB_1000C equ CarvedBlob+$4 after incbin, got:\n%s", text)
+	}
+}

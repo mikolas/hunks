@@ -2,10 +2,12 @@ package analyzer
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/mikolas/hunks/internal/amiga"
 	"github.com/mikolas/hunks/internal/db"
 	"github.com/mikolas/hunks/internal/m68k"
+	"github.com/mikolas/hunks/internal/project"
 )
 
 // Stage3FormatOperands formats all CODE cells' mnemonics and operands into vasmm68k_mot syntax.
@@ -181,9 +183,10 @@ func (a *Analyzer) formatOperand(addr uint32, insn *m68k.Insn, op m68k.Operand, 
 		}
 		if len(a.Proj.Data.RegisterAliases) > 0 {
 			baseStr := m68k.RegAName(op.Reg)
-			if structName, ok := a.Proj.Data.RegisterAliases[baseStr]; ok {
+			if structName, ok := a.resolveRegisterAlias(addr, baseStr); ok {
 				if structDef, ok := a.Proj.Data.Structs[structName]; ok {
-					if field, ok := structDef[fmt.Sprintf("%d", op.Disp)]; ok {
+					if rawField, ok := structDef[fmt.Sprintf("%d", op.Disp)]; ok && rawField != "" {
+						field, _ := project.StripFieldType(rawField)
 						if op.Mode == m68k.EAIndex {
 							return field + "(" + baseStr + "," + op.IndexRegName() + op.IndexSize.DotSuffix() + ")"
 						}
@@ -196,6 +199,47 @@ func (a *Analyzer) formatOperand(addr uint32, insn *m68k.Insn, op m68k.Operand, 
 	}
 
 	return op.FormatASM(insn.Op)
+}
+
+func (a *Analyzer) resolveRegisterAlias(addr uint32, baseStr string) (string, bool) {
+	aliases := a.Proj.Data.RegisterAliases
+	if len(aliases) == 0 {
+		return "", false
+	}
+	if len(a.funcEntries) == 0 {
+		a.funcEntries = a.DB.FunctionEntries()
+	}
+	lo, hi := 0, len(a.funcEntries)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if a.funcEntries[mid] <= addr {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo > 0 && a.IsSameSegment(a.funcEntries[lo-1], addr) {
+		fnEntry := a.funcEntries[lo-1]
+		var candKeys [4]string
+		candKeys[0] = a.GetOrDefaultLabel(fnEntry) + ":" + baseStr
+		candKeys[1] = a.Proj.AutoLabel(fnEntry) + ":" + baseStr
+		candKeys[2] = fmt.Sprintf("LAB_%05X:%s", fnEntry, baseStr)
+		candKeys[3] = fmt.Sprintf("0x%X:%s", fnEntry, baseStr)
+		for _, k := range candKeys {
+			if s, ok := aliases[k]; ok && s != "" {
+				return s, true
+			}
+			for ak, av := range aliases {
+				if strings.EqualFold(ak, k) && av != "" {
+					return av, true
+				}
+			}
+		}
+	}
+	if s, ok := aliases[baseStr]; ok && s != "" {
+		return s, true
+	}
+	return "", false
 }
 
 func (a *Analyzer) formatImmOperand(addr uint32, insn *m68k.Insn, op m68k.Operand, hunkMode bool) string {

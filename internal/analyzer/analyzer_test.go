@@ -1017,6 +1017,15 @@ func TestFunctionMetaAndNoreturnPruning(t *testing.T) {
 		0x4A, 0xFC,
 	}
 	a, ctrl := newTestTraceAnalyzer(t, code, base)
+	// Pre-populate a CODE cell at base to simulate re-running `hunks analyze` on an existing DB.
+	_ = ctrl.InsertCell(&db.Cell{
+		Addr:     base,
+		Size:     4,
+		Type:     db.CellCode,
+		Mnemonic: db.StrPtr("move.w"),
+		OpStr:    db.StrPtr("$1034.w,d0"),
+		RawBytes: code[0:4],
+	})
 	a.Analyze([]uint32{base})
 
 	const normalFn = base + 0x0E   // 0x1000E
@@ -1097,6 +1106,15 @@ func TestApplyTraceRegDispatchesResolvesFromRegContext(t *testing.T) {
 	// 0x10002: rts        4E 75   (the observed target)
 	code := []byte{0x4E, 0xD0, 0x4E, 0x75}
 	a, ctrl := newTestTraceAnalyzer(t, code, base)
+	// Pre-populate a CODE cell at base to simulate re-running `hunks analyze` on an existing DB.
+	_ = ctrl.InsertCell(&db.Cell{
+		Addr:     base,
+		Size:     4,
+		Type:     db.CellCode,
+		Mnemonic: db.StrPtr("move.w"),
+		OpStr:    db.StrPtr("$1034.w,d0"),
+		RawBytes: code[0:4],
+	})
 	a.Analyze([]uint32{base})
 
 	// Static analysis leaves the jmp (a0) site unresolved (no control edge).
@@ -1191,6 +1209,15 @@ func TestCustomRegBitfieldAutoComments(t *testing.T) {
 		0x4E, 0x75,
 	}
 	a, ctrl := newTestTraceAnalyzer(t, code, base)
+	// Pre-populate a CODE cell at base to simulate re-running `hunks analyze` on an existing DB.
+	_ = ctrl.InsertCell(&db.Cell{
+		Addr:     base,
+		Size:     4,
+		Type:     db.CellCode,
+		Mnemonic: db.StrPtr("move.w"),
+		OpStr:    db.StrPtr("$1034.w,d0"),
+		RawBytes: code[0:4],
+	})
 	a.Analyze([]uint32{base})
 
 	cDmacon := ctrl.GetAddressComment(0x10000).AutoComment
@@ -1206,5 +1233,108 @@ func TestCustomRegBitfieldAutoComments(t *testing.T) {
 	cBplcon := ctrl.GetAddressComment(0x10018).AutoComment
 	if !strings.Contains(cBplcon, "4BPU (16c)|COLOR") {
 		t.Fatalf("expected BPLCON0 bitfield auto-comment at 0x10018, got %q", cBplcon)
+	}
+}
+
+func TestAbsShortXrefsAndRangeRollup(t *testing.T) {
+	const base uint32 = 0x10000
+	// 0x10000: move.w $1034.w,d0   30 38 10 34
+	// 0x10004: move.w d0,$1038.w   31 C0 10 38
+	// 0x10008: lea.l  $1178.w,a0   41 F8 11 78
+	// 0x1000C: pea.l  $0020.w      48 78 00 20 (small constant push — must not record xref)
+	// 0x10010: rts                 4E 75
+	code := []byte{
+		0x30, 0x38, 0x10, 0x34,
+		0x31, 0xC0, 0x10, 0x38,
+		0x41, 0xF8, 0x11, 0x78,
+		0x48, 0x78, 0x00, 0x20,
+		0x4E, 0x75,
+	}
+	a, ctrl := newTestTraceAnalyzer(t, code, base)
+	// Pre-populate a CODE cell at base to simulate re-running `hunks analyze` on an existing DB.
+	_ = ctrl.InsertCell(&db.Cell{
+		Addr:     base,
+		Size:     4,
+		Type:     db.CellCode,
+		Mnemonic: db.StrPtr("move.w"),
+		OpStr:    db.StrPtr("$1034.w,d0"),
+		RawBytes: code[0:4],
+	})
+	a.Analyze([]uint32{base})
+
+	if xrefs := ctrl.GetXrefsToRange(0x1034, 0x1035, false); len(xrefs) != 1 || xrefs[0].Source != 0x10000 || xrefs[0].Kind != db.XrefDataRead {
+		t.Fatalf("expected 1 XrefDataRead to 0x1034 from 0x10000, got %+v", xrefs)
+	}
+	if xrefs := ctrl.GetXrefsToRange(0x1038, 0x1039, false); len(xrefs) != 1 || xrefs[0].Source != 0x10004 || xrefs[0].Kind != db.XrefDataWrite {
+		t.Fatalf("expected 1 XrefDataWrite to 0x1038 from 0x10004, got %+v", xrefs)
+	}
+	if xrefs := ctrl.GetXrefsToRange(0x1178, 0x1179, false); len(xrefs) != 1 || xrefs[0].Source != 0x10008 || xrefs[0].Kind != db.XrefDataAddr {
+		t.Fatalf("expected 1 XrefDataAddr to 0x1178 from 0x10008, got %+v", xrefs)
+	}
+	if xrefs := ctrl.GetXrefsToRange(0x0020, 0x0021, false); len(xrefs) != 0 {
+		t.Fatalf("expected pea $0020.w not to record xref, got %+v", xrefs)
+	}
+	rangeXrefs := ctrl.GetXrefsToRange(0x1000, 0x1200, true)
+	if len(rangeXrefs) != 3 {
+		t.Fatalf("expected 3 xrefs in range 0x1000..0x1200, got %+v", rangeXrefs)
+	}
+}
+
+func TestTraceLowRAMTrampolineBouncing(t *testing.T) {
+	const base uint32 = 0x10000
+	code := []byte{
+		0x31, 0xFC, 0x4E, 0xF9, 0x10, 0x32,
+		0x21, 0xFC, 0x00, 0x01, 0x00, 0x14, 0x10, 0x34,
+		0x4E, 0xB8, 0x10, 0x32,
+		0x4E, 0x75,
+		0x70, 0x2A,
+		0x4E, 0x75,
+	}
+	res := RunTrace(code, base, base, TraceOptions{Budget: 100, StuckN: 50})
+	var found bool
+	for _, site := range res.Sites {
+		if site.Addr == 0x1000E && site.Targets[0x10014] > 0 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected RunTrace to bounce through low-RAM trampoline $1032.w and resolve 0x10014, got %+v", res.Sites)
+	}
+}
+
+func TestScopedRegisterAliasAndFieldTypeStripping(t *testing.T) {
+	const base uint32 = 0x10000
+	// 0x10000: bsr.s  $10008        61 06
+	// 0x10002: move.w 2(a0),d0      30 28 00 02
+	// 0x10006: rts                  4E 75
+	// 0x10008: move.w 2(a0),d0      30 28 00 02
+	// 0x1000C: rts                  4E 75
+	code := []byte{
+		0x61, 0x06,
+		0x30, 0x28, 0x00, 0x02,
+		0x4E, 0x75,
+		0x30, 0x28, 0x00, 0x02,
+		0x4E, 0x75,
+	}
+	a, ctrl := newTestTraceAnalyzer(t, code, base)
+	a.Proj.Data.Structs = map[string]map[string]string{
+		"Model": {
+			"2":     "vx.w",
+			"_size": "18",
+		},
+	}
+	a.Proj.Data.RegisterAliases = map[string]string{
+		"LAB_10008:a0": "Model",
+	}
+	a.Analyze([]uint32{base})
+
+	cMain, _ := ctrl.GetCell(0x10002)
+	if cMain == nil || cMain.OpStrVal() != "2(a0),d0" {
+		t.Fatalf("expected un-aliased 2(a0),d0 at 0x10002, got %+v", cMain)
+	}
+	cSub, _ := ctrl.GetCell(0x10008)
+	if cSub == nil || cSub.OpStrVal() != "vx(a0),d0" {
+		t.Fatalf("expected function-scoped alias vx(a0),d0 at 0x10008, got %+v", cSub)
 	}
 }

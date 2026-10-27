@@ -182,13 +182,19 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 						continue
 					}
 					src := addr
+					shouldLabel := op.Mode != m68k.EAAbsShort && a.isValidTarget(ref.Target)
+					if op.Mode == m68k.EAImm && !a.IsInAnyProjectSegment(ref.Target) {
+						shouldLabel = false
+					}
 					switch ref.Kind {
 					case RefCodeCall:
 						target := ref.Target
 						_ = a.DB.InsertXref(addr, target, db.XrefCodeCall)
-						_ = a.DB.InsertEdge(addr, target, db.EdgeCall)
-						a.AddLabel(&src, target)
-						if a.IsInCodeSegment(target) {
+						if shouldLabel {
+							_ = a.DB.InsertEdge(addr, target, db.EdgeCall)
+							a.AddLabel(&src, target)
+						}
+						if op.Mode != m68k.EAAbsShort && a.IsInCodeSegment(target) {
 							labelName := a.GetOrDefaultLabel(target)
 							_ = a.DB.InsertFunction(target, labelName, confidence)
 							if _, seen := visited[target]; !seen {
@@ -199,14 +205,16 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 					case RefCodeBranch:
 						target := ref.Target
 						_ = a.DB.InsertXref(addr, target, db.XrefCodeBranch)
-						if ref.IsConditional {
-							_ = a.DB.InsertEdge(addr, target, db.EdgeCondTrue)
-							_ = a.DB.InsertEdge(addr, addr+size, db.EdgeCondFalse)
-						} else {
-							_ = a.DB.InsertEdge(addr, target, db.EdgeUncond)
+						if shouldLabel {
+							if ref.IsConditional {
+								_ = a.DB.InsertEdge(addr, target, db.EdgeCondTrue)
+								_ = a.DB.InsertEdge(addr, addr+size, db.EdgeCondFalse)
+							} else {
+								_ = a.DB.InsertEdge(addr, target, db.EdgeUncond)
+							}
+							a.AddLabel(&src, target)
 						}
-						a.AddLabel(&src, target)
-						if a.IsInCodeSegment(target) {
+						if op.Mode != m68k.EAAbsShort && a.IsInCodeSegment(target) {
 							if _, seen := visited[target]; !seen {
 								worklist = append(worklist, workItem{addr: target, confidence: confidence})
 							}
@@ -215,22 +223,28 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 					case RefDataAddr:
 						target := ref.Target
 						_ = a.DB.InsertXref(addr, target, db.XrefDataAddr)
-						a.AddLabel(&src, target)
-						if a.IsInCodeSegment(target) && target%2 == 0 {
-							candidateCode = append(candidateCode, target)
+						if shouldLabel {
+							a.AddLabel(&src, target)
+							if a.IsInCodeSegment(target) && target%2 == 0 {
+								candidateCode = append(candidateCode, target)
+							}
 						}
 
 					case RefDataRead:
 						target := ref.Target
 						_ = a.DB.InsertXref(addr, target, db.XrefDataRead)
-						a.AddLabel(&src, target)
-						dataReadTargets[target] = struct{}{}
+						if shouldLabel {
+							a.AddLabel(&src, target)
+							dataReadTargets[target] = struct{}{}
+						}
 
 					case RefDataWrite:
 						target := ref.Target
 						_ = a.DB.InsertXref(addr, target, db.XrefDataWrite)
-						a.AddLabel(&src, target)
-						dataReadTargets[target] = struct{}{}
+						if shouldLabel {
+							a.AddLabel(&src, target)
+							dataReadTargets[target] = struct{}{}
+						}
 
 					case RefIndirect:
 						if _, proc := processedIndirect[addr]; !proc {
