@@ -479,6 +479,10 @@ func buildXrefBadgesMap(
 				mnem = caller.overrideMnem
 			} else if rawSrc >= startAddr && rawSrc < endAddr && len(localCells) > 0 {
 				if c := findContainingCellInSlice(localCells, rawSrc); c != nil {
+					if allLabels[targetAddr] == "" && c.Type == db.CellCode &&
+						(strings.HasSuffix(c.OpStrVal(), ".w") || strings.Contains(c.OpStrVal(), ".w,")) {
+						continue
+					}
 					snappedAddr = c.Addr
 					mnem = c.MnemonicStr()
 					if c.Type == db.CellPointer || c.Type == db.CellDataL {
@@ -655,6 +659,13 @@ func buildListingRowsWithData(
 			entryAddrs[ep.Addr] = true
 		}
 	}
+	fnEntrySet := make(map[uint32]bool, len(entryAddrs)+16)
+	for _, fnAddr := range ctrl.FunctionEntries() {
+		fnEntrySet[fnAddr] = true
+	}
+	for a := range entryAddrs {
+		fnEntrySet[a] = true
+	}
 
 	var rows []ListingRow
 	appendSpacerIfNeeded := func() {
@@ -677,6 +688,16 @@ func buildListingRowsWithData(
 		}
 		badges := xrefsByTarget[addr]
 		lbl := getLabelStr(addr)
+		if fnEntrySet[addr] {
+			if abiStr := proj.GetFunctionABI(lbl, proj.AutoLabel(addr)); abiStr != "" && !strings.Contains(blockText, "ABI:") {
+				abiLine := "ABI: " + abiStr
+				if blockText != "" {
+					blockText = abiLine + "\n" + blockText
+				} else {
+					blockText = abiLine
+				}
+			}
+		}
 
 		if blockText != "" || len(badges) > 0 || lbl != "" {
 			appendSpacerIfNeeded()
@@ -934,6 +955,7 @@ func buildListingRowsWithData(
 
 	addr := baseAddr
 	expIdx := 0
+	var curFuncLabel, curFuncAutoLabel string
 	for addr < dataEnd {
 		nextExpAddr := dataEnd
 		if expIdx < len(explicitCells) {
@@ -965,12 +987,20 @@ func buildListingRowsWithData(
 
 		isStringCell := cell.Type == db.CellStr
 		emitPreSubRows(addr, cell.Size, cell.Type.AsStr(), isStringCell, false)
+		if fnEntrySet[addr] {
+			if l := getLabelStr(addr); l != "" {
+				curFuncLabel = l
+			} else {
+				curFuncLabel = proj.AutoLabel(addr)
+			}
+			curFuncAutoLabel = proj.AutoLabel(addr)
+		}
 
 		addrCopy := addr
 		switch cell.Type {
 		case db.CellCode:
 			mnem := cell.MnemonicStr()
-			opStr := cell.OpStrVal()
+			opStr := proj.ApplyStructAliasesToOpStr(cell.OpStrVal(), curFuncLabel, curFuncAutoLabel)
 			var timing m68k.Timing
 			var isTerm bool
 			if insn, ok := m68k.Decode(raw, addr); ok {
@@ -1019,6 +1049,17 @@ func buildListingRowsWithData(
 							targetHint = fmt.Sprintf("→ %s", tseg.Name)
 							break
 						}
+					}
+				}
+			}
+
+			if (op == m68k.OpJSR || op == m68k.OpBSR) && refTgt != nil {
+				if calleeABI := proj.GetFunctionABI(getLabelStr(*refTgt), proj.AutoLabel(*refTgt)); calleeABI != "" {
+					abiTag := fmt.Sprintf("[ABI: %s]", calleeABI)
+					if targetHint == "" {
+						targetHint = abiTag
+					} else if !strings.Contains(targetHint, "ABI:") {
+						targetHint = targetHint + " " + abiTag
 					}
 				}
 			}

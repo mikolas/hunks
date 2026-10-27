@@ -866,6 +866,12 @@ func renderModal(buf *screenBuffer, a *App, screen rect) {
 		renderInputModal(buf, screen, " Comment ", &m.Input, fgYellow)
 	case ModalBlockComment:
 		renderInputModal(buf, screen, " Block Comment ", &m.Input, fgYellow)
+	case ModalABI:
+		title := " Function ABI "
+		if m.ABIFuncLabel != "" {
+			title = fmt.Sprintf(" Function ABI (%s) ", m.ABIFuncLabel)
+		}
+		renderInputModal(buf, screen, title, &m.Input, fgCyan)
 	case ModalGoto:
 		title := " Goto (hex or label) "
 		if a.IsRelocatable {
@@ -957,6 +963,9 @@ func renderModal(buf *screenBuffer, a *App, screen rect) {
 			if fn.Cycles != "" {
 				spans = append(spans, styledSpan{text: fn.Cycles, style: cellStyle{fg: fgYellow}})
 			}
+			if fn.ABI != "" {
+				spans = append(spans, styledSpan{text: "  " + fn.ABI, style: cellStyle{fg: fgCyan}})
+			}
 			rows[i] = spans
 		}
 		renderListModal(buf, area, title, fgGreen, rows, m.ListSelect)
@@ -992,7 +1001,7 @@ func renderModal(buf *screenBuffer, a *App, screen rect) {
 			"  Ctrl-d/u Half page   Home/End  Top/Bottom",
 			"",
 			"Annotation:",
-			"  n  Rename   ;  Comment   :  Block comment",
+			"  n  Rename   ;  Comment   :  Block comment   A  ABI",
 			"  #  Cycle format (HEX/DEC/BIN)",
 			"",
 			"Type Marking:",

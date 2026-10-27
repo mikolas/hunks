@@ -175,7 +175,35 @@ hunks -m <module> dump -f json > findings_state.json    # export entries, region
 
 ## Agent Reverse-Engineering Playbook
 
-This playbook defines the standard workflow for AI coding/reverse-engineering agents working on an Amiga binary with `hunks`. Every command is atomic and read-only (or a fast metadata mutation) — **do not write ad-hoc Python/shell scripts to grep raw bytes or scrape full assembly dumps when a `hunks` primitive answers the question directly**.
+This playbook defines the standard workflow for AI coding/reverse-engineering agents working on an Amiga binary with `hunks`. Every command is atomic and read-only (or a fast metadata mutation) — **do not write ad-hoc Python/shell scripts to grep raw bytes or scrape full assembly dumps when a `hunks` primitive answers the question directly**, and **never run `emit` just to text-search the listing** — `search`/`xref`/`data` answer those questions against `project.db`.
+
+### 0. Recommended Order (Optimized Cold-Start Path)
+
+For a freshly `init`'d binary, work top-down to the spine, then bottom-up to name it:
+
+```
+1. analyze --trace            seed code/vectors/dispatch on a self-booting binary
+2. xref '$64..$7C'            find installed interrupt vectors (async call-graph roots)
+3. cg --indirect              map the dispatch spine (state machines, jump tables)
+4. search cluster:<...>       locate each subsystem (3dmath/blitter/copper/paula/...)
+5. cg <hot> --code            read a routine + its "Globals & Memory Flow" block
+   + xref <global>            map every producer/consumer of each global it touches
+6. data --struct <N> --count  decode record arrays AND verify fields against real bytes
+7. rename -> abi -> comment   bottom-up, only after reading each body (Section 4)
+8. dump -f json               reconcile DB state with your FINDINGS.md
+```
+
+**Three principles that prevent wrong turns:**
+- **`xref` is the data-flow oracle; `search o:` is only substring text.** To map a global use
+  `xref <addr>` (returns typed `READ`/`WRITE`/`ADDR`/`CALL`/`BRANCH`); fall back to `search 'o:$addr'`
+  only for the textual operand form or when `xref` is empty.
+- **Trace resolves only what the playthrough exercised.** `[UNRESOLVED]` sites in `cg --indirect`
+  after `analyze --trace` are **normal** for data-driven dispatch (e.g. per-song audio step routines) —
+  resolve them statically with `hint pointer --follow` when a table is obvious, otherwise document the
+  table and move on. Do not treat unresolved as failure.
+- **Verify every structural guess against bytes.** After `struct add`, always
+  `data --struct --count N` and sanity-check: do `.p` fields resolve to labels, are counts plausible,
+  does the stride line up? A wrong `--size`/field type is caught here, not later.
 
 ### 1. Command Selection Matrix (What to Use and When)
 
@@ -224,9 +252,11 @@ When starting on a newly initialized module, map the top-level control flow befo
    ```
    - Many games drive their main loop or per-entity update via a state-machine jump table (`move.l Table(pc,d0.w),a0; jsr (a0)`) or a function pointer in low RAM (`jsr (a4)`).
    - For any `[UNRESOLVED]` site in `cg --indirect`, inspect the enclosing function with `cg <Func> --code`, inspect the table address with `hunks -m <mod> data <table_addr> --len 64`, and mark pointer tables with `hunks -m <mod> hint pointer <table_addr> <count> --follow` so all state handlers enter the call graph.
-4. **Identify the Per-Frame Run Loop:**
-   - Inside `main` (or the primary state handler), locate the main loop (indicated by `+loop` in `cg` and a frame-sync call waiting on `VPOSR`/`VHPOSR` or a VBlank flag).
-   - The direct callees of that loop give you the spine of the application: **Input/AI Update $\rightarrow$ Camera/World Transform $\rightarrow$ Scene/Object Cull & Sort $\rightarrow$ Rasterize/Blit $\rightarrow$ Copper/Page Flip $\rightarrow$ Audio Tick**.
+   - **Expect residual `[UNRESOLVED]` sites.** `analyze --trace` only resolves dispatch the playthrough actually took; data-driven callbacks (per-song audio step routines, rarely-hit menu branches) legitimately stay unresolved. Resolve the ones backed by an obvious pointer table, document the rest — unresolved is not a failure.
+4. **Identify the Per-Frame Run Loop or Mode Dispatcher:**
+   - The frame driver is often **not** a `VPOSR`/VBlank-wait loop but a **mode-code state dispatcher**: a handler that reads a mode byte and branches per value (`move.w $mode,d0; cmp.b #'E',d0hi; beq ...; cmp.b #'_',d0hi; beq ...`). Each matched mode is a separate top-level pipeline (menu / flight / debrief / map); map and name each handler independently.
+   - Otherwise locate the loop by `+loop` in `cg` plus a frame-sync call (VBlank flag or `VPOSR`/`VHPOSR` wait).
+   - The direct callees of the active handler give the spine of the application: **Input/AI Update $\rightarrow$ Camera/World Transform $\rightarrow$ Scene/Object Cull & Sort $\rightarrow$ Rasterize/Blit $\rightarrow$ Copper/Page Flip $\rightarrow$ Audio Tick**.
 
 ---
 
@@ -247,13 +277,19 @@ Use cluster queries, mnemonic searches, and region XREF rollups to isolate each 
    - Inspect a math routine with `cg <MathFunc> --code` and check its **`=== Globals & Memory Flow ===`** block (e.g. `Reads: $1178, $117A...` / `Writes: $10E6...`).
    - Run `hunks -m <mod> xref 0x1178` (or `hunks -m <mod> xref '$1060..$1210'`) to find every producer that writes the matrix/workspace and every consumer that reads it.
 
-#### B. Rendering, Blitter & Self-Modifying Fill Kernels
+#### B. Rendering, Blitter & CPU Fill Kernels
 1. **Locate Blitter & CPU rasterizer kernels:**
    ```bash
    hunks -m <mod> search cluster:blitter
    hunks -m <mod> search smc
    ```
-   - Amiga 3D and 2D engines frequently use **Self-Modifying Code (`search smc`)** for polygon span fillers, line drawers, and unrolled bitplane clearers (patching an instruction's immediate mask or computing a dynamic branch offset into an unrolled tower of `move.w d0,-(a0)` / `bfins` instructions).
+   - `search smc` finds **true opcode-patching** — instructions that write into `CODE` cells: boot
+     relocators/decompressors, `rts`-toggle self-enable tricks, and the rarer dynamically-patched
+     immediate/branch. Expect **few** hits; treat each as a genuine runtime code mutation.
+   - **Unrolled fill kernels are usually NOT self-modifying.** CPU span fillers, line drawers, and
+     bitplane clearers are typically a **bank of unrolled or jump-table-dispatched kernels** (one per
+     color/length/slope), reached by a computed `jmp (pc,d.w)` — find those with `cg --indirect`
+     (resolved jump tables) and `search cluster:blitter`, not `search smc`.
    - When you find a contiguous bank of unrolled fill kernels or edge-mask tables (e.g. `+3DDEE..+3EFFF`), run a **region XREF rollup** to see every dispatcher that enters the bank without querying dozens of individual addresses:
      ```bash
      hunks -m <mod> xref '+3DDEE..+3EFFF'
@@ -282,14 +318,21 @@ Use cluster queries, mnemonic searches, and region XREF rollups to isolate each 
      ```bash
      hunks -m <mod> struct add ModelRec --size 18 0=Model_Radius.w 2=Model_Verts.p 6=Model_Faces.p 10=Model_NumVerts.w
      ```
-   - Dump the entire table as decoded records to verify your field types against the actual bytes:
+   - Dump the entire table as decoded records and **verify before trusting the layout** — this step catches a wrong `--size` stride or mis-typed field immediately (do `.p` fields resolve to labels? are counts plausible? does record[1] start where record[0] ends?):
      ```bash
      hunks -m <mod> data 0x6B6E --struct ModelRec --count 16
      ```
+     If a field looks wrong (a `.p` that doesn't resolve, a count of thousands), adjust `--size`/field
+     types and re-decode. Never document a struct you haven't byte-verified this way.
    - Bind the base register **scoped to the consuming function** (`--fn`) so `2(a0)` renders as `Model_Verts(a0)` in `Poly_RenderObject` without polluting unrelated uses of `a0` elsewhere:
      ```bash
      hunks -m <mod> alias a0 ModelRec --fn Poly_RenderObject
      ```
+3. **Use `cg --suspect` to find table boundaries, not just bugs:**
+   - A function flagged `SUSPECT:DATA_*@+off` (fallthrough into data) is frequently the exact boundary
+     between a routine and an adjacent **vertex/pointer/jump table**. Inspect the suspect address with
+     `data <addr>` / `data <addr> --struct ...`; if it is a pointer table, `hint pointer <addr> N --follow`;
+     if a record array, define a struct. Suspects are structure-discovery leads, not only cutoff errors.
 
 ---
 
@@ -305,6 +348,10 @@ Follow a strict **bottom-up verification discipline** so annotations remain accu
 
 #### Rule 2: How and When to Add an ABI Envelope (`hunks abi`)
 - **Why ABI envelopes matter:** In M68000 assembly, arguments are passed in arbitrary registers (`d0`–`d7`, `a0`–`a6`) or scratch memory slots. Recording a function's ABI attaches `; [ABI: ...]` to every `jsr`/`bsr` call site in `cg --code` and `; ABI: ...` to emitted `.asm` function headers, eliminating the need to re-read callees when analyzing higher-level callers.
+- **Canonical signature grammar** (one form everywhere, so `--verify` can parse it):
+  `(in_reg=role, ...) -> out_reg=role | clobbers: regs`. Inputs/outputs may be registers
+  (`d0.w`, `a0`) or memory globals (`$10E4=count`); `clobbers:` lists registers trashed and not
+  restored. Omit any empty section (`(a0=desc) -> void`). Keep it one line.
 - **Always check `Regs (static)` first:** Every `cg <Func>` output displays the statically inferred register envelope:
   ```text
   Regs (static):  in: d0,a0 | mod: d0,d1,a0,a1 | saved: d2,d3,a2
@@ -710,9 +757,10 @@ Instructions that jump/call across hunks or through a register jump-vector table
 
 | Key | Action |
 |-----|--------|
-| `n` | Rename label at cursor (propagates across all segments) |
+| `n` | Rename label at cursor (propagates across all segments and re-keys function ABIs/aliases) |
 | `;` | Edit inline comment at cursor (on `STRING` rows, opens the block comment editor so comments appear cleanly above `dc.b "...",0`) |
 | `:` | Edit block comment (emitted on its own `; ...` line(s) above the instruction/label/string) |
+| `A` | Set or edit function ABI signature for the enclosing function (displayed above the function label, in `f` Functions list, and on `JSR`/`BSR` call rows) |
 | `#` | Cycle operand format (`HEX` → `DEC` → `BIN`) |
 
 ### Project & Tool Keys
