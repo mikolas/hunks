@@ -1017,6 +1017,15 @@ func TestFunctionMetaAndNoreturnPruning(t *testing.T) {
 		0x4A, 0xFC,
 	}
 	a, ctrl := newTestTraceAnalyzer(t, code, base)
+	// Pre-populate a CODE cell at base to simulate re-running `hunks analyze` on an existing DB.
+	_ = ctrl.InsertCell(&db.Cell{
+		Addr:     base,
+		Size:     4,
+		Type:     db.CellCode,
+		Mnemonic: db.StrPtr("move.w"),
+		OpStr:    db.StrPtr("$1034.w,d0"),
+		RawBytes: code[0:4],
+	})
 	a.Analyze([]uint32{base})
 
 	const normalFn = base + 0x0E   // 0x1000E
@@ -1097,6 +1106,15 @@ func TestApplyTraceRegDispatchesResolvesFromRegContext(t *testing.T) {
 	// 0x10002: rts        4E 75   (the observed target)
 	code := []byte{0x4E, 0xD0, 0x4E, 0x75}
 	a, ctrl := newTestTraceAnalyzer(t, code, base)
+	// Pre-populate a CODE cell at base to simulate re-running `hunks analyze` on an existing DB.
+	_ = ctrl.InsertCell(&db.Cell{
+		Addr:     base,
+		Size:     4,
+		Type:     db.CellCode,
+		Mnemonic: db.StrPtr("move.w"),
+		OpStr:    db.StrPtr("$1034.w,d0"),
+		RawBytes: code[0:4],
+	})
 	a.Analyze([]uint32{base})
 
 	// Static analysis leaves the jmp (a0) site unresolved (no control edge).
@@ -1191,6 +1209,15 @@ func TestCustomRegBitfieldAutoComments(t *testing.T) {
 		0x4E, 0x75,
 	}
 	a, ctrl := newTestTraceAnalyzer(t, code, base)
+	// Pre-populate a CODE cell at base to simulate re-running `hunks analyze` on an existing DB.
+	_ = ctrl.InsertCell(&db.Cell{
+		Addr:     base,
+		Size:     4,
+		Type:     db.CellCode,
+		Mnemonic: db.StrPtr("move.w"),
+		OpStr:    db.StrPtr("$1034.w,d0"),
+		RawBytes: code[0:4],
+	})
 	a.Analyze([]uint32{base})
 
 	cDmacon := ctrl.GetAddressComment(0x10000).AutoComment
@@ -1224,6 +1251,15 @@ func TestAbsShortXrefsAndRangeRollup(t *testing.T) {
 		0x4E, 0x75,
 	}
 	a, ctrl := newTestTraceAnalyzer(t, code, base)
+	// Pre-populate a CODE cell at base to simulate re-running `hunks analyze` on an existing DB.
+	_ = ctrl.InsertCell(&db.Cell{
+		Addr:     base,
+		Size:     4,
+		Type:     db.CellCode,
+		Mnemonic: db.StrPtr("move.w"),
+		OpStr:    db.StrPtr("$1034.w,d0"),
+		RawBytes: code[0:4],
+	})
 	a.Analyze([]uint32{base})
 
 	if xrefs := ctrl.GetXrefsToRange(0x1034, 0x1035, false); len(xrefs) != 1 || xrefs[0].Source != 0x10000 || xrefs[0].Kind != db.XrefDataRead {

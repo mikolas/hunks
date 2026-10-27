@@ -452,6 +452,14 @@ func (a *Analyzer) Analyze(startAddrs []uint32) {
 			entries = append(entries, seg.Base)
 		}
 	}
+	if startAddrs == nil {
+		for _, fnAddr := range a.DB.FunctionEntries() {
+			if a.IsInCodeSegment(fnAddr) && !slices.Contains(entries, fnAddr) {
+				entries = append(entries, fnAddr)
+			}
+		}
+	}
+	_ = a.DB.DeleteCodeCells()
 
 	a.runPipeline(entries)
 	a.updateCoverageStats()
