@@ -1053,6 +1053,25 @@ func (e *Emitter) PopulateCellsItems() error {
 			e.addItemSizedAt(addr, label, mnem, opStr, commentStr, cell.Size)
 		}
 
+		if cell.Size > 1 && cell.Type != db.CellCode {
+			idxStart, _ := slices.BinarySearch(allLabelAddrs, addr+1)
+			idxEnd, _ := slices.BinarySearch(allLabelAddrs, addr+cell.Size)
+			for _, intAddr := range allLabelAddrs[idxStart:idxEnd] {
+				intLbl := getLabelStr(intAddr)
+				if intLbl == "" {
+					continue
+				}
+				if e.Relocatable && isEntry(intAddr) {
+					e.addItem("", "xdef", intLbl, "")
+				}
+				if label != "" {
+					e.addItemAt(intAddr, intLbl, "equ", fmt.Sprintf("%s+$%X", label, intAddr-addr), "")
+				} else {
+					e.addItemAt(intAddr, intLbl, "equ", fmt.Sprintf("*-$%X", (addr+cell.Size)-intAddr), "")
+				}
+			}
+		}
+
 		addr += cell.Size
 	}
 
@@ -1379,16 +1398,33 @@ func EmitAllAmiga(proj *project.Project, outDir string, force bool) error {
 			equatesLines = append(equatesLines, fmt.Sprintf("%s\tequ\t%s", seq.name, formatSignedEquHex(seq.offset)))
 		}
 	}
-	if err := os.WriteFile(filepath.Join(srcDir, "equates.i"), []byte(strings.Join(equatesLines, "\n")+"\n"), 0o644); err != nil {
-		return err
-	}
 
-	// 2. Emit each modular hunk to src/<targetName>/{seg.Name}.asm
 	proj.SyncDBScope(sharedCtrl)
 	sharedCache, err := buildSpaceCache(sharedCtrl)
 	if err != nil {
 		return err
 	}
+	var extEquates []string
+	for _, addr := range sharedCache.sortedLabelAddrs {
+		if proj.SegmentAtAddr(addr) != nil {
+			continue
+		}
+		if _, isHW := amiga.GetAmigaHWLabel(addr); isHW {
+			continue
+		}
+		if lbl := sharedCache.allLabels[addr]; lbl != "" {
+			extEquates = append(extEquates, fmt.Sprintf("%s\tequ\t$%X", lbl, addr))
+		}
+	}
+	if len(extEquates) > 0 {
+		equatesLines = append(equatesLines, "", "; --- External/BSS Equates ---")
+		equatesLines = append(equatesLines, extEquates...)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "equates.i"), []byte(strings.Join(equatesLines, "\n")+"\n"), 0o644); err != nil {
+		return err
+	}
+
+	// 2. Emit each modular hunk to src/<targetName>/{seg.Name}.asm
 	hunkFiles := make([]string, 0, len(segments))
 	for _, seg := range segments {
 		proj.ActiveSegmentName = seg.Name
