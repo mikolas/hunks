@@ -431,6 +431,16 @@ func matchesClusterInstruction(clusterName string, mnem, opStr, comment string) 
 			return true
 		}
 		return false
+	case "mul":
+		return baseMnem == "muls" || baseMnem == "mulu"
+	case "div":
+		return baseMnem == "divs" || baseMnem == "divu"
+	case "trig", "sin", "cos":
+		switch baseMnem {
+		case "muls", "mulu", "asr", "lsr", "lsl", "asl":
+			return strings.Contains(opStr, "(a") && strings.Contains(opStr, ",")
+		}
+		return false
 	case "blitter":
 		for _, tok := range []string{"BLT", "DMACON"} {
 			if strings.Contains(combined, tok) {
@@ -463,8 +473,10 @@ func matchesClusterInstruction(clusterName string, mnem, opStr, comment string) 
 		return strings.Contains(combined, "SPR")
 	case "cia", "timer":
 		return strings.Contains(combined, "CIA")
-	case "dma", "irq", "interrupt":
-		for _, tok := range []string{"DMACON", "INTENA", "INTREQ"} {
+	case "dma":
+		return strings.Contains(combined, "DMACON")
+	case "irq", "interrupt":
+		for _, tok := range []string{"INTENA", "INTREQ"} {
 			if strings.Contains(combined, tok) {
 				return true
 			}
@@ -493,6 +505,25 @@ func dispatchControllerSearch(proj *project.Project, ctrl *db.Controller, cg *ca
 		add(ctrl.SearchCode("o", needle, nil, maxDBLimit))
 		// Also match auto/inline comments (e.g. resolved hardware or base-reg targets).
 		add(ctrl.SearchComments(needle, nil, maxDBLimit))
+		if len(proj.Data.RegisterAliases) > 0 && len(proj.Data.Structs) > 0 {
+			needleLower := strings.ToLower(needle)
+			for addr, cell := range cg.Cells {
+				if cell.Type != db.CellCode {
+					continue
+				}
+				var fnName, fnRaw string
+				if fAddr, ok := cg.InsnToFunc[addr]; ok {
+					if f, ok := cg.Functions[fAddr]; ok {
+						fnName = f.Name
+						fnRaw = f.RawName
+					}
+				}
+				aliased := proj.ApplyStructAliasesToOpStr(cell.OpStrVal(), fnName, fnRaw)
+				if strings.Contains(strings.ToLower(aliased), needleLower) {
+					out = append(out, addr)
+				}
+			}
+		}
 	case strings.HasPrefix(qLower, "s:"):
 		add(ctrl.SearchStrings(strings.TrimSpace(q[2:]), nil, maxDBLimit))
 	case strings.HasPrefix(qLower, "c:"):
@@ -557,69 +588,74 @@ func runSearchCommand(
 			continue
 		}
 		seenDBs[seg.DB] = true
-		ctrl, err := db.New(seg.DB)
-		if err != nil {
-			return err
-		}
-		proj.SyncDBScope(ctrl)
-
-		switch {
-		case qLower == "smc":
-			// Match all CODE cells with [SMC] comment or XrefDataWrite targeting a CODE cell.
-			for _, addr := range slices.Sorted(maps.Keys(cg.Cells)) {
-				cell := cg.Cells[addr]
-				if cell.Type != db.CellCode {
-					continue
-				}
-				if strings.Contains(cg.Comments[addr].EffectiveComment(), "[SMC]") {
-					matchedAddrs = append(matchedAddrs, addr)
-				}
+		if err := func(dbPath string) error {
+			ctrl, err := db.New(dbPath)
+			if err != nil {
+				return err
 			}
-			for _, x := range ctrl.AllXrefs() {
-				if x.Kind == db.XrefDataWrite {
-					if srcCell, ok := cg.Cells[x.Source]; ok && srcCell.Type == db.CellCode {
-						if tgtCell, ok := cg.Cells[x.Target]; ok && tgtCell.Type == db.CellCode {
-							if !slices.Contains(matchedAddrs, x.Source) {
-								matchedAddrs = append(matchedAddrs, x.Source)
+			defer ctrl.Close()
+			proj.SyncDBScope(ctrl)
+
+			switch {
+			case qLower == "smc":
+				// Match all CODE cells with [SMC] comment or XrefDataWrite targeting a CODE cell.
+				for _, addr := range slices.Sorted(maps.Keys(cg.Cells)) {
+					cell := cg.Cells[addr]
+					if cell.Type != db.CellCode {
+						continue
+					}
+					if strings.Contains(cg.Comments[addr].EffectiveComment(), "[SMC]") {
+						matchedAddrs = append(matchedAddrs, addr)
+					}
+				}
+				for _, x := range ctrl.AllXrefs() {
+					if x.Kind == db.XrefDataWrite {
+						if srcCell, ok := cg.Cells[x.Source]; ok && srcCell.Type == db.CellCode {
+							if tgtCell, ok := cg.Cells[x.Target]; ok && tgtCell.Type == db.CellCode {
+								if !slices.Contains(matchedAddrs, x.Source) {
+									matchedAddrs = append(matchedAddrs, x.Source)
+								}
 							}
 						}
 					}
 				}
-			}
 
-		case strings.HasPrefix(qLower, "cluster:"):
-			clusterName := strings.TrimSpace(query[len("cluster:"):])
-			var clusterAddrs []uint32
-			for _, addr := range slices.Sorted(maps.Keys(cg.Cells)) {
-				cell := cg.Cells[addr]
-				if cell.Type != db.CellCode {
-					continue
-				}
-				cmt := cg.Comments[addr].EffectiveComment()
-				if matchesClusterInstruction(clusterName, cell.MnemonicStr(), cell.OpStrVal(), cmt) {
-					clusterAddrs = append(clusterAddrs, addr)
-				}
-			}
-			if denseOnly {
-				for i := range clusterAddrs {
-					j := i
-					for j < len(clusterAddrs) && clusterAddrs[j]-clusterAddrs[i] <= 24 {
-						j++
+			case strings.HasPrefix(qLower, "cluster:"):
+				clusterName := strings.TrimSpace(query[len("cluster:"):])
+				var clusterAddrs []uint32
+				for _, addr := range slices.Sorted(maps.Keys(cg.Cells)) {
+					cell := cg.Cells[addr]
+					if cell.Type != db.CellCode {
+						continue
 					}
-					if j-i >= 3 {
-						for k := i; k < j; k++ {
-							matchedAddrs = append(matchedAddrs, clusterAddrs[k])
+					cmt := cg.Comments[addr].EffectiveComment()
+					if matchesClusterInstruction(clusterName, cell.MnemonicStr(), cell.OpStrVal(), cmt) {
+						clusterAddrs = append(clusterAddrs, addr)
+					}
+				}
+				if denseOnly {
+					for i := range clusterAddrs {
+						j := i
+						for j < len(clusterAddrs) && clusterAddrs[j]-clusterAddrs[i] <= 24 {
+							j++
+						}
+						if j-i >= 3 {
+							for k := i; k < j; k++ {
+								matchedAddrs = append(matchedAddrs, clusterAddrs[k])
+							}
 						}
 					}
+				} else {
+					matchedAddrs = append(matchedAddrs, clusterAddrs...)
 				}
-			} else {
-				matchedAddrs = append(matchedAddrs, clusterAddrs...)
-			}
 
-		default:
-			matchedAddrs = append(matchedAddrs, dispatchControllerSearch(proj, ctrl, cg, query)...)
+			default:
+				matchedAddrs = append(matchedAddrs, dispatchControllerSearch(proj, ctrl, cg, query)...)
+			}
+			return nil
+		}(seg.DB); err != nil {
+			return err
 		}
-		_ = ctrl.Close()
 	}
 
 	slices.Sort(matchedAddrs)
@@ -639,6 +675,14 @@ func runSearchCommand(
 		if normSeg != "" && !strings.EqualFold(segName, normSeg) {
 			continue
 		}
+		var fnName, fnRaw, fnOffStr string
+		if fAddr, ok := cg.InsnToFunc[addr]; ok {
+			if f, ok := cg.Functions[fAddr]; ok {
+				fnName = f.Name
+				fnRaw = f.RawName
+				fnOffStr = formatFnOffset(addr, f.EntryAddr)
+			}
+		}
 		cell, ok := cg.Cells[addr]
 		cellType := "DATA"
 		var insnText string
@@ -646,6 +690,9 @@ func runSearchCommand(
 			cellType = cell.Type.AsStr()
 			mnem := cell.MnemonicStr()
 			ops := cell.OpStrVal()
+			if cell.Type == db.CellCode {
+				ops = proj.ApplyStructAliasesToOpStr(ops, fnName, fnRaw)
+			}
 			if mnem != "" {
 				insnText = strings.TrimSpace(fmt.Sprintf("%-8s %s", mnem, ops))
 			} else if ops != "" {
@@ -656,14 +703,6 @@ func runSearchCommand(
 		} else if lbl := cg.Labels[addr]; lbl != "" {
 			cellType = "LABEL"
 			insnText = lbl
-		}
-
-		var fnName, fnOffStr string
-		if fAddr, ok := cg.InsnToFunc[addr]; ok {
-			if f, ok := cg.Functions[fAddr]; ok {
-				fnName = f.Name
-				fnOffStr = formatFnOffset(addr, f.EntryAddr)
-			}
 		}
 		cmt := cg.Comments[addr].EffectiveComment()
 		hits = append(hits, searchHitJSON{
@@ -837,7 +876,7 @@ func renderDataInspection(
 				items = append(items, dataItemJSON{
 					Offset:  fmt.Sprintf("+%05X", off),
 					Addr:    fmt.Sprintf("0x%X", cur),
-					Type:    "STRING",
+					Type:    c.Type.AsStr(),
 					Asm:     fmt.Sprintf("dc.b %q,0", strPreview),
 					Comment: cg.Comments[cur].EffectiveComment(),
 				})
@@ -849,7 +888,7 @@ func renderDataInspection(
 					items = append(items, dataItemJSON{
 						Offset:  fmt.Sprintf("+%05X", off),
 						Addr:    fmt.Sprintf("0x%X", cur),
-						Type:    "DATA_W",
+						Type:    c.Type.AsStr(),
 						Asm:     fmt.Sprintf("dc.w $%04X (%d)", val, int16(val)),
 						Comment: cg.Comments[cur].EffectiveComment(),
 					})
@@ -1182,6 +1221,30 @@ type xrefHitJSON struct {
 	TargetAddr string `json:"target_addr"`
 }
 
+func collectXrefsToRange(proj *project.Project, fallbackCtrl *db.Controller, startAddr, endAddr uint32, externalOnly bool) []db.Xref {
+	var rawXrefs []db.Xref
+	seenDBs := make(map[string]bool)
+	for _, seg := range proj.ActiveSegments() {
+		if seenDBs[seg.DB] {
+			continue
+		}
+		seenDBs[seg.DB] = true
+		func(dbPath string) {
+			ctrl, err := db.New(dbPath)
+			if err != nil {
+				return
+			}
+			defer ctrl.Close()
+			proj.SyncDBScope(ctrl)
+			rawXrefs = append(rawXrefs, ctrl.GetXrefsToRange(startAddr, endAddr, externalOnly)...)
+		}(seg.DB)
+	}
+	if len(seenDBs) == 0 && fallbackCtrl != nil {
+		rawXrefs = fallbackCtrl.GetXrefsToRange(startAddr, endAddr, externalOnly)
+	}
+	return rawXrefs
+}
+
 func runXrefCommand(
 	proj *project.Project,
 	ctrl *db.Controller,
@@ -1222,7 +1285,7 @@ func runXrefCommand(
 		}
 	}
 
-	rawXrefs := ctrl.GetXrefsToRange(targetAddr, targetAddr, false)
+	rawXrefs := collectXrefsToRange(proj, ctrl, targetAddr, targetAddr, false)
 	hits := formatXrefHits(proj, cg, rawXrefs, 0, 0, false)
 
 	lbl := cg.Labels[targetAddr]
@@ -1270,7 +1333,7 @@ func renderXrefRange(
 	startAddr, endAddr uint32,
 	format string,
 ) (string, error) {
-	rawXrefs := ctrl.GetXrefsToRange(startAddr, endAddr, true)
+	rawXrefs := collectXrefsToRange(proj, ctrl, startAddr, endAddr, true)
 	// Exclude internal references where source is also inside [startAddr, endAddr].
 	hits := formatXrefHits(proj, cg, rawXrefs, startAddr, endAddr, true)
 
@@ -1824,40 +1887,45 @@ func runDumpCommand(proj *project.Project, section string, format string) (strin
 			continue
 		}
 		seenDBs[seg.DB] = true
-		ctrl, err := db.New(seg.DB)
-		if err != nil {
+		if err := func(dbPath string) error {
+			ctrl, err := db.New(dbPath)
+			if err != nil {
+				return err
+			}
+			defer ctrl.Close()
+			proj.SyncDBScope(ctrl)
+			for _, ac := range ctrl.GetUserComments() {
+				addr := ac.Addr
+				s := proj.SegmentAtAddr(addr)
+				segName := ""
+				var off uint32
+				if s != nil {
+					segName = s.Name
+					if addr >= s.Base {
+						off = addr - s.Base
+					}
+				}
+				var fnName, fnOff string
+				if fAddr, ok := cg.InsnToFunc[addr]; ok {
+					if f, ok := cg.Functions[fAddr]; ok {
+						fnName = f.Name
+						fnOff = formatFnOffset(addr, f.EntryAddr)
+					}
+				}
+				userComments = append(userComments, commentEntry{
+					Addr:         fmt.Sprintf("0x%X", addr),
+					Segment:      segName,
+					Offset:       fmt.Sprintf("+%05X", off),
+					Func:         fnName,
+					FnOffset:     fnOff,
+					Comment:      ac.Comment,
+					BlockComment: ac.BlockComment,
+				})
+			}
+			return nil
+		}(seg.DB); err != nil {
 			return "", err
 		}
-		proj.SyncDBScope(ctrl)
-		for _, ac := range ctrl.GetUserComments() {
-			addr := ac.Addr
-			s := proj.SegmentAtAddr(addr)
-			segName := ""
-			var off uint32
-			if s != nil {
-				segName = s.Name
-				if addr >= s.Base {
-					off = addr - s.Base
-				}
-			}
-			var fnName, fnOff string
-			if fAddr, ok := cg.InsnToFunc[addr]; ok {
-				if f, ok := cg.Functions[fAddr]; ok {
-					fnName = f.Name
-					fnOff = formatFnOffset(addr, f.EntryAddr)
-				}
-			}
-			userComments = append(userComments, commentEntry{
-				Addr:         fmt.Sprintf("0x%X", addr),
-				Segment:      segName,
-				Offset:       fmt.Sprintf("+%05X", off),
-				Func:         fnName,
-				FnOffset:     fnOff,
-				Comment:      ac.Comment,
-				BlockComment: ac.BlockComment,
-			})
-		}
-		_ = ctrl.Close()
 	}
 
 	for _, addr := range slices.Sorted(maps.Keys(cg.Cells)) {

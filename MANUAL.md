@@ -140,7 +140,7 @@ Every CLI command that takes a `TARGET` (`callgraph`, `hint`, `comment`, `operan
 hunks -m <module> search m:muls.w                       # mnemonic prefix match
 hunks -m <module> search 'o:$1178'                      # operand substring match
 hunks -m <module> search cluster:3dmath --dense         # dense pockets (>=3 hits in 24B) of muls/mulu/divs/divu
-hunks -m <module> search cluster:blitter                # blitter, copper, paula, bitplane, sprite, cia, dma
+hunks -m <module> search cluster:blitter                # presets: 3dmath, mul, div, trig, blitter, copper, paula, bitplane, sprite, cia, dma, irq
 hunks -m <module> search smc                            # self-modifying code writes into CODE cells
 ```
 

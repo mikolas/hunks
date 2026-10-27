@@ -1089,6 +1089,7 @@ func main() {
 					defer ctrl.Close()
 					proj.SyncDBScope(ctrl)
 					return ctrl.WithTransaction(func() error {
+						renamesMap, _ := ctrl.GetAllRenames()
 						var affectedAddrs []uint32
 						for _, p := range pairs {
 							cleanOld := p.oldName
@@ -1120,12 +1121,17 @@ func main() {
 									effectiveOld = auto
 								}
 							}
+							prevRenamed := renamesMap[effectiveOld]
 							if err := ctrl.SetRename(effectiveOld, p.newName); err != nil {
 								ctrl.SetActiveSeg(prevSeg)
 								return err
 							}
+							renamesMap[effectiveOld] = p.newName
 							proj.ReKeyFunctionABI(effectiveOld, p.newName)
 							proj.ReKeyFunctionABI(cleanOld, p.newName)
+							if prevRenamed != "" {
+								proj.ReKeyFunctionABI(prevRenamed, p.newName)
+							}
 							if hasResolved {
 								affectedAddrs = append(affectedAddrs, resolvedAddr)
 							} else if targetAddr, ok := ctrl.LabelAddrByName(effectiveOld, false); ok {
@@ -1186,6 +1192,23 @@ func main() {
 				return err
 			}
 
+			updateAddrComment := func(addrU32 uint32, val string) error {
+				targetCtrl := ctrl
+				if tgtSeg := proj.SegmentAtAddr(addrU32); tgtSeg != nil && tgtSeg.DB != "" && tgtSeg.DB != seg.DB {
+					c, err := db.New(tgtSeg.DB)
+					if err != nil {
+						return err
+					}
+					defer c.Close()
+					proj.SyncDBScope(c)
+					targetCtrl = c
+				}
+				if commentBlock {
+					return targetCtrl.UpdateBlockComment(addrU32, val)
+				}
+				return targetCtrl.UpdateComment(addrU32, val)
+			}
+
 			applyOne := func(addrStr, val string) error {
 				addrU32, note, err := resolveStrictCommentAddr(proj, ctrl, cg, addrStr)
 				if err != nil {
@@ -1194,10 +1217,7 @@ func main() {
 				if note != "" {
 					fmt.Fprintln(os.Stderr, note)
 				}
-				if commentBlock {
-					return ctrl.UpdateBlockComment(addrU32, val)
-				}
-				return ctrl.UpdateComment(addrU32, val)
+				return updateAddrComment(addrU32, val)
 			}
 
 			if commentBatchFile != "" {
@@ -1258,19 +1278,16 @@ func main() {
 			if note != "" {
 				fmt.Fprintln(os.Stderr, note)
 			}
+			if err := updateAddrComment(addrU32, val); err != nil {
+				return err
+			}
 			if commentBlock {
-				if err := ctrl.UpdateBlockComment(addrU32, val); err != nil {
-					return err
-				}
 				if val == "" {
 					fmt.Printf("Removed block comment at 0x%X\n", addrU32)
 				} else {
 					fmt.Printf("Added block comment at 0x%X\n", addrU32)
 				}
 			} else {
-				if err := ctrl.UpdateComment(addrU32, val); err != nil {
-					return err
-				}
 				if val == "" {
 					fmt.Printf("Removed comment at 0x%X\n", addrU32)
 				} else {

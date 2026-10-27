@@ -233,7 +233,7 @@ func (a *Analyzer) classifyImmOperand(addr uint32, insn *m68k.Insn, op m68k.Oper
 	if (a.IsInAnyProjectSegment(val) || a.IsInMemoryRegion(val)) && val%2 == 0 {
 		return RefType{Kind: RefDataAddr, Target: val}, true
 	}
-	if insn.Op == m68k.OpMOVEA && val > 0 && (val&0xFF000000) == 0 {
+	if insn.Op == m68k.OpMOVEA && val >= 0x100 && val%2 == 0 && (val&0xFF000000) == 0 {
 		return RefType{Kind: RefDataAddr, Target: val}, true
 	}
 	return RefType{}, false

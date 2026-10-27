@@ -354,6 +354,10 @@ func TestCallGraphStaticRegsABIAndDualOffsets(t *testing.T) {
 	if len(warnings) != 2 {
 		t.Fatalf("expected 2 ABI verification warnings (a1 never read, d4 never modified), got %v", warnings)
 	}
+	rangeWarnings := VerifyABI("(a0=obj, d7=count) -> d0 | clobbers: d0-d2", fn.InRegs, fn.ModRegs, fn.SavedRegs)
+	if len(rangeWarnings) != 3 {
+		t.Fatalf("expected 3 warnings for d7 input and d1/d2 range clobbers, got %v", rangeWarnings)
+	}
 
 	rendered, err := cg.Render(proj, &Options{
 		Target:  "CalcStep",

@@ -417,8 +417,12 @@ func (a *App) searchBytes(content string, targetSeg *project.Segment, rng *db.Ad
 func (a *App) searchCluster(preset string, rng *db.AddrRange) []SearchHit {
 	var sig clusterSig
 	switch strings.ToLower(strings.TrimSpace(preset)) {
-	case "3dmath", "math":
+	case "3dmath", "math", "trig", "sin", "cos":
 		sig = clusterSig{mnems: []string{"mul", "div"}}
+	case "mul":
+		sig = clusterSig{mnems: []string{"mul"}}
+	case "div":
+		sig = clusterSig{mnems: []string{"div"}}
 	case "blitter":
 		sig = clusterSig{offs: [][2]uint16{{0x040, 0x074}}}
 	case "copper":
@@ -429,8 +433,10 @@ func (a *App) searchCluster(preset string, rng *db.AddrRange) []SearchHit {
 		sig = clusterSig{offs: [][2]uint16{{0x0A0, 0x0DF}, {0x09E, 0x09E}}}
 	case "sprite", "sprites":
 		sig = clusterSig{offs: [][2]uint16{{0x120, 0x17E}}}
-	case "dma", "irq", "interrupt":
-		sig = clusterSig{offs: [][2]uint16{{0x002, 0x002}, {0x01C, 0x01E}, {0x096, 0x09C}}}
+	case "dma":
+		sig = clusterSig{offs: [][2]uint16{{0x002, 0x002}, {0x096, 0x096}}}
+	case "irq", "interrupt":
+		sig = clusterSig{offs: [][2]uint16{{0x01C, 0x01E}, {0x09A, 0x09C}}}
 	default:
 		return nil
 	}

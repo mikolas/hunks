@@ -500,7 +500,6 @@ func RunTrace(image []byte, base, entry uint32, opts TraceOptions) TraceReport {
 				}
 			} else {
 				trampOriginPC = pc
-				trampFirstOutPC = newPC
 				if hasDispatch {
 					hasTrampOrigin = true
 					trampOriginDisp = dispatch
