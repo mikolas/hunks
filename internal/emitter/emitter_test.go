@@ -673,3 +673,116 @@ func TestIncbinInteriorLabelsEmitEquates(t *testing.T) {
 		t.Fatalf("expected interior label LAB_1000C equ CarvedBlob+$4 after incbin, got:\n%s", text)
 	}
 }
+
+func TestOutOfSegmentEquPrefixAndStaticVectorEquates(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	ctrl, err := db.New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrl.Close()
+
+	binPath := filepath.Join(dir, "flat.bin")
+	rawBytes := make([]byte, 32)
+	if err := os.WriteFile(binPath, rawBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sz := uint32(len(rawBytes))
+	proj := project.New(filepath.Join(dir, "project.json"))
+	proj.Data.Segments = append(proj.Data.Segments, project.Segment{
+		Name:        "main",
+		HunkIndex:   0,
+		HunkType:    hunk.HunkTypeCode,
+		MemoryType:  hunk.MemoryPublic,
+		AllocSize:   sz,
+		FileDataLen: &sz,
+		File:        &binPath,
+		Base:        0xE700,
+		DB:          dbPath,
+		Relocatable: false,
+	})
+	proj.Data.Spaces = append(proj.Data.Spaces, project.Space{
+		Name:     "default",
+		Segments: []string{"main"},
+	})
+	proj.Data.ActiveSpace = "default"
+	proj.ActiveSegmentName = "main"
+	proj.SyncDBScope(ctrl)
+
+	if got := proj.AutoLabel(0x006C); got != "Level_3_Interrupt" {
+		t.Fatalf("AutoLabel(0x6C) = %q, want Level_3_Interrupt", got)
+	}
+	if got := proj.AutoLabel(0x0080); got != "Trap_0" {
+		t.Fatalf("AutoLabel(0x80) = %q, want Trap_0", got)
+	}
+	if got := proj.AutoLabel(0x7B08A); got != "EQU_7B08A" {
+		t.Fatalf("AutoLabel(0x7B08A) = %q, want EQU_7B08A", got)
+	}
+	if got := proj.AutoLabel(0xE700); got != "LAB_0E700" {
+		t.Fatalf("AutoLabel(0xE700) = %q, want LAB_0E700", got)
+	}
+
+	for _, addr := range []uint32{0x0020, 0x006C, 0x0080, 0x00FF, 0x3D80, 0x7A01A, 0x7B08A} {
+		_ = ctrl.SetLabel(addr, proj.AutoLabel(addr), db.LabelLab, true)
+	}
+	_ = ctrl.SetRename(proj.AutoLabel(0x7A01A), "EdgeSpan_DirectoryTable")
+
+	mkCode := func(addr, size uint32, mnem, op string) *db.Cell {
+		m := mnem
+		o := op
+		return &db.Cell{
+			Seg:        "main",
+			Addr:       addr,
+			Size:       size,
+			Type:       db.CellCode,
+			Confidence: 100,
+			Mnemonic:   &m,
+			OpStr:      &o,
+			RawBytes:   make([]byte, size),
+		}
+	}
+	_ = ctrl.InsertCell(mkCode(0xE700, 6, "move.l", "a0,$6C.l"))
+	_ = ctrl.InsertCell(mkCode(0xE706, 6, "movea.l", "#$7B08A,a1"))
+	_ = ctrl.InsertCell(mkCode(0xE70C, 6, "move.l", "$3D80.l,d0"))
+	_ = ctrl.InsertCell(mkCode(0xE712, 6, "movea.l", "#$7A01A,a2"))
+
+	em, err := New(proj, ctrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := em.GenerateItems(false); err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Join(em.FormatLines(), "\n")
+	for _, want := range []string{
+		"Privilege_Violation\tequ\t$20",
+		"Level_3_Interrupt\tequ\t$6C",
+		"Trap_0\tequ\t$80",
+		"EQU_000FF\tequ\t$FF",
+		"EQU_03D80\tequ\t$3D80",
+		"EdgeSpan_DirectoryTable\tequ\t$7A01A",
+		"EQU_7B08A\tequ\t$7B08A",
+		"move.l\ta0,Level_3_Interrupt.l",
+		"movea.l\t#EQU_7B08A,a1",
+		"move.l\tEQU_03D80.l,d0",
+		"movea.l\t#EdgeSpan_DirectoryTable,a2",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in emitted output:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"LAB_0006C", "LAB_7B08A", "LAB_03D80"} {
+		if strings.Contains(text, unwanted) {
+			t.Errorf("unexpected legacy %q in emitted output:\n%s", unwanted, text)
+		}
+	}
+
+	if addr, ok := proj.ResolveTarget(ctrl, "EQU_7B08A"); !ok || addr != 0x7B08A {
+		t.Errorf("ResolveTarget(EQU_7B08A) = ($%X, %v), want ($7B08A, true)", addr, ok)
+	}
+	if addr, ok := proj.ResolveTarget(ctrl, "Level_3_Interrupt"); !ok || addr != 0x6C {
+		t.Errorf("ResolveTarget(Level_3_Interrupt) = ($%X, %v), want ($6C, true)", addr, ok)
+	}
+}

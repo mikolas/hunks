@@ -719,8 +719,13 @@ func (c *Controller) GetExportedLabelsInRange(startAddr, endAddr uint32) ([]stri
 func (c *Controller) GetAllLabelsResolved() (map[uint32]string, error) {
 	m := make(map[uint32]string)
 	err := c.forEachSegRow(
-		`SELECT l.addr, COALESCE(r.renamed, l.name)
-		 FROM labels l LEFT JOIN renames r ON r.seg = l.seg AND r.original = l.name
+		`SELECT l.addr, COALESCE(r.renamed, r2.renamed, l.name)
+		 FROM labels l
+		 LEFT JOIN renames r ON r.seg = l.seg AND r.original = l.name
+		 LEFT JOIN renames r2 ON r2.seg = l.seg AND (
+		     (l.name LIKE 'EQU_%' AND r2.original = 'LAB_' || SUBSTR(l.name, 5)) OR
+		     (l.name LIKE 'LAB_%' AND r2.original = 'EQU_' || SUBSTR(l.name, 5))
+		 )
 		 WHERE l.seg = ?1 ORDER BY l.addr ASC`,
 		true,
 		func(rows *sql.Rows) error {

@@ -52,6 +52,31 @@ func GetTrapName(addr uint32) (string, bool) {
 	return "", false
 }
 
+// GetM68kVectorLabel returns the canonical 68000 exception, autovector, or
+// TRAP vector name for a 4-byte-aligned vector table address in [$00..$BC].
+func GetM68kVectorLabel(addr uint32) (string, bool) {
+	if name, ok := m68kVectors[addr]; ok {
+		return name, true
+	}
+	return GetTrapName(addr)
+}
+
+// ParseM68kVectorLabelAddr resolves a canonical 68000 vector name (e.g.
+// "Level_3_Interrupt", "Privilege_Violation", "Trap_0") to its vector address.
+func ParseM68kVectorLabelAddr(label string) (uint32, bool) {
+	for addr, name := range m68kVectors {
+		if strings.EqualFold(name, label) {
+			return addr, true
+		}
+	}
+	if len(label) >= 6 && strings.EqualFold(label[:5], "Trap_") {
+		if n, err := strconv.ParseUint(label[5:], 10, 32); err == nil && n < 16 {
+			return 0x80 + uint32(n)*4, true
+		}
+	}
+	return 0, false
+}
+
 var customRegs = map[uint32]string{
 	0x000: "BLTDDAT", 0x002: "DMACONR", 0x004: "VPOSR",
 	0x006: "VHPOSR", 0x008: "DSKDATR", 0x00A: "JOY0DAT",

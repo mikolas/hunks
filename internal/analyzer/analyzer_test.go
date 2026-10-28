@@ -1278,6 +1278,13 @@ func TestAbsShortXrefsAndRangeRollup(t *testing.T) {
 	if len(rangeXrefs) != 3 {
 		t.Fatalf("expected 3 xrefs in range 0x1000..0x1200, got %+v", rangeXrefs)
 	}
+
+	_ = ctrl.SetLabel(0x1178, "Matrix_Active", db.LabelLab, false)
+	a.ReanalyzeXrefs(0x1178)
+	cell1178, err := ctrl.GetCell(0x10008)
+	if err != nil || cell1178 == nil || cell1178.OpStr == nil || *cell1178.OpStr != "Matrix_Active.w,a0" {
+		t.Fatalf("expected EAAbsShort at 0x10008 to format as Matrix_Active.w,a0, got %+v", cell1178)
+	}
 }
 
 func TestTraceLowRAMTrampolineBouncing(t *testing.T) {

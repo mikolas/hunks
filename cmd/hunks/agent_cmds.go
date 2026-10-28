@@ -1853,7 +1853,7 @@ func runDumpCommand(proj *project.Project, section string, format string) (strin
 		if rawName == "" {
 			rawName = proj.AutoLabel(addr)
 		}
-		if newName == rawName && strings.HasPrefix(newName, "LAB_") {
+		if newName == rawName && project.IsAutoLabel(newName) {
 			continue
 		}
 		seg := proj.SegmentAtAddr(addr)

@@ -9,9 +9,20 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mikolas/hunks/internal/amiga"
 	"github.com/mikolas/hunks/internal/db"
 	"github.com/mikolas/hunks/internal/hunk"
 )
+
+// IsAutoLabel reports whether name is an auto-generated symbol ("LAB_...", "EQU_...")
+// or a canonical 68000 exception/interrupt/trap vector equate name.
+func IsAutoLabel(name string) bool {
+	if strings.HasPrefix(name, "LAB_") || strings.HasPrefix(name, "EQU_") {
+		return true
+	}
+	_, isVec := amiga.ParseM68kVectorLabelAddr(name)
+	return isVec
+}
 
 func formatHex(v uint32) string {
 	return fmt.Sprintf("0x%X", v)
@@ -272,6 +283,12 @@ func (s *Segment) AutoLabel(addr uint32) string {
 			}
 		}
 		return fmt.Sprintf("LAB_%d_%05X", idx, offset)
+	}
+	if s.EndAddr() > s.Base && !s.Contains(addr) {
+		if vec, ok := amiga.GetM68kVectorLabel(addr); ok {
+			return vec
+		}
+		return fmt.Sprintf("EQU_%05X", addr)
 	}
 	return fmt.Sprintf("LAB_%05X", addr)
 }
@@ -538,6 +555,12 @@ func (p *Project) AutoLabel(addr uint32) string {
 			return p.Data.Segments[i].AutoLabel(addr)
 		}
 	}
+	if len(p.Data.Segments) > 0 {
+		if vec, ok := amiga.GetM68kVectorLabel(addr); ok {
+			return vec
+		}
+		return fmt.Sprintf("EQU_%05X", addr)
+	}
 	return fmt.Sprintf("LAB_%05X", addr)
 }
 
@@ -768,12 +791,18 @@ func (p *Project) ResolveTarget(ctrl *db.Controller, input string) (uint32, bool
 		}
 	}
 
-	// 5. Pattern `LAB_<hunk>_<offset>` even if not in DB labels table
-	rest, hasLab := strings.CutPrefix(s, "LAB_")
-	if !hasLab {
-		rest, hasLab = strings.CutPrefix(s, "lab_")
+	// 5. Pattern `LAB_<hunk>_<offset>`, `LAB_<hex>`, `EQU_<hex>`, or known vector/HW equate
+	rest, hasPrefix := strings.CutPrefix(s, "LAB_")
+	if !hasPrefix {
+		rest, hasPrefix = strings.CutPrefix(s, "lab_")
 	}
-	if hasLab {
+	if !hasPrefix {
+		rest, hasPrefix = strings.CutPrefix(s, "EQU_")
+	}
+	if !hasPrefix {
+		rest, hasPrefix = strings.CutPrefix(s, "equ_")
+	}
+	if hasPrefix {
 		if hunkStr, offStr, hasUnderscore := strings.Cut(rest, "_"); hasUnderscore {
 			hunkIdx, err1 := strconv.Atoi(hunkStr)
 			off, err2 := strconv.ParseUint(offStr, 16, 32)
@@ -785,7 +814,15 @@ func (p *Project) ResolveTarget(ctrl *db.Controller, input string) (uint32, bool
 					}
 				}
 			}
+		} else if val, err := strconv.ParseUint(rest, 16, 32); err == nil {
+			return uint32(val), true
 		}
+	}
+	if vecAddr, ok := amiga.ParseM68kVectorLabelAddr(s); ok {
+		return vecAddr, true
+	}
+	if hwAddr, ok := amiga.ParseHWLabelAddr(s); ok {
+		return hwAddr, true
 	}
 
 	// 6. Explicit hex `0x...`, `$...`, or bare hex

@@ -339,7 +339,8 @@ func (a *Analyzer) AddLabel(srcAddr *uint32, targetAddr uint32) {
 		return
 	}
 	inMemRegion := a.IsInMemoryRegion(targetAddr)
-	if !a.IsInAnySegment(targetAddr) && !inMemRegion {
+	isFlatOut := srcAddr != nil && !a.IsRelocatableAt(*srcAddr) && !a.IsInAnyProjectSegment(targetAddr) && targetAddr > 0 && (targetAddr&0xFF000000) == 0
+	if !a.IsInAnySegment(targetAddr) && !inMemRegion && !isFlatOut {
 		return
 	}
 
@@ -348,7 +349,18 @@ func (a *Analyzer) AddLabel(srcAddr *uint32, targetAddr uint32) {
 		isCrossSeg = !a.IsSameSegment(*srcAddr, targetAddr) && a.IsInAnySegment(targetAddr)
 	}
 
-	if _, exists := a.LabelsCache[targetAddr]; exists {
+	if existing, exists := a.LabelsCache[targetAddr]; exists {
+		if isFlatOut && strings.HasPrefix(existing, "LAB_") {
+			if lbl, err := a.DB.GetLabelFull(targetAddr); err == nil && lbl != nil && lbl.IsAuto && lbl.Name == existing {
+				auto := a.Proj.AutoLabel(targetAddr)
+				_ = a.DB.SetLabel(targetAddr, auto, db.LabelLab, true)
+				if resolved, err := a.DB.GetAllLabelsResolved(); err == nil {
+					if r, ok := resolved[targetAddr]; ok {
+						a.LabelsCache[targetAddr] = r
+					}
+				}
+			}
+		}
 		if isCrossSeg {
 			if _, exp := a.ExportedCache[targetAddr]; !exp {
 				a.ExportedCache[targetAddr] = struct{}{}

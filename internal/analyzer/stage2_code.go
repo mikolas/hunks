@@ -183,8 +183,16 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 					}
 					src := addr
 					shouldLabel := op.Mode != m68k.EAAbsShort && a.isValidTarget(ref.Target)
-					if op.Mode == m68k.EAImm && !a.IsInAnyProjectSegment(ref.Target) {
+					if op.Mode == m68k.EAImm && !a.IsInAnyProjectSegment(ref.Target) && !a.IsInMemoryRegion(ref.Target) {
 						shouldLabel = false
+					}
+					if !shouldLabel && !a.IsRelocatableAt(addr) && !a.IsInAnyProjectSegment(ref.Target) && ref.Target > 0 && (ref.Target&0xFF000000) == 0 {
+						switch op.Mode {
+						case m68k.EAAbsLong, m68k.EAImm:
+							shouldLabel = true
+						case m68k.EAAbsShort:
+							shouldLabel = int16(uint16(op.UVal)) >= 0x100
+						}
 					}
 					switch ref.Kind {
 					case RefCodeCall:
