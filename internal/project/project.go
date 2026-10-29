@@ -735,13 +735,41 @@ func (p *Project) ResolveTarget(ctrl *db.Controller, input string) (uint32, bool
 			var resolved uint32
 			var found bool
 			ctrl.WithActiveSeg(seg.Name, func() {
+				if a, ok := ctrl.LabelAddrByName(rest, false); ok {
+					resolved, found = a, true
+					return
+				}
+				if orig, ok := ctrl.RenameOriginalOf(rest, false); ok {
+					if a, ok := ctrl.LabelAddrByName(orig, false); ok {
+						resolved, found = a, true
+						return
+					}
+				}
+				if a, ok := ctrl.LabelAddrByName(rest, true); ok {
+					resolved, found = a, true
+					return
+				}
+				if orig, ok := ctrl.RenameOriginalOf(rest, true); ok {
+					if a, ok := ctrl.LabelAddrByName(orig, true); ok {
+						resolved, found = a, true
+						return
+					}
+				}
+				if off, err := ParseHex(rest); err == nil {
+					if seg.Base > 0 && off >= seg.Base && off < seg.EndAddr() && off >= seg.AllocSize {
+						resolved, found = off, true
+					} else {
+						resolved, found = seg.Base+off, true
+					}
+					return
+				}
 				resolved, found = p.ResolveTarget(ctrl, rest)
+				if found && seg.Base > 0 && resolved < seg.Base && resolved < seg.AllocSize {
+					resolved += seg.Base
+				}
 			})
 			if found {
 				return resolved, true
-			}
-			if off, err := ParseHex(rest); err == nil {
-				return seg.Base + off, true
 			}
 		}
 	}

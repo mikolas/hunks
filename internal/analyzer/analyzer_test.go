@@ -1345,3 +1345,43 @@ func TestScopedRegisterAliasAndFieldTypeStripping(t *testing.T) {
 		t.Fatalf("expected function-scoped alias vx(a0),d0 at 0x10008, got %+v", cSub)
 	}
 }
+
+func TestIndexedDispatchVsNegativeOffsetTable(t *testing.T) {
+	const base uint32 = 0x10000
+	// 0x10000: jsr    $10008(pc,d0.w)   4E BB 00 06  (direct indexed code call -> 0x10008)
+	// 0x10004: bra.s  $10012            60 0C
+	// 0x10006: nop                      4E 71
+	// 0x10008: lea.l  2(a0),a0          41 E8 00 02  (must NOT be misread as dc.w $41E8,$0002)
+	// 0x1000C: rts                      4E 75
+	// 0x1000E: moveq  #1,d0             70 01        (negative-offset jump table handler)
+	// 0x10010: rts                      4E 75
+	// 0x10012: move.w $1001A(pc,d0.w),d0 30 3B 00 06
+	// 0x10016: jmp    $1001A(pc,d0.w)   4E FB 00 02
+	// 0x1001A: dc.w   $FFF4             FF F4        (0x1001A - 12 = 0x1000E)
+	code := []byte{
+		0x4E, 0xBB, 0x00, 0x06,
+		0x60, 0x0C,
+		0x4E, 0x71,
+		0x41, 0xE8, 0x00, 0x02,
+		0x4E, 0x75,
+		0x70, 0x01,
+		0x4E, 0x75,
+		0x30, 0x3B, 0x00, 0x06,
+		0x4E, 0xFB, 0x00, 0x02,
+		0xFF, 0xF4,
+	}
+	a, ctrl := newTestTraceAnalyzer(t, code, base)
+	a.Analyze([]uint32{base})
+
+	c10008, _ := ctrl.GetCell(0x10008)
+	if c10008 == nil || c10008.Type != db.CellCode || c10008.Size != 4 {
+		t.Fatalf("expected 4-byte CODE cell at 0x10008 (lea 2(a0),a0), got %+v", c10008)
+	}
+	if _, hasLbl, _ := ctrl.GetLabel(0x1000A); hasLbl {
+		t.Fatalf("unexpected interior label at 0x1000A")
+	}
+	c1000E, _ := ctrl.GetCell(0x1000E)
+	if c1000E == nil || c1000E.Type != db.CellCode {
+		t.Fatalf("expected negative-offset jump table target 0x1000E to be decoded as CODE, got %+v", c1000E)
+	}
+}

@@ -14,8 +14,10 @@ import (
 	"strings"
 
 	"github.com/mikolas/hunks/internal/amiga"
+	"github.com/mikolas/hunks/internal/analyzer"
 	"github.com/mikolas/hunks/internal/callgraph"
 	"github.com/mikolas/hunks/internal/db"
+	"github.com/mikolas/hunks/internal/m68k"
 	"github.com/mikolas/hunks/internal/project"
 	"github.com/spf13/cobra"
 )
@@ -55,7 +57,7 @@ func registerAgentCommands(
 
 	// --- 2. data (alias: inspect) ---
 	var dataLen, dataCount int
-	var dataCopper bool
+	var dataCopper, dataTryCode bool
 	var dataStruct, dataFormat string
 	dataCmd := &cobra.Command{
 		Use:     "data <addr_or_label>",
@@ -86,6 +88,14 @@ func registerAgentCommands(
 			if err != nil {
 				return err
 			}
+			if dataTryCode {
+				out, err := renderDisasmRange(proj, ctrl, cg, addr, 0, dataLen, true, dataFormat)
+				if err != nil {
+					return err
+				}
+				fmt.Print(out)
+				return nil
+			}
 			out, err := renderDataInspection(proj, ctrl, cg, addr, dataLen, dataCopper, dataStruct, dataCount, dataFormat)
 			if err != nil {
 				return err
@@ -96,10 +106,115 @@ func registerAgentCommands(
 	}
 	dataCmd.Flags().IntVar(&dataLen, "len", 64, "Number of bytes to inspect when target is not a single bounded table/string")
 	dataCmd.Flags().BoolVar(&dataCopper, "copper", false, "Decode words as Amiga Copper MOVE/WAIT/SKIP instructions")
+	dataCmd.Flags().BoolVar(&dataTryCode, "code", false, "Decode bytes as candidate M68000 instructions without modifying the DB")
+	dataCmd.Flags().BoolVar(&dataTryCode, "try-code", false, "Alias for --code")
 	dataCmd.Flags().StringVar(&dataStruct, "struct", "", "Decode bytes as records of the named struct")
 	dataCmd.Flags().IntVar(&dataCount, "count", 1, "Number of struct records to decode with --struct")
 	dataCmd.Flags().StringVarP(&dataFormat, "format", "f", "text", "Output format: text or json")
 	rootCmd.AddCommand(dataCmd)
+
+	// --- 2b. disasm ---
+	var disasmCount, disasmLen int
+	var disasmTryCode bool
+	var disasmFormat string
+	disasmCmd := &cobra.Command{
+		Use:   "disasm <addr_or_label>",
+		Short: "Disassemble a bounded address range directly (even outside functions or in unreached DATA)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			proj, err := loadTargetProject(getWorkspaceRoot(), *moduleName)
+			if err != nil {
+				return err
+			}
+			seg, err := requireSegment(proj)
+			if err != nil {
+				return err
+			}
+			ctrl, err := db.New(seg.DB)
+			if err != nil {
+				return err
+			}
+			defer ctrl.Close()
+			proj.SyncDBScope(ctrl)
+
+			addr, err := resolveAddrOrLabel(proj, ctrl, args[0])
+			if err != nil {
+				return fmt.Errorf("cannot resolve address or label %q: %w", args[0], err)
+			}
+			cg, err := callgraph.Build(proj)
+			if err != nil {
+				return err
+			}
+			out, err := renderDisasmRange(proj, ctrl, cg, addr, disasmCount, disasmLen, disasmTryCode, disasmFormat)
+			if err != nil {
+				return err
+			}
+			fmt.Print(out)
+			return nil
+		},
+	}
+	disasmCmd.Flags().IntVarP(&disasmCount, "count", "n", 30, "Number of instructions/cells to disassemble (ignored when --len > 0)")
+	disasmCmd.Flags().IntVar(&disasmLen, "len", 0, "Byte length to disassemble (overrides -n when > 0)")
+	disasmCmd.Flags().BoolVar(&disasmTryCode, "try-code", false, "Decode DATA_* cells in range as candidate M68000 instructions without modifying the DB")
+	disasmCmd.Flags().BoolVar(&disasmTryCode, "code", false, "Alias for --try-code")
+	disasmCmd.Flags().StringVarP(&disasmFormat, "format", "f", "text", "Output format: text or json")
+	rootCmd.AddCommand(disasmCmd)
+
+	// --- 2c. label ---
+	labelCmd := &cobra.Command{
+		Use:   "label",
+		Short: "Manage labels (e.g. delete bogus or stale interior labels)",
+	}
+	labelDeleteCmd := &cobra.Command{
+		Use:     "delete <addr_or_label>...",
+		Aliases: []string{"rm", "remove"},
+		Short:   "Delete one or more labels (and any associated rename or function entry)",
+		Args:    cobra.MinimumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			proj, err := loadTargetProject(getWorkspaceRoot(), *moduleName)
+			if err != nil {
+				return err
+			}
+			seg, err := requireSegment(proj)
+			if err != nil {
+				return err
+			}
+			ctrl, err := db.New(seg.DB)
+			if err != nil {
+				return err
+			}
+			defer ctrl.Close()
+			proj.SyncDBScope(ctrl)
+
+			var deleted []uint32
+			if err := ctrl.WithTransaction(func() error {
+				for _, arg := range args {
+					addr, err := resolveAddrOrLabel(proj, ctrl, arg)
+					if err != nil {
+						return fmt.Errorf("cannot resolve address or label %q: %w", arg, err)
+					}
+					if err := ctrl.DeleteLabelAndRename(addr); err != nil {
+						return err
+					}
+					proj.Data.EntryPoints = slices.DeleteFunc(proj.Data.EntryPoints, func(ep project.EntryPoint) bool {
+						return ep.Addr == addr
+					})
+					deleted = append(deleted, addr)
+					fmt.Printf("Deleted label at 0x%X (%s)\n", addr, arg)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			_ = proj.Save()
+			if an, err := analyzer.New(proj, ctrl); err == nil {
+				an.ReanalyzeXrefsBatch(deleted)
+			}
+			return nil
+		},
+	}
+	labelCmd.AddCommand(labelDeleteCmd)
+	rootCmd.AddCommand(labelCmd)
 
 	// --- 3. xref ---
 	var xrefFormat string
@@ -344,6 +459,10 @@ func registerAgentCommands(
 			proj, err := loadTargetProject(getWorkspaceRoot(), *moduleName)
 			if err != nil {
 				return err
+			}
+			if abiBatchFile == "" && abiFormat != "text" && abiFormat != "json" {
+				abiBatchFile = abiFormat
+				abiFormat = "text"
 			}
 			return runABICommand(proj, args, abiBatchFile, abiVerify, abiFormat, resolveCallerPath)
 		},
@@ -885,11 +1004,15 @@ func renderDataInspection(
 			case db.CellDataW:
 				if bIdx+2 <= len(segBytes) {
 					val := binary.BigEndian.Uint16(segBytes[bIdx : bIdx+2])
+					asmStr := fmt.Sprintf("dc.w $%04X (%d)", val, int16(val))
+					if c.OpStr != nil && *c.OpStr != "" {
+						asmStr = fmt.Sprintf("dc.w %s ($%04X / %d)", *c.OpStr, val, int16(val))
+					}
 					items = append(items, dataItemJSON{
 						Offset:  fmt.Sprintf("+%05X", off),
 						Addr:    fmt.Sprintf("0x%X", cur),
 						Type:    c.Type.AsStr(),
-						Asm:     fmt.Sprintf("dc.w $%04X (%d)", val, int16(val)),
+						Asm:     asmStr,
 						Comment: cg.Comments[cur].EffectiveComment(),
 					})
 					cur += 2
@@ -1520,7 +1643,11 @@ func renderStructList(proj *project.Project, format string) error {
 		}
 		slices.Sort(offs)
 		for _, off := range offs {
-			fmt.Printf("    +%-4d ($%02X)  %s\n", off, uint32(off), sdef[strconv.Itoa(off)])
+			if off < 0 {
+				fmt.Printf("    %-5d (-$%02X)  %s\n", off, uint32(-off), sdef[strconv.Itoa(off)])
+			} else {
+				fmt.Printf("    +%-4d ($%02X)  %s\n", off, uint32(off), sdef[strconv.Itoa(off)])
+			}
 		}
 	}
 	return nil
@@ -2013,6 +2140,332 @@ func runDumpCommand(proj *project.Project, section string, format string) (strin
 			}
 		}
 		out.WriteByte('\n')
+	}
+	return out.String(), nil
+}
+
+type disasmItemJSON struct {
+	Offset   string `json:"offset"`
+	FnOffset string `json:"fn_offset,omitempty"`
+	Addr     string `json:"addr"`
+	Label    string `json:"label,omitempty"`
+	Type     string `json:"type"`
+	Mnemonic string `json:"mnemonic"`
+	Operands string `json:"operands,omitempty"`
+	Comment  string `json:"comment,omitempty"`
+}
+
+func formatReadOnlyTryInsn(proj *project.Project, cg *callgraph.CallGraph, relocs map[uint32]uint32, addr uint32, insn *m68k.Insn) (string, string) {
+	mnem := insn.FullMnemonic()
+	if insn.NumOps == 0 {
+		return mnem, ""
+	}
+	fmtOp := func(op m68k.Operand) string {
+		switch op.Mode {
+		case m68k.EABranch:
+			t := op.UVal
+			if l, ok := cg.Labels[t]; ok && l != "" {
+				return l
+			}
+			return proj.AutoLabel(t)
+		case m68k.EAPCDisp16, m68k.EAPCIndex:
+			t := op.UVal
+			l := cg.Labels[t]
+			if l == "" {
+				l = proj.AutoLabel(t)
+			}
+			if op.Mode == m68k.EAPCIndex {
+				return l + "(pc," + op.IndexRegName() + op.IndexSize.DotSuffix() + ")"
+			}
+			return l + "(pc)"
+		case m68k.EAAbsLong:
+			extAddr := addr + uint32(op.ExtOffset)
+			if rTgt, ok := relocs[extAddr]; ok {
+				l := cg.Labels[rTgt]
+				if l == "" {
+					l = proj.AutoLabel(rTgt)
+				}
+				return l + ".l"
+			}
+			if hw, ok := amiga.GetAmigaHWOperand(op.UVal); ok {
+				return hw + ".l"
+			}
+		case m68k.EAAbsShort:
+			if hw, ok := amiga.GetAmigaHWOperand(op.UVal); ok {
+				return hw + ".w"
+			}
+		case m68k.EAImm:
+			if op.ImmSize == m68k.SizeL && op.ExtSize == 4 && insn.Size >= 6 {
+				extAddr := addr + uint32(op.ExtOffset)
+				if rTgt, ok := relocs[extAddr]; ok {
+					l := cg.Labels[rTgt]
+					if l == "" {
+						l = proj.AutoLabel(rTgt)
+					}
+					return "#" + l
+				}
+			}
+		}
+		return op.FormatASM(insn.Op)
+	}
+	if insn.NumOps == 1 {
+		return mnem, fmtOp(insn.Ops[0])
+	}
+	return mnem, fmtOp(insn.Ops[0]) + "," + fmtOp(insn.Ops[1])
+}
+
+func renderDisasmRange(
+	proj *project.Project,
+	ctrl *db.Controller,
+	cg *callgraph.CallGraph,
+	startAddr uint32,
+	maxInsts int,
+	byteLen int,
+	tryCode bool,
+	format string,
+) (string, error) {
+	seg := proj.SegmentAtAddr(startAddr)
+	if seg == nil {
+		return "", fmt.Errorf("address $%X is not inside any active segment", startAddr)
+	}
+	segBytes := seg.LoadBinaryData()
+	segBase := seg.Base
+	segEnd := segBase + uint32(len(segBytes))
+	if startAddr >= segEnd {
+		return "", fmt.Errorf("address $%X is past end of segment %s ($%X)", startAddr, seg.Name, segEnd)
+	}
+
+	relocs, _ := ctrl.GetAllRelocs()
+
+	var enclosingFn *callgraph.FunctionNode
+	if fAddr, ok := cg.InsnToFunc[startAddr]; ok {
+		enclosingFn = cg.Functions[fAddr]
+	} else if fn, ok := cg.Functions[startAddr]; ok {
+		enclosingFn = fn
+	}
+
+	if maxInsts <= 0 && byteLen <= 0 {
+		maxInsts = 30
+	}
+	var endBound uint32 = segEnd
+	if byteLen > 0 {
+		if startAddr+uint32(byteLen) < endBound {
+			endBound = startAddr + uint32(byteLen)
+		}
+	}
+
+	var items []disasmItemJSON
+	cur := startAddr
+	count := 0
+	for cur < endBound && (byteLen > 0 || count < maxInsts) {
+		off := cur - segBase
+		bIdx := int(off)
+		if bIdx >= len(segBytes) {
+			break
+		}
+
+		curFn := enclosingFn
+		if fAddr, ok := cg.InsnToFunc[cur]; ok {
+			if fn, okF := cg.Functions[fAddr]; okF {
+				curFn = fn
+			}
+		} else if fn, okF := cg.Functions[cur]; okF {
+			curFn = fn
+		}
+
+		var fnOffStr, fnName, fnAuto string
+		if curFn != nil {
+			fnOffStr = fmt.Sprintf("(%s)", formatFnOffset(cur, curFn.EntryAddr))
+			fnName = curFn.Name
+			fnAuto = proj.AutoLabel(curFn.EntryAddr)
+		} else {
+			fnOffStr = fmt.Sprintf("(+%03X)", cur-startAddr)
+		}
+
+		lbl := cg.Labels[cur]
+		cmt := cg.Comments[cur].EffectiveComment()
+		cell, hasCell := cg.Cells[cur]
+
+		if hasCell && cell.Type == db.CellCode {
+			mnem := cell.MnemonicStr()
+			opStr := proj.ApplyStructAliasesToOpStr(cell.OpStrVal(), fnName, fnAuto)
+			items = append(items, disasmItemJSON{
+				Offset:   fmt.Sprintf("+%05X", off),
+				FnOffset: fnOffStr,
+				Addr:     fmt.Sprintf("0x%X", cur),
+				Label:    lbl,
+				Type:     "CODE",
+				Mnemonic: mnem,
+				Operands: opStr,
+				Comment:  cmt,
+			})
+			step := cell.Size
+			if step == 0 {
+				step = 2
+			}
+			cur += step
+			count++
+			continue
+		}
+
+		if tryCode {
+			rem := min(10, len(segBytes)-bIdx)
+			if insn, ok := m68k.Decode(segBytes[bIdx:bIdx+rem], cur); ok && insn.Size > 0 && cur+uint32(insn.Size) <= segEnd {
+				mnem, opStr := formatReadOnlyTryInsn(proj, cg, relocs, cur, &insn)
+				opStr = proj.ApplyStructAliasesToOpStr(opStr, fnName, fnAuto)
+				cellTag := "TRY_CODE"
+				if hasCell {
+					cellTag = fmt.Sprintf("TRY_CODE (was %s)", cell.Type.AsStr())
+				}
+				tryCmt := cmt
+				if tryCmt != "" {
+					tryCmt += " ; [" + cellTag + "]"
+				} else {
+					tryCmt = "[" + cellTag + "]"
+				}
+				items = append(items, disasmItemJSON{
+					Offset:   fmt.Sprintf("+%05X", off),
+					FnOffset: fnOffStr,
+					Addr:     fmt.Sprintf("0x%X", cur),
+					Label:    lbl,
+					Type:     cellTag,
+					Mnemonic: mnem,
+					Operands: opStr,
+					Comment:  tryCmt,
+				})
+				cur += uint32(insn.Size)
+				count++
+				continue
+			}
+		}
+
+		if hasCell {
+			var mnem, opStr string
+			switch cell.Type {
+			case db.CellPointer:
+				mnem = "dc.l"
+				opStr = cell.OpStrVal()
+				if opStr == "" && bIdx+4 <= len(segBytes) {
+					v := binary.BigEndian.Uint32(segBytes[bIdx : bIdx+4])
+					if tLbl := cg.Labels[v]; tLbl != "" {
+						opStr = tLbl
+					} else {
+						opStr = fmt.Sprintf("$%08X", v)
+					}
+				}
+			case db.CellDataL:
+				mnem = "dc.l"
+				if cell.OpStr != nil && *cell.OpStr != "" {
+					opStr = *cell.OpStr
+				} else if bIdx+4 <= len(segBytes) {
+					opStr = fmt.Sprintf("$%08X", binary.BigEndian.Uint32(segBytes[bIdx:bIdx+4]))
+				}
+			case db.CellDataW:
+				mnem = "dc.w"
+				if cell.OpStr != nil && *cell.OpStr != "" {
+					opStr = *cell.OpStr
+				} else if bIdx+2 <= len(segBytes) {
+					opStr = fmt.Sprintf("$%04X", binary.BigEndian.Uint16(segBytes[bIdx:bIdx+2]))
+				}
+			case db.CellStr:
+				mnem = "dc.b"
+				endC := min(bIdx+int(cell.Size), len(segBytes))
+				opStr = fmt.Sprintf("%q,0", strings.TrimRight(string(segBytes[bIdx:endC]), "\x00"))
+			default:
+				mnem = "dc.b"
+				opStr = fmt.Sprintf("$%02X", segBytes[bIdx])
+			}
+			items = append(items, disasmItemJSON{
+				Offset:   fmt.Sprintf("+%05X", off),
+				FnOffset: fnOffStr,
+				Addr:     fmt.Sprintf("0x%X", cur),
+				Label:    lbl,
+				Type:     cell.Type.AsStr(),
+				Mnemonic: mnem,
+				Operands: opStr,
+				Comment:  cmt,
+			})
+			step := cell.Size
+			if step == 0 {
+				step = 2
+			}
+			cur += step
+			count++
+			continue
+		}
+
+		// Raw unmapped word/byte fallback
+		if bIdx+2 <= len(segBytes) {
+			val := binary.BigEndian.Uint16(segBytes[bIdx : bIdx+2])
+			items = append(items, disasmItemJSON{
+				Offset:   fmt.Sprintf("+%05X", off),
+				FnOffset: fnOffStr,
+				Addr:     fmt.Sprintf("0x%X", cur),
+				Label:    lbl,
+				Type:     "RAW",
+				Mnemonic: "dc.w",
+				Operands: fmt.Sprintf("$%04X", val),
+				Comment:  cmt,
+			})
+			cur += 2
+		} else {
+			items = append(items, disasmItemJSON{
+				Offset:   fmt.Sprintf("+%05X", off),
+				FnOffset: fnOffStr,
+				Addr:     fmt.Sprintf("0x%X", cur),
+				Label:    lbl,
+				Type:     "RAW",
+				Mnemonic: "dc.b",
+				Operands: fmt.Sprintf("$%02X", segBytes[bIdx]),
+				Comment:  cmt,
+			})
+			cur++
+		}
+		count++
+	}
+
+	titleLbl := cg.Labels[startAddr]
+	if titleLbl == "" {
+		titleLbl = proj.AutoLabel(startAddr)
+	}
+	fnCtx := "unowned"
+	if enclosingFn != nil {
+		fnCtx = fmt.Sprintf("%s%s", enclosingFn.QualifiedName(), formatFnOffset(startAddr, enclosingFn.EntryAddr))
+	}
+
+	if format == "json" {
+		payload := map[string]any{
+			"label":    titleLbl,
+			"segment":  seg.Name,
+			"offset":   fmt.Sprintf("+%05X", startAddr-segBase),
+			"addr":     fmt.Sprintf("0x%X", startAddr),
+			"function": fnCtx,
+			"try_code": tryCode,
+			"items":    items,
+		}
+		b, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		return string(b) + "\n", nil
+	}
+
+	var out strings.Builder
+	fmt.Fprintf(&out, "=== Disassembly @ %s [+%05X / $%X] (%s, fn: %s) ===\n",
+		titleLbl, startAddr-segBase, startAddr, seg.Name, fnCtx)
+	for _, it := range items {
+		if it.Label != "" {
+			fmt.Fprintf(&out, "%s:\n", it.Label)
+		}
+		cmtSuffix := ""
+		if it.Comment != "" {
+			cmtSuffix = " ; " + it.Comment
+		}
+		if it.Operands != "" {
+			fmt.Fprintf(&out, "  %s %-7s  %-8s %s%s\n", it.Offset, it.FnOffset, it.Mnemonic, it.Operands, cmtSuffix)
+		} else {
+			fmt.Fprintf(&out, "  %s %-7s  %-8s%s\n", it.Offset, it.FnOffset, it.Mnemonic, cmtSuffix)
+		}
 	}
 	return out.String(), nil
 }

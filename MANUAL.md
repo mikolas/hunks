@@ -63,20 +63,24 @@ cmp -l assets/disk.1 build/disk_1.bin   # 0 differences
 | `-m <module> analyze --trace [--budget N]` | Trace-driven analysis: run the binary from its entry point in the built-in sandboxed M68000 interpreter (`m68kemu`) + minimal Amiga chipset, then resolve indirect dispatch (trampolines, `d16(An)`/indexed computed calls), self-installed interrupt/trap handlers, and hardware-register accesses **by observation** and seed them into recursive descent. Opt-in, for **flat self-booting binaries** (games/demos); default `analyze` is unchanged. `--budget` caps the instruction count (default 20,000,000). All facts are non-byte-affecting (labels/edges/comments) — parity is preserved. |
 | `-m <module> emit [--amiga] [--all] [--relocatable] [--force]` | Emit modular Amiga assembly (`--amiga`: `src/<module>/hunk*.asm` + `disasm/<module>.asm` + shared `src/equates.i`) or single-file assembly (`disasm/<module>.asm`). Refuses to overwrite existing files unless `--force` is passed. |
 | `-m <module> callgraph` / `cg [TARGET...] [FLAGS]` | Inspect multi-hunk call graphs, bottom-up worklists, string/HW anchors, indirect dispatch sites (`--indirect`), and function disassembly |
+| `-m <module> disasm` / `d TARGET [-n INSTS] [--len BYTES] [--try-code] [-f text\|json]` | Disassemble `N` instructions or `BYTES` starting at any address or mid-function label without dumping the full function (`--try-code` previews candidate instructions on `DATA` bytes read-only) |
 | `-m <module> search QUERY [-s SEG] [-n LIMIT] [--dense] [-f text\|json]` | Search instructions, operands, strings, labels, comments, bytes, hardware/math clusters (`cluster:<name>`), or self-modifying code (`smc`) |
-| `-m <module> data` / `inspect TARGET [--len N] [--copper] [--struct NAME [--count N]] [-f text\|json]` | Inspect non-code data, pointer tables, strings, Amiga Copper lists (`--copper`), or structured record arrays (`--struct`) |
+| `-m <module> data` / `inspect TARGET [--len N] [--copper] [--struct NAME [--count N]] [--try-code] [-f text\|json]` | Inspect non-code data, pointer tables, strings, Amiga Copper lists (`--copper`), structured record arrays (`--struct`), or candidate instructions (`--code` / `--try-code`) |
 | `-m <module> xref TARGET_OR_RANGE [-f text\|json]` | Query all incoming cross-references to an address/label (`xref $1178`) or external references into an address/offset range (`xref $1000..$1FFF`, `xref +3DDEE..+3EFFF`) |
-| `-m <module> hint code TARGET` | Mark target as code entry (`confidence = 100`) and run incremental analysis |
+| `-m <module> hint [--batch FILE \| -f FILE]` | Apply multiple `code`, `data`, `pointer`, or `jump-table` hints in a single transaction + one incremental analysis pass |
+| `-m <module> hint code TARGET... [--batch FILE]` | Mark one or more targets as code entries (`confidence = 100`), reclaim unreferenced interior labels, and run incremental analysis once |
 | `-m <module> hint data TARGET [COUNT] [--string] [--comment TEXT]` | Mark byte/data range or null-terminated string (`--string`) at `confidence = 100` |
 | `-m <module> hint pointer TARGET [COUNT] [--follow] [--comment TEXT]` | Mark 32-bit pointer(s) (`confidence = 100`), create target labels + `DATA_ADDR` xrefs, and seed code targets when `--follow` is passed |
+| `-m <module> hint jump-table TARGET [COUNT] [--base BASE] [--count N] [--entry-size 2\|4]` | Mark a relative offset jump table (`dc.w Target-Base` or `dc.l Target-Base`), create `Target-Base` expressions + `DATA_ADDR` xrefs, and seed all target handlers as `CODE` |
 | `-m <module> hint base-reg REG BASE_HEX [--segment NAME] [--function LABEL]` | Declare a base-register invariant (`REG` = `a4`/`a5`/`a6`, e.g. `hint base-reg a6 0xDFF000`) so `d16(An)` accesses resolve to hardware names / global `DATA`/`BSS` xrefs. Scope is global, or limited to one `--segment` or `--function`; re-runs analysis |
-| `-m <module> rename OLD_NAME NEW_NAME` | Rename a symbol (or multiple `OLD=NEW` pairs, or `--file <path>` batch file) across all segments in a single transaction |
-| `-m <module> comment TARGET [TEXT] [--block] [--batch FILE]` | Set or clear inline comment or function/block header comment (`--block` / `-b`), with strict cell-boundary & function-bounds validation and batch file support (`--batch` / `--file`) |
-| `-m <module> abi [TARGET [SIGNATURE]] [--verify] [--batch FILE] [-f text\|json]` | Set, inspect, or statically verify (`--verify`) a function's register call signature (`(a0=Model*) -> d0 \| clobbers: d1/a1`) |
-| `-m <module> struct add NAME [--size BYTES] OFFSET=FIELD[.b\|.w\|.l\|.p]...` | Define or update a named struct and its field offsets (`struct list [-f text\|json]`, `struct remove NAME`); emitted as `<field> equ <offset>` and `<Struct>_SIZEOF equ <size>` |
+| `-m <module> label delete TARGET...` | Delete one or more bogus/mid-instruction labels (and associated renames) and re-format covering cells |
+| `-m <module> rename [OLD_NAME NEW_NAME \| --delete TARGET... \| --batch FILE \| -f FILE]` | Rename a symbol (or multiple `OLD=NEW` pairs, `--batch`/`-f <path>` batch file, or `--delete` labels) across all segments in a single transaction |
+| `-m <module> comment [TARGET [TEXT]] [--block] [--batch FILE \| -f FILE]` | Set or clear inline comment or function/block header comment (`--block` / `-b`), with strict cell-boundary & function-bounds validation and batch file support (`--batch` / `--file` / `-f`) |
+| `-m <module> abi [TARGET [SIGNATURE]] [--verify] [--batch FILE \| -f FILE] [-f text\|json]` | Set, inspect, or statically verify (`--verify`) a function's register call signature (`(a0=Model*) -> d0 \| clobbers: d1/a1`) |
+| `-m <module> struct add NAME [--size BYTES] OFFSET=FIELD[.b\|.w\|.l\|.p]...` | Define or update a named struct and its field offsets (including negative stack-frame offsets like `-220=rf_NormTablePtr.l`; `struct list [-f text\|json]`, `struct remove NAME`) |
 | `-m <module> alias [REG STRUCT [--fn FUNC]]` | Bind an address register (`a0`..`a6`) globally or per-function (`--fn <func>`) to a struct so `d16(An)` renders symbolically (`alias list [-f text\|json]`, `alias remove REG [--fn FUNC]`) |
 | `-m <module> dump [-f text\|json] [--section SEC]` | Export all durable reverse-engineering state (`entry_points`, `memory_regions`, `renames`, non-auto `comments`, `structs`, `register_aliases`, `carves`) |
-| `-m <module> operand TARGET FORMAT` | Set operand numeric format (`HEX`, `DEC`, `BIN`) and reformat the instruction |
+| `-m <module> operand [TARGET FORMAT] [--batch FILE \| -f FILE]` | Set operand numeric format (`HEX`, `DEC`, `BIN`) for one target or a batch file (`<target> <HEX\|DEC\|BIN>`) and reformat instructions |
 | `-m <module> segment add --file F --base HEX --name N` | Add a binary segment to the module |
 | `-m <module> segment split PARENT --at OFF (--len N \| --to OFF) --base HEX --name N` | Slice an extent out of a segment into a new static-base part (`<name>.bin` + shared DB), filed into the active space |
 | `-m <module> segment remove NAME` | Remove a segment from the module |
@@ -96,13 +100,13 @@ cmp -l assets/disk.1 build/disk_1.bin   # 0 differences
 
 ## Target Address & Label Resolution Syntax
 
-Every CLI command that takes a `TARGET` (`callgraph`, `hint`, `comment`, `operand`) as well as the TUI `Goto` (`g`) prompt accepts any of the following human- and LLM-friendly formats:
+Every CLI command that takes a `TARGET` (`callgraph`, `disasm`, `data`, `xref`, `hint`, `comment`, `operand`, `label delete`) as well as the TUI `Goto` (`g`) prompt accepts any of the following human- and LLM-friendly formats:
 
 | Format | Example | Meaning |
 |--------|---------|---------|
 | `<segment>:<label>` | `hunk5:LAB_5_24BE8` or `hunk3:RenderSprite` | Exact label (original or renamed) within a specific segment |
 | `<label>` | `LAB_5_24BE8` or `RenderSprite` | Unqualified label name (auto-generated or renamed) |
-| `<segment>:+<hex>` | `hunk5:+24BE8` or `hunk3:+$10` | Hex byte offset relative to the start of `<segment>` |
+| `<segment>:+<hex>` / `<segment>:<hex>` | `hunk5:+24BE8`, `hunk5:0x24BE8`, or `hunk3:$10` | Hex byte offset relative to the start of `<segment>` |
 | `<label>+<hex>` | `LAB_5_24BE8+2C` or `hunk5:LAB_5_24BE8+2C` | Hex byte offset relative to a label (ideal for targeting individual instructions inside a function) |
 | `+<hex>` / `+$<hex>` | `+24BE8` | Hex byte offset relative to the currently active segment |
 | `0x<hex>` / `$<hex>` | `0x72580` / `$72580` | Internal virtual address |
@@ -133,7 +137,7 @@ Every CLI command that takes a `TARGET` (`callgraph`, `hint`, `comment`, `operan
 
 ---
 
-## Atomic Analysis & Annotation Primitives (`search`, `data`, `xref`, `struct`, `alias`, `abi`, `dump`)
+## Atomic Analysis & Annotation Primitives (`search`, `disasm`, `data`, `xref`, `struct`, `alias`, `abi`, `dump`)
 
 ### 1. Code, Pattern & Cluster Search (`hunks search`)
 ```bash
@@ -144,8 +148,10 @@ hunks -m <module> search cluster:blitter                # presets: 3dmath, mul, 
 hunks -m <module> search smc                            # self-modifying code writes into CODE cells
 ```
 
-### 2. Data, Copper & Struct Array Inspection (`hunks data` / `inspect`)
+### 2. Direct Address-Range Disassembly (`hunks disasm`) & Data Inspection (`hunks data` / `inspect`)
 ```bash
+hunks -m <module> disasm hunk5:0x1DD50 -n 16            # disassemble 16 instructions at any address or mid-function label
+hunks -m <module> disasm +1EF10 -n 12 --try-code        # read-only preview of candidate M68000 instructions on DATA bytes
 hunks -m <module> data +001A4 --len 64                  # formatted dc.b/dc.w/dc.l/pointer/string cells
 hunks -m <module> data CopperList_Main --copper         # decode Amiga Copper MOVE/WAIT/SKIP words
 hunks -m <module> data 0x6B6E --struct Model --count 8  # decode N records using a defined struct stride
@@ -161,9 +167,10 @@ hunks -m <module> xref '+3DDEE..+3EFFF'                 # rollup of all external
 ### 4. Structs, Scoped Register Aliases & Call ABI (`struct`, `alias`, `abi`)
 ```bash
 hunks -m <module> struct add Model --size 18 0=Model_Radius.w 2=Model_Verts.p
+hunks -m <module> struct add RenderFrame --size 240 -220=rf_NormTablePtr.l -216=rf_VertTablePtr.l
 hunks -m <module> alias a0 Model --fn Poly_RenderObject # scope a0 -> Model to a single function
 hunks -m <module> abi Poly_RenderObject "(a0=Model*, d0.w=id) -> d0.l | clobbers: d1-d7/a1-a3"
-hunks -m <module> abi --verify                          # check all ABI strings against static ReadRegs/WriteRegs
+hunks -m <module> abi --verify                          # check all ABI strings against static ReadRegs/WriteRegs/SavedRegs
 ```
 
 ### 5. Structured State Export (`hunks dump`)
@@ -214,13 +221,15 @@ For a freshly `init`'d binary, work top-down to the spine, then bottom-up to nam
 | Are any functions cut off early by unreached branches or inline data tables? | `hunks -m <mod> cg --suspect -n 20` |
 | What indirect calls (`jsr (An)`, `jmp d16(An)`, `jmp d8(PC,Xn)`) exist and which are unresolved? | `hunks -m <mod> cg --indirect [-f json]` |
 | How does function `X` work, what registers/globals does it read/write, and how do callers invoke it? | `hunks -m <mod> cg <X> --code` |
+| How do I inspect a mid-function local label or preview candidate instructions on `DATA` bytes without dumping a huge function? | `hunks -m <mod> disasm <target> [-n 20]`<br>`hunks -m <mod> disasm <target> -n 15 --try-code` |
 | Where are 3D math, Blitter, Copper, Paula audio, bitplane, sprite, CIA, or DMA routines? | `hunks -m <mod> search cluster:<3dmath\|blitter\|copper\|paula\|bitplane\|sprite\|cia\|dma> [--dense]` |
 | Where does the program use a specific opcode (`muls.w`, `divs.w`, `movem.l`) or operand (`$1178`)? | `hunks -m <mod> search m:divs.w`<br>`hunks -m <mod> search 'o:$1178'` |
 | Does this program use self-modifying code (SMC), and what code addresses are patched? | `hunks -m <mod> search smc` |
 | What is inside a non-code table, string block, Copper list, or array of structs? | `hunks -m <mod> data <target> [--len N]`<br>`hunks -m <mod> data <target> --copper`<br>`hunks -m <mod> data <target> --struct <Name> --count <N>` |
 | What reads, writes, or calls a specific variable/function or a whole memory/code region? | `hunks -m <mod> xref <addr_or_label>`<br>`hunks -m <mod> xref '$1000..$1FFF'`<br>`hunks -m <mod> xref '+3DDEE..+3EFFF'` |
-| A jump/pointer table in `DATA` points to unseeded subroutines — how do I mark & trace them? | `hunks -m <mod> hint pointer <addr> <count> --follow` |
-| How do I make `d16(An)` struct offsets readable in `cg --code` and emitted `.asm`? | `hunks -m <mod> struct add <Name> --size <N> 0=field.w ...`<br>`hunks -m <mod> alias <a0..a6> <Name> [--fn <Func>]` |
+| A jump/pointer table in `DATA` points to unseeded subroutines — how do I mark & trace them? | `hunks -m <mod> hint pointer <addr> <count> --follow`<br>`hunks -m <mod> hint jump-table <addr> [count] [--base <base>]`<br>`hunks -m <mod> hint code <addr1> <addr2>...` |
+| How do I remove a bogus/mid-instruction label so the covering instruction can decode cleanly? | `hunks -m <mod> label delete <addr_or_label>...` |
+| How do I make `d16(An)` struct or negative `link a6,#-N` stack-frame offsets readable in `cg --code` and emitted `.asm`? | `hunks -m <mod> struct add <Name> --size <N> 0=field.w -220=local.l ...`<br>`hunks -m <mod> alias <a0..a6> <Name> [--fn <Func>]` |
 | How do I record and statically verify a function's register calling convention? | `hunks -m <mod> abi <Func> "(a0=Model*, d0.w=id) -> d0.l \| clobbers: d1-d3/a1"`<br>`hunks -m <mod> abi --verify` |
 | How do I reconcile all renames, comments, ABIs, structs, and regions with `FINDINGS.md`? | `hunks -m <mod> dump -f json` |
 
@@ -446,8 +455,11 @@ hunks -m frontier cg hunk9:LAB_9_03E44 --code
 ```
 If `+03EF4` is valid code that was not reached, mark it as `code`; if it is a pointer table or string, mark it explicitly:
 ```bash
-# Mark unreached instructions at hunk9:+03EF4 as code and re-trace:
-hunks -m frontier hint code hunk9:+03EF4
+# Mark one or more unreached instructions as code and re-trace in a single pass:
+hunks -m frontier hint code hunk9:0x03EF4 hunk5:0x1EF10
+
+# Or mark a 16-bit relative offset jump table (positive/negative offsets) and seed all handlers:
+hunks -m frontier hint jump-table hunk5:0x1DD6A 24 --base hunk5:0x1DD66
 
 # Or mark 8 longword pointers at hunk5:+1ABB2 and follow their code targets:
 hunks -m frontier hint pointer hunk5:+1ABB2 8 --follow
