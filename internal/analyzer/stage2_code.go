@@ -96,6 +96,12 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 	for _, c := range a.DB.CodeCells() {
 		codeCells.ReplaceOrInsert(c)
 	}
+	isIncremental := codeCells.Len() > 0
+	if isIncremental {
+		for _, t := range a.DB.DataReadWriteTargets() {
+			dataReadTargets[t] = struct{}{}
+		}
+	}
 
 	const confProtected uint8 = 100
 	protected := a.DB.ProtectedNoncodeRanges(confProtected)
@@ -117,18 +123,20 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 		}
 	}
 
-	var relocCodeTargets []uint32
-	for t := range a.RelocTargets {
-		if a.IsInCodeSegment(t) && t%2 == 0 {
-			relocCodeTargets = append(relocCodeTargets, t)
+	if !isIncremental {
+		var relocCodeTargets []uint32
+		for t := range a.RelocTargets {
+			if a.IsInCodeSegment(t) && t%2 == 0 {
+				relocCodeTargets = append(relocCodeTargets, t)
+			}
 		}
+		slices.Sort(relocCodeTargets)
+		candidateCode = append(candidateCode, relocCodeTargets...)
 	}
-	slices.Sort(relocCodeTargets)
-	candidateCode = append(candidateCode, relocCodeTargets...)
 
 	a.DB.Begin()
 
-	tablesScanned := false
+	tablesScanned := isIncremental
 	scanCursors := make([]uint32, len(a.Segments))
 	for i, s := range a.Segments {
 		scanCursors[i] = s.Base
@@ -357,26 +365,28 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 			continue
 		}
 
-		// 5. Sandbox-validated gap sweep across all Code segments
-		gapEntries := a.scanCodeGapsForCandidates(codeCells, dataReadTargets, rejectedCandidates, scanCursors, protected, hintedBases)
-		if len(gapEntries) > 0 {
-			for _, addr := range gapEntries {
+		if !isIncremental {
+			// 5. Sandbox-validated gap sweep across all Code segments
+			gapEntries := a.scanCodeGapsForCandidates(codeCells, dataReadTargets, rejectedCandidates, scanCursors, protected, hintedBases)
+			if len(gapEntries) > 0 {
+				for _, addr := range gapEntries {
+					a.AddLabel(nil, addr)
+					labelName := a.GetOrDefaultLabel(addr)
+					_ = a.DB.InsertFunction(addr, labelName, ConfMedium)
+					worklist = append(worklist, workItem{addr: addr, confidence: ConfMedium})
+				}
+				continue
+			}
+
+			// 5.5 Prologue-DATA reclaim
+			if addr, ok := a.findPrologueDataToReclaim(codeCells, dataReadTargets, reclaimedPrologues, protected, hintedBases); ok {
+				_ = a.DB.ClearOverlaps(addr, 2)
 				a.AddLabel(nil, addr)
 				labelName := a.GetOrDefaultLabel(addr)
 				_ = a.DB.InsertFunction(addr, labelName, ConfMedium)
 				worklist = append(worklist, workItem{addr: addr, confidence: ConfMedium})
+				continue
 			}
-			continue
-		}
-
-		// 5.5 Prologue-DATA reclaim
-		if addr, ok := a.findPrologueDataToReclaim(codeCells, dataReadTargets, reclaimedPrologues, protected, hintedBases); ok {
-			_ = a.DB.ClearOverlaps(addr, 2)
-			a.AddLabel(nil, addr)
-			labelName := a.GetOrDefaultLabel(addr)
-			_ = a.DB.InsertFunction(addr, labelName, ConfMedium)
-			worklist = append(worklist, workItem{addr: addr, confidence: ConfMedium})
-			continue
 		}
 
 		break
@@ -906,9 +916,17 @@ func (a *Analyzer) resolveJumpTable(
 	case m68k.EAPCIndex:
 		targets, ok := a.scanIndexedJumpTable(siteAddr, op.UVal, op.IndexReg, codeCells, dataReadTargets)
 		if ok {
+			edgeKind := db.EdgeUncond
+			xrefKind := db.XrefCodeBranch
+			if isCall && len(targets) == 1 && targets[0] == op.UVal {
+				edgeKind = db.EdgeCall
+				xrefKind = db.XrefCodeCall
+				labelName := a.GetOrDefaultLabel(op.UVal)
+				_ = a.DB.InsertFunction(op.UVal, labelName, ConfHigh)
+			}
 			for _, t := range targets {
-				_ = a.DB.InsertEdge(siteAddr, t, db.EdgeUncond)
-				_ = a.DB.InsertXref(siteAddr, t, db.XrefCodeBranch)
+				_ = a.DB.InsertEdge(siteAddr, t, edgeKind)
+				_ = a.DB.InsertXref(siteAddr, t, xrefKind)
 			}
 		}
 		return targets, ok
@@ -1074,38 +1092,143 @@ func (a *Analyzer) scanIndexedJumpTable(
 	}
 
 	// 2. Check for 16-bit relative offset data table (dc.w target - table_addr)
+	_, hasDataReadAtTable := dataReadTargets[tableAddr]
+	isOffsetTable := hasDataReadAtTable || a.hasPrecedingOffsetLoad(siteAddr, idxReg, codeCells)
+	if !isOffsetTable {
+		if !hasCodeCell(codeCells, tableAddr) {
+			if _, ok := a.DecodeValidInsn(tableAddr, false); ok {
+				return []uint32{tableAddr}, true
+			}
+		} else {
+			return []uint32{tableAddr}, true
+		}
+		return nil, false
+	}
+
 	dataBounds := uint32(16)
 	if hasBound {
 		dataBounds = inferredBound
 	}
 	if firstWord, ok := a.ReadI16(tableAddr); ok {
 		firstTarget := uint32(int64(tableAddr) + int64(firstWord))
-		if a.IsSameSegment(tableAddr, firstTarget) && firstTarget%2 == 0 && firstTarget > tableAddr {
-			for i := uint32(0); i < dataBounds; i++ {
-				entryAddr := tableAddr + i*2
-				if entryAddr >= minTarget || !a.IsSameSegment(tableAddr, entryAddr) || hasCodeCell(codeCells, entryAddr) {
-					break
+		if a.IsSameSegment(tableAddr, firstTarget) && firstTarget%2 == 0 {
+			if firstWord > 0 && firstTarget > tableAddr {
+				for i := uint32(0); i < dataBounds; i++ {
+					entryAddr := tableAddr + i*2
+					if entryAddr >= minTarget || !a.IsSameSegment(tableAddr, entryAddr) || hasCodeCell(codeCells, entryAddr) {
+						break
+					}
+					offset, ok := a.ReadI16(entryAddr)
+					if !ok || offset <= 0 {
+						break
+					}
+					target := uint32(int64(tableAddr) + int64(offset))
+					if !a.IsSameSegment(tableAddr, target) || target%2 != 0 {
+						break
+					}
+					minTarget = min(minTarget, target)
+					dataReadTargets[entryAddr] = struct{}{}
+					a.AddLabel(&src, target)
+					targets = append(targets, target)
 				}
-				offset, ok := a.ReadI16(entryAddr)
-				if !ok || offset <= 0 {
-					break
+				if len(targets) > 0 {
+					return targets, true
 				}
-				target := uint32(int64(tableAddr) + int64(offset))
-				if !a.IsSameSegment(tableAddr, target) || target%2 != 0 {
-					break
+			} else if firstWord < 0 {
+				for i := uint32(0); i < dataBounds; i++ {
+					entryAddr := tableAddr + i*2
+					if !a.IsSameSegment(tableAddr, entryAddr) || hasCodeCell(codeCells, entryAddr) {
+						break
+					}
+					offset, ok := a.ReadI16(entryAddr)
+					if !ok || offset >= 0 || offset%2 != 0 {
+						break
+					}
+					target := uint32(int64(tableAddr) + int64(offset))
+					if !a.IsSameSegment(tableAddr, target) || target%2 != 0 {
+						break
+					}
+					if _, okInsn := a.DecodeValidInsn(target, false); !okInsn {
+						break
+					}
+					dataReadTargets[entryAddr] = struct{}{}
+					a.AddLabel(&src, target)
+					targets = append(targets, target)
 				}
-				minTarget = min(minTarget, target)
-				dataReadTargets[entryAddr] = struct{}{}
-				a.AddLabel(&src, target)
-				targets = append(targets, target)
-			}
-			if len(targets) > 0 {
-				return targets, true
+				if len(targets) > 0 {
+					return targets, true
+				}
 			}
 		}
 	}
 
 	return nil, false
+}
+
+// hasPrecedingOffsetLoad reports whether the instructions immediately preceding siteAddr
+// load the dispatch index register `idxReg` from a 16-bit indexed memory operand
+// (`MOVE.W d8(PC/An,Xn),Dm`).
+func (a *Analyzer) hasPrecedingOffsetLoad(siteAddr uint32, idxReg uint8, codeCells *btree.BTreeG[db.Cell]) bool {
+	seg := a.SegmentAt(siteAddr)
+	if seg == nil || idxReg >= 8 {
+		return false
+	}
+	isLoad := func(insn *m68k.Insn) bool {
+		if insn.Op != m68k.OpMOVE || insn.Suffix != m68k.SizeW || insn.NumOps < 2 {
+			return false
+		}
+		srcOp := insn.Ops[0]
+		dstOp := insn.Ops[1]
+		if dstOp.Mode != m68k.EADataReg || dstOp.Reg != idxReg {
+			return false
+		}
+		return srcOp.Mode == m68k.EAPCIndex || srcOp.Mode == m68k.EAIndex
+	}
+	if codeCells != nil && siteAddr > seg.Base {
+		expectedEnd := siteAddr
+		steps := 0
+		walked := false
+		found := false
+		codeCells.DescendLessOrEqual(db.Cell{Addr: siteAddr - 1}, func(c db.Cell) bool {
+			if c.Addr < seg.Base || c.Addr+c.Size != expectedEnd || steps >= 6 {
+				return false
+			}
+			walked = true
+			expectedEnd = c.Addr
+			steps++
+			raw := c.RawBytes
+			if len(raw) < 2 {
+				raw = a.ReadBytes(c.Addr, int(c.Size))
+			}
+			insn, ok := m68k.Decode(raw, c.Addr)
+			if !ok {
+				return false
+			}
+			if isLoad(&insn) {
+				found = true
+				return false
+			}
+			return true
+		})
+		if walked {
+			return found
+		}
+	}
+	addr := siteAddr
+	for step := 0; step < 6; step++ {
+		if addr <= seg.Base+2 {
+			break
+		}
+		addr -= 2
+		chunk := a.ReadBytes(addr, 10)
+		if len(chunk) < 2 {
+			continue
+		}
+		if insn, ok := m68k.Decode(chunk, addr); ok && isLoad(&insn) {
+			return true
+		}
+	}
+	return false
 }
 
 // extractJumpTableBounds scans backward before siteAddr for a range-check

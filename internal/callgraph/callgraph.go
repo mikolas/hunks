@@ -168,7 +168,7 @@ func VerifyABI(abiStr string, inRegs, modRegs, savedRegs []string) []string {
 
 	var warnings []string
 	for _, r := range extractRegs(inSection) {
-		if !slices.Contains(inRegs, r) {
+		if !slices.Contains(inRegs, r) && !slices.Contains(savedRegs, r) {
 			if slices.Contains(modRegs, r) {
 				warnings = append(warnings, fmt.Sprintf("claimed input register %s is overwritten before being read in function body", r))
 			} else {
@@ -559,7 +559,22 @@ func Build(proj *project.Project) (*CallGraph, error) {
 		hasLoop := false
 		hasSMC := false
 
-		for insnIdx, ia := range insnAddrs {
+		// Order instructions starting from entryAddr first, followed by any backward-branched
+		// tail/helper blocks at addresses < entryAddr, so prologue register saves (isEntrySave)
+		// and read-before-write liveness (inMask vs modMask) evaluate from the true entry point.
+		flowAddrs := make([]uint32, 0, len(insnAddrs))
+		for _, ia := range insnAddrs {
+			if ia >= entryAddr {
+				flowAddrs = append(flowAddrs, ia)
+			}
+		}
+		for _, ia := range insnAddrs {
+			if ia < entryAddr {
+				flowAddrs = append(flowAddrs, ia)
+			}
+		}
+
+		for insnIdx, ia := range flowAddrs {
 			cell, ok := cells[ia]
 			if !ok {
 				continue
@@ -1181,6 +1196,7 @@ func (cg *CallGraph) ResolveTarget(proj *project.Project, target string, segFilt
 				if fAddr, ok := cg.InsnToFunc[abs]; ok {
 					return fAddr, true
 				}
+				return 0, false
 			}
 		}
 	}
@@ -1190,7 +1206,7 @@ func (cg *CallGraph) ResolveTarget(proj *project.Project, target string, segFilt
 		if normSeg != "" {
 			if s := proj.SegmentByName(normSeg); s != nil {
 				abs := addr
-				if addr < s.FileSize() {
+				if addr < s.FileSize() || addr < s.AllocSize {
 					abs = s.Base + addr
 				}
 				if _, ok := cg.Functions[abs]; ok {
@@ -1199,6 +1215,15 @@ func (cg *CallGraph) ResolveTarget(proj *project.Project, target string, segFilt
 				if fAddr, ok := cg.InsnToFunc[abs]; ok {
 					return fAddr, true
 				}
+				if abs != addr && addr >= s.Base && addr < s.EndAddr() {
+					if _, ok := cg.Functions[addr]; ok {
+						return addr, true
+					}
+					if fAddr, ok := cg.InsnToFunc[addr]; ok {
+						return fAddr, true
+					}
+				}
+				return 0, false
 			}
 		}
 		if _, ok := cg.Functions[addr]; ok {

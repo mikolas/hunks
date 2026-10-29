@@ -16,6 +16,7 @@ import (
 	"github.com/mikolas/hunks/internal/db"
 	"github.com/mikolas/hunks/internal/emitter"
 	"github.com/mikolas/hunks/internal/hunk"
+	"github.com/mikolas/hunks/internal/m68k"
 	"github.com/mikolas/hunks/internal/modules"
 	"github.com/mikolas/hunks/internal/project"
 	"github.com/mikolas/hunks/internal/tui"
@@ -36,20 +37,26 @@ func resolveAddrOrLabel(proj *project.Project, ctrl *db.Controller, val string) 
 }
 
 func listWorkspaceTargets(workspaceRoot string) []string {
-	workDir := filepath.Join(workspaceRoot, "work")
-	entries, err := os.ReadDir(workDir)
-	if err != nil {
-		return nil
-	}
 	var targets []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			p := filepath.Join(workDir, entry.Name(), "project.json")
-			if _, err := os.Stat(p); err == nil {
-				targets = append(targets, entry.Name())
+	seen := make(map[string]bool)
+	scanDir := func(dir string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			if entry.IsDir() && !seen[entry.Name()] {
+				p := filepath.Join(dir, entry.Name(), "project.json")
+				if _, err := os.Stat(p); err == nil {
+					seen[entry.Name()] = true
+					targets = append(targets, entry.Name())
+				}
 			}
 		}
 	}
+	scanDir(filepath.Join(workspaceRoot, "work"))
+	scanDir(workspaceRoot)
+	scanDir(filepath.Join(workspaceRoot, "work", "work"))
 	slices.Sort(targets)
 	return targets
 }
@@ -70,8 +77,25 @@ func loadTargetProject(workspaceRoot string, moduleOpt string) (*project.Project
 	targetName = strings.TrimSuffix(targetName, "/")
 	targetWorkDir := filepath.Join(workspaceRoot, "work", targetName)
 	projJSON := filepath.Join(targetWorkDir, "project.json")
+	effectiveRoot := workspaceRoot
 	if _, err := os.Stat(projJSON); err != nil {
-		return nil, fmt.Errorf("Module '%s' not found at %s. Run 'hunks init' first.%s", targetName, projJSON, availHint)
+		altDir := filepath.Join(workspaceRoot, targetName)
+		altJSON := filepath.Join(altDir, "project.json")
+		nestedDir := filepath.Join(workspaceRoot, "work", "work", targetName)
+		nestedJSON := filepath.Join(nestedDir, "project.json")
+		if _, errAlt := os.Stat(altJSON); errAlt == nil {
+			targetWorkDir = altDir
+			projJSON = altJSON
+			if filepath.Base(workspaceRoot) == "work" {
+				effectiveRoot = filepath.Dir(workspaceRoot)
+			}
+		} else if _, errNested := os.Stat(nestedJSON); errNested == nil {
+			targetWorkDir = nestedDir
+			projJSON = nestedJSON
+			effectiveRoot = filepath.Join(workspaceRoot, "work")
+		} else {
+			return nil, fmt.Errorf("Module '%s' not found at %s. Run 'hunks init' first.%s", targetName, projJSON, availHint)
+		}
 	}
 
 	if err := os.Chdir(targetWorkDir); err != nil {
@@ -81,7 +105,7 @@ func loadTargetProject(workspaceRoot string, moduleOpt string) (*project.Project
 	if err := proj.Load(); err != nil {
 		return nil, err
 	}
-	proj.WorkspaceRoot = workspaceRoot
+	proj.WorkspaceRoot = effectiveRoot
 	if proj.Data.TargetName == "" {
 		proj.Data.TargetName = targetName
 	}
@@ -94,6 +118,135 @@ func requireSegment(proj *project.Project) (project.Segment, error) {
 		return project.Segment{}, fmt.Errorf("module '%s' has no segments; run `hunks init` first or re-initialize the workspace", proj.Data.TargetName)
 	}
 	return *seg, nil
+}
+
+func applyCodeHintsBatch(proj *project.Project, ctrl *db.Controller, rawAddrs []uint32) ([]uint32, error) {
+	if len(rawAddrs) == 0 {
+		return nil, nil
+	}
+	aligned := make([]uint32, 0, len(rawAddrs))
+	var singleSegName string
+	multiOrReloc := false
+	segDataCache := make(map[string][]byte)
+
+	for i, rawAddr := range rawAddrs {
+		addr := rawAddr &^ 1
+		aligned = append(aligned, addr)
+		autoLbl := proj.AutoLabel(addr)
+
+		var segName string
+		isReloc := false
+		var segData []byte
+		var segBase uint32
+		if targetSeg := proj.SegmentAtAddr(addr); targetSeg != nil {
+			segName = targetSeg.Name
+			isReloc = targetSeg.IsRelocatable()
+			segBase = targetSeg.Base
+			data, ok := segDataCache[segName]
+			if !ok {
+				data = targetSeg.LoadBinaryData()
+				segDataCache[segName] = data
+			}
+			segData = data
+		}
+		if i == 0 {
+			singleSegName = segName
+			if isReloc || segName == "" {
+				multiOrReloc = true
+			}
+		} else if isReloc || segName == "" || !strings.EqualFold(segName, singleSegName) {
+			multiOrReloc = true
+		}
+
+		cur := addr
+		for step := 0; step < 32; step++ {
+			insnSize := uint32(2)
+			var decoded m68k.Insn
+			hasDecoded := false
+			if len(segData) > 0 && cur >= segBase {
+				off := int(cur - segBase)
+				if off < 0 || off+2 > len(segData) {
+					break
+				}
+				end := min(off+10, len(segData))
+				if insn, ok := m68k.Decode(segData[off:end], cur); ok && insn.Size >= 2 {
+					insnSize = uint32(insn.Size)
+					decoded = insn
+					hasDecoded = true
+				} else if step > 0 {
+					break
+				}
+			} else if step > 0 {
+				break
+			}
+			if step > 0 {
+				if existing, err := ctrl.GetCell(cur); err == nil && existing != nil && existing.Type == db.CellCode && existing.Size == insnSize {
+					break
+				}
+			}
+			_ = ctrl.DeleteCellsInRange(cur, cur+insnSize)
+			_ = ctrl.ClearOverlaps(cur, insnSize)
+			for inner := cur + 1; inner < cur+insnSize; inner++ {
+				selfTarget := false
+				if hasDecoded {
+					for opIdx := uint8(0); opIdx < decoded.NumOps; opIdx++ {
+						if decoded.Ops[opIdx].UVal == inner {
+							selfTarget = true
+							break
+						}
+					}
+				}
+				if !selfTarget {
+					_ = ctrl.DeleteLabelAndRename(inner)
+					_ = ctrl.DeleteEdgesAndXrefsTo(inner)
+				}
+			}
+			if !hasDecoded || decoded.IsTerminator() {
+				break
+			}
+			cur += insnSize
+		}
+
+		hasEP := false
+		for _, ep := range proj.Data.EntryPoints {
+			if (ep.Segment == "" || strings.EqualFold(ep.Segment, segName)) && ep.Addr == addr {
+				hasEP = true
+				break
+			}
+		}
+		if !hasEP {
+			proj.Data.EntryPoints = append(proj.Data.EntryPoints, project.EntryPoint{
+				Addr:    addr,
+				Name:    autoLbl,
+				Segment: segName,
+			})
+		}
+
+		if lbl, err := ctrl.GetLabelFull(addr); err != nil || lbl == nil || lbl.IsAuto {
+			_ = ctrl.SetLabel(addr, autoLbl, db.LabelLab, true)
+		}
+	}
+	_ = proj.Save()
+
+	var an *analyzer.Analyzer
+	var err error
+	if multiOrReloc || singleSegName == "" {
+		an, err = analyzer.New(proj, ctrl)
+	} else {
+		an, err = analyzer.NewForSegment(proj, ctrl, singleSegName)
+	}
+	if err != nil {
+		proj.SyncDBScope(ctrl)
+		return aligned, err
+	}
+	an.AnalyzeIncremental(aligned)
+	if !multiOrReloc && singleSegName != "" {
+		proj.RefreshCoverageStats(ctrl)
+		_ = proj.Save()
+	} else {
+		proj.SyncDBScope(ctrl)
+	}
+	return aligned, nil
 }
 
 func runTraceAnalysis(proj *project.Project, ctrl *db.Controller, budget uint64) error {
@@ -340,6 +493,9 @@ func main() {
 			targetName := strings.TrimPrefix(rawTarget, "work/")
 			targetName = strings.TrimSuffix(targetName, "/")
 
+			if workspacePath == "." && filepath.Base(workspaceRoot) == "work" {
+				workspaceRoot = filepath.Dir(workspaceRoot)
+			}
 			targetWorkDir := filepath.Join(workspaceRoot, "work", targetName)
 			projJSON := filepath.Join(targetWorkDir, "project.json")
 			if _, err := os.Stat(projJSON); err == nil && !initForce {
@@ -826,22 +982,147 @@ func main() {
 
 	// --- hint ---
 	var hintFollow, hintString bool
-	var hintComment, hintSegment, hintFunction string
+	var hintComment, hintSegment, hintFunction, hintBase, hintBatchFile string
+	var hintCount, hintEntrySize int
 	hintCmd := &cobra.Command{
-		Use:   "hint <pointer|data|code|base-reg> <addr> [count]",
-		Short: "Provide an analysis hint (pointer, data, code, or base-reg)",
-		Args:  cobra.RangeArgs(2, 3),
+		Use:   "hint [pointer|data|code|base-reg|jump-table] [addr...]",
+		Short: "Provide one or more analysis hints (pointer, data, code, base-reg, or jump-table; supports --batch/-f)",
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			typeStr := args[0]
-			addrStr := args[1]
-			var countStr string
-			if len(args) >= 3 {
-				countStr = args[2]
+			type hintSpec struct {
+				kind      string
+				addrStr   string
+				countStr  string
+				baseStr   string
+				entrySize int
+				follow    bool
+				isString  bool
+				comment   string
 			}
-			switch typeStr {
-			case "pointer", "data", "code", "base-reg":
-			default:
-				return fmt.Errorf("invalid hint type %q (expected pointer, data, code, or base-reg)", typeStr)
+			var specs []hintSpec
+
+			if hintBatchFile != "" {
+				var r io.Reader
+				if hintBatchFile == "-" {
+					r = os.Stdin
+				} else {
+					fpath := resolveCallerPath(hintBatchFile)
+					f, err := os.Open(fpath)
+					if err != nil {
+						return fmt.Errorf("failed to open hint batch file '%s': %w", fpath, err)
+					}
+					defer f.Close()
+					r = f
+				}
+				scanner := bufio.NewScanner(r)
+				lineIdx := 0
+				for scanner.Scan() {
+					lineIdx++
+					line := scanner.Text()
+					trimmed := line
+					if idx := strings.IndexByte(trimmed, '#'); idx >= 0 {
+						trimmed = trimmed[:idx]
+					}
+					if idx := strings.IndexByte(trimmed, ';'); idx >= 0 {
+						trimmed = trimmed[:idx]
+					}
+					trimmed = strings.TrimSpace(trimmed)
+					if trimmed == "" {
+						continue
+					}
+					fields := strings.Fields(trimmed)
+					if len(fields) == 1 {
+						specs = append(specs, hintSpec{
+							kind:      "code",
+							addrStr:   fields[0],
+							entrySize: hintEntrySize,
+							follow:    hintFollow,
+							isString:  hintString,
+						})
+						continue
+					}
+					k := strings.ToLower(fields[0])
+					switch k {
+					case "code":
+						for _, a := range fields[1:] {
+							specs = append(specs, hintSpec{kind: "code", addrStr: a})
+						}
+					case "pointer", "data", "base-reg", "jump-table":
+						sp := hintSpec{
+							kind:      k,
+							addrStr:   fields[1],
+							baseStr:   hintBase,
+							entrySize: hintEntrySize,
+							follow:    hintFollow,
+							isString:  hintString,
+						}
+						for _, extra := range fields[2:] {
+							switch {
+							case extra == "--follow":
+								sp.follow = true
+							case extra == "--string":
+								sp.isString = true
+							case strings.HasPrefix(extra, "--base="):
+								sp.baseStr = strings.TrimPrefix(extra, "--base=")
+							case strings.HasPrefix(extra, "--count="):
+								sp.countStr = strings.TrimPrefix(extra, "--count=")
+							case sp.countStr == "":
+								sp.countStr = extra
+							case sp.baseStr == "":
+								sp.baseStr = extra
+							}
+						}
+						specs = append(specs, sp)
+					default:
+						return fmt.Errorf("invalid hint type %q on line %d (expected pointer, data, code, base-reg, or jump-table)", fields[0], lineIdx)
+					}
+				}
+				if err := scanner.Err(); err != nil {
+					return err
+				}
+			}
+
+			if len(args) > 0 {
+				typeStr := strings.ToLower(args[0])
+				switch typeStr {
+				case "code":
+					if len(args) < 2 {
+						return fmt.Errorf("usage: hunks hint code <addr1> [addr2...]")
+					}
+					for _, a := range args[1:] {
+						specs = append(specs, hintSpec{
+							kind:    "code",
+							addrStr: a,
+							comment: hintComment,
+						})
+					}
+				case "pointer", "data", "base-reg", "jump-table":
+					if len(args) < 2 {
+						return fmt.Errorf("usage: hunks hint %s <addr> [count]", typeStr)
+					}
+					var countStr string
+					if len(args) >= 3 {
+						countStr = args[2]
+					} else if hintCount > 0 {
+						countStr = fmt.Sprintf("%d", hintCount)
+					}
+					specs = append(specs, hintSpec{
+						kind:      typeStr,
+						addrStr:   args[1],
+						countStr:  countStr,
+						baseStr:   hintBase,
+						entrySize: hintEntrySize,
+						follow:    hintFollow,
+						isString:  hintString,
+						comment:   hintComment,
+					})
+				default:
+					return fmt.Errorf("invalid hint type %q (expected pointer, data, code, base-reg, or jump-table)", args[0])
+				}
+			}
+
+			if len(specs) == 0 {
+				return fmt.Errorf("expected `hunks hint <pointer|data|code|base-reg|jump-table> <addr>...` or `--batch <file>`")
 			}
 
 			proj, err := loadTargetProject(getWorkspaceRoot(), moduleName)
@@ -859,124 +1140,285 @@ func main() {
 			defer ctrl.Close()
 			proj.SyncDBScope(ctrl)
 
-			if typeStr == "base-reg" {
-				reg := strings.ToLower(addrStr)
-				if reg != "a4" && reg != "a5" && reg != "a6" {
-					return fmt.Errorf("base-reg: register must be a4, a5 or a6 (got '%s')", addrStr)
+			var allCodeSeeds []uint32
+			type jtEntry struct {
+				entryAddr  uint32
+				targetAddr uint32
+				baseAddr   uint32
+			}
+			var jtEntries []jtEntry
+			needFullAnalyze := false
+
+			for _, sp := range specs {
+				switch sp.kind {
+				case "base-reg":
+					reg := strings.ToLower(sp.addrStr)
+					if reg != "a4" && reg != "a5" && reg != "a6" {
+						return fmt.Errorf("base-reg: register must be a4, a5 or a6 (got '%s')", sp.addrStr)
+					}
+					if sp.countStr == "" {
+						return fmt.Errorf("base-reg: missing base address (usage: hint base-reg a4 0x<addr>)")
+					}
+					baseAddr, err := parseHex(sp.countStr)
+					if err != nil {
+						return err
+					}
+					scopeKind := "global"
+					scopeKey := ""
+					if hintFunction != "" {
+						scopeKind = "function"
+						scopeKey = hintFunction
+					} else if hintSegment != "" {
+						scopeKind = "segment"
+						scopeKey = hintSegment
+					}
+					if err := ctrl.SetBaseReg(scopeKind, scopeKey, reg, baseAddr, "hint"); err != nil {
+						return err
+					}
+					needFullAnalyze = true
+					fmt.Printf("Set base-reg %s = 0x%X (scope: %s %s)\n", reg, baseAddr, scopeKind, scopeKey)
+
+				case "pointer":
+					addrU32, err := resolveAddrOrLabel(proj, ctrl, sp.addrStr)
+					if err != nil {
+						return err
+					}
+					cnt := uint32(1)
+					if sp.countStr != "" {
+						cnt, err = parseHex(sp.countStr)
+						if err != nil {
+							return err
+						}
+					}
+					an, err := analyzer.New(proj, ctrl)
+					if err != nil {
+						return err
+					}
+					var ptrSeeds []uint32
+					if err := ctrl.WithTransaction(func() error {
+						for i := uint32(0); i < cnt; i++ {
+							slotAddr := addrU32 + (i * 4)
+							if err := ctrl.MarkData(slotAddr, 4, db.CellPointer); err != nil {
+								return err
+							}
+							var tgt uint32
+							hasTgt := false
+							if rTgt, ok := an.Relocs[slotAddr]; ok {
+								tgt = rTgt
+								hasTgt = true
+							} else if u32Tgt, ok := an.ReadU32(slotAddr); ok {
+								tgt = u32Tgt
+								hasTgt = true
+							}
+							if hasTgt && (an.IsInAnySegment(tgt) || an.IsInMemoryRegion(tgt)) {
+								an.AddLabel(&slotAddr, tgt)
+								_ = ctrl.InsertXref(slotAddr, tgt, db.XrefDataAddr)
+								lbl := an.GetOrDefaultLabel(tgt)
+								_ = ctrl.SetCellOp(slotAddr, lbl)
+								if sp.follow && tgt%2 == 0 && an.IsInCodeSegment(tgt) && !slices.Contains(allCodeSeeds, tgt) {
+									allCodeSeeds = append(allCodeSeeds, tgt)
+									ptrSeeds = append(ptrSeeds, tgt)
+								}
+							}
+						}
+						if sp.comment != "" {
+							return ctrl.UpdateComment(addrU32, sp.comment)
+						}
+						return nil
+					}); err != nil {
+						return err
+					}
+					fmt.Printf("Added pointer hint at 0x%X with count %d (%d code target(s) queued)\n", addrU32, cnt, len(ptrSeeds))
+
+				case "data":
+					addrU32, err := resolveAddrOrLabel(proj, ctrl, sp.addrStr)
+					if err != nil {
+						return err
+					}
+					size := uint32(1)
+					if sp.countStr != "" {
+						size, err = parseHex(sp.countStr)
+						if err != nil {
+							return err
+						}
+					}
+					regionType := db.CellDataB
+					if sp.isString {
+						regionType = db.CellStr
+					}
+					if err := ctrl.MarkData(addrU32, size, regionType); err != nil {
+						return err
+					}
+					if sp.comment != "" {
+						_ = ctrl.UpdateComment(addrU32, sp.comment)
+					}
+					fmt.Printf("Added data hint at 0x%X with size %d\n", addrU32, size)
+
+				case "jump-table":
+					tableAddr, err := resolveAddrOrLabel(proj, ctrl, sp.addrStr)
+					if err != nil {
+						return err
+					}
+					tableAddr &= ^uint32(1)
+					baseAddr := tableAddr
+					if sp.baseStr != "" {
+						baseAddr, err = resolveAddrOrLabel(proj, ctrl, sp.baseStr)
+						if err != nil {
+							return fmt.Errorf("cannot resolve --base %q: %w", sp.baseStr, err)
+						}
+					}
+					entSize := uint32(2)
+					if sp.entrySize == 4 {
+						entSize = 4
+					} else if sp.entrySize != 0 && sp.entrySize != 2 {
+						return fmt.Errorf("invalid --entry-size %d (expected 2 or 4)", sp.entrySize)
+					}
+					var explicitCnt uint32
+					if sp.countStr != "" {
+						explicitCnt, err = parseHex(sp.countStr)
+						if err != nil {
+							return err
+						}
+					}
+					an, err := analyzer.New(proj, ctrl)
+					if err != nil {
+						return err
+					}
+					maxEntries := explicitCnt
+					if maxEntries == 0 {
+						maxEntries = 256
+					}
+					var minFwdTarget uint32 = 0xFFFFFFFF
+					var tableEntries []jtEntry
+					for i := uint32(0); i < maxEntries; i++ {
+						entryAddr := tableAddr + i*entSize
+						if explicitCnt == 0 && entryAddr >= minFwdTarget {
+							break
+						}
+						if !an.IsSameSegment(tableAddr, entryAddr) {
+							break
+						}
+						var off int64
+						var okOff bool
+						if entSize == 2 {
+							if v, ok16 := an.ReadI16(entryAddr); ok16 {
+								off = int64(v)
+								okOff = true
+							}
+						} else {
+							if v, ok32 := an.ReadU32(entryAddr); ok32 {
+								off = int64(int32(v))
+								okOff = true
+							}
+						}
+						if !okOff {
+							break
+						}
+						targetAddr := uint32(int64(baseAddr) + off)
+						if explicitCnt == 0 {
+							if off == 0 || targetAddr%2 != 0 || !an.IsSameSegment(tableAddr, targetAddr) {
+								break
+							}
+							if targetAddr > tableAddr && targetAddr < entryAddr+entSize {
+								break
+							}
+							if _, okInsn := an.DecodeValidInsn(targetAddr, false); !okInsn {
+								break
+							}
+						}
+						if targetAddr > tableAddr {
+							minFwdTarget = min(minFwdTarget, targetAddr)
+						}
+						tableEntries = append(tableEntries, jtEntry{
+							entryAddr:  entryAddr,
+							targetAddr: targetAddr,
+							baseAddr:   baseAddr,
+						})
+					}
+					if len(tableEntries) == 0 {
+						return fmt.Errorf("no valid jump-table entries found at 0x%X", tableAddr)
+					}
+					cellType := db.CellDataW
+					if entSize == 4 {
+						cellType = db.CellDataL
+					}
+					if err := ctrl.WithTransaction(func() error {
+						an.AddLabel(nil, tableAddr)
+						if baseAddr != tableAddr {
+							an.AddLabel(nil, baseAddr)
+						}
+						baseLbl := an.GetOrDefaultLabel(baseAddr)
+						for _, je := range tableEntries {
+							if err := ctrl.MarkData(je.entryAddr, entSize, cellType); err != nil {
+								return err
+							}
+							if je.targetAddr%2 == 0 && an.IsInAnySegment(je.targetAddr) {
+								src := je.entryAddr
+								an.AddLabel(&src, je.targetAddr)
+								_ = ctrl.InsertXref(je.entryAddr, je.targetAddr, db.XrefDataAddr)
+								tgtLbl := an.GetOrDefaultLabel(je.targetAddr)
+								_ = ctrl.SetCellOp(je.entryAddr, fmt.Sprintf("%s-%s", tgtLbl, baseLbl))
+								if an.IsInCodeSegment(je.targetAddr) && !slices.Contains(allCodeSeeds, je.targetAddr) {
+									allCodeSeeds = append(allCodeSeeds, je.targetAddr)
+								}
+							}
+							jtEntries = append(jtEntries, je)
+						}
+						if sp.comment != "" {
+							return ctrl.UpdateComment(tableAddr, sp.comment)
+						}
+						return nil
+					}); err != nil {
+						return err
+					}
+					fmt.Printf("Marked jump-table at 0x%X (%d entries, base 0x%X, %d code target(s) queued)\n",
+						tableAddr, len(tableEntries), baseAddr, len(allCodeSeeds))
+
+				case "code":
+					addrU32, err := resolveAddrOrLabel(proj, ctrl, sp.addrStr)
+					if err != nil {
+						return err
+					}
+					addrAligned := addrU32 &^ 1
+					if !slices.Contains(allCodeSeeds, addrAligned) {
+						allCodeSeeds = append(allCodeSeeds, addrAligned)
+					}
+					if sp.comment != "" {
+						_ = ctrl.UpdateComment(addrAligned, sp.comment)
+					}
 				}
-				if countStr == "" {
-					return fmt.Errorf("base-reg: missing base address (usage: hint base-reg a4 0x<addr>)")
-				}
-				baseAddr, err := parseHex(countStr)
-				if err != nil {
-					return err
-				}
-				scopeKind := "global"
-				scopeKey := ""
-				if hintFunction != "" {
-					scopeKind = "function"
-					scopeKey = hintFunction
-				} else if hintSegment != "" {
-					scopeKind = "segment"
-					scopeKey = hintSegment
-				}
-				if err := ctrl.SetBaseReg(scopeKind, scopeKey, reg, baseAddr, "hint"); err != nil {
-					return err
-				}
+			}
+
+			if needFullAnalyze {
 				an, err := analyzer.New(proj, ctrl)
 				if err != nil {
 					return err
 				}
 				an.Analyze(nil)
-				fmt.Printf("Set base-reg %s = 0x%X (scope: %s %s)\n", reg, baseAddr, scopeKind, scopeKey)
-				return nil
 			}
-
-			addrU32, err := resolveAddrOrLabel(proj, ctrl, addrStr)
-			if err != nil {
-				return err
-			}
-
-			switch typeStr {
-			case "pointer":
-				cnt := uint32(1)
-				if countStr != "" {
-					cnt, err = parseHex(countStr)
-					if err != nil {
-						return err
-					}
-				}
-				an, err := analyzer.New(proj, ctrl)
+			if len(allCodeSeeds) > 0 {
+				aligned, err := applyCodeHintsBatch(proj, ctrl, allCodeSeeds)
 				if err != nil {
 					return err
 				}
-				var codeSeeds []uint32
-				if err := ctrl.WithTransaction(func() error {
-					for i := uint32(0); i < cnt; i++ {
-						slotAddr := addrU32 + (i * 4)
-						if err := ctrl.MarkData(slotAddr, 4, db.CellPointer); err != nil {
-							return err
-						}
-						var tgt uint32
-						hasTgt := false
-						if rTgt, ok := an.Relocs[slotAddr]; ok {
-							tgt = rTgt
-							hasTgt = true
-						} else if u32Tgt, ok := an.ReadU32(slotAddr); ok {
-							tgt = u32Tgt
-							hasTgt = true
-						}
-						if hasTgt && (an.IsInAnySegment(tgt) || an.IsInMemoryRegion(tgt)) {
-							an.AddLabel(&slotAddr, tgt)
-							_ = ctrl.InsertXref(slotAddr, tgt, db.XrefDataAddr)
-							lbl := an.GetOrDefaultLabel(tgt)
-							_ = ctrl.SetCellOp(slotAddr, lbl)
-							if hintFollow && tgt%2 == 0 && an.IsInCodeSegment(tgt) && !slices.Contains(codeSeeds, tgt) {
-								codeSeeds = append(codeSeeds, tgt)
+				if len(jtEntries) > 0 {
+					if an, err := analyzer.New(proj, ctrl); err == nil {
+						an.RefreshCaches()
+						_ = ctrl.WithTransaction(func() error {
+							for _, je := range jtEntries {
+								tgtLbl := an.GetOrDefaultLabel(je.targetAddr)
+								baseLbl := an.GetOrDefaultLabel(je.baseAddr)
+								_ = ctrl.SetCellOp(je.entryAddr, fmt.Sprintf("%s-%s", tgtLbl, baseLbl))
 							}
-						}
-					}
-					if hintComment != "" {
-						return ctrl.UpdateComment(addrU32, hintComment)
-					}
-					return nil
-				}); err != nil {
-					return err
-				}
-				for _, seed := range codeSeeds {
-					if _, err := analyzer.ApplyCodeHint(proj, ctrl, seed); err != nil {
-						return err
+							return nil
+						})
 					}
 				}
-				fmt.Printf("Added pointer hint at 0x%X with count %d (%d code target(s) followed)\n", addrU32, cnt, len(codeSeeds))
-			case "data":
-				size := uint32(1)
-				if countStr != "" {
-					size, err = parseHex(countStr)
-					if err != nil {
-						return err
-					}
+				if len(aligned) == 1 && len(specs) == 1 && specs[0].kind == "code" {
+					fmt.Printf("Marked code and incrementally analyzed at 0x%X\n", aligned[0])
+				} else {
+					fmt.Printf("Marked %d code seed(s) and incrementally analyzed (first: 0x%X)\n", len(aligned), aligned[0])
 				}
-				regionType := db.CellDataB
-				if hintString {
-					regionType = db.CellStr
-				}
-				if err := ctrl.MarkData(addrU32, size, regionType); err != nil {
-					return err
-				}
-				if hintComment != "" {
-					_ = ctrl.UpdateComment(addrU32, hintComment)
-				}
-				fmt.Printf("Added data hint at 0x%X with size %d\n", addrU32, size)
-			case "code":
-				addrAligned, err := analyzer.ApplyCodeHint(proj, ctrl, addrU32)
-				if err != nil {
-					return err
-				}
-				if hintComment != "" {
-					_ = ctrl.UpdateComment(addrAligned, hintComment)
-				}
-				fmt.Printf("Marked code and incrementally analyzed at 0x%X\n", addrAligned)
 			}
 			return nil
 		},
@@ -986,14 +1428,64 @@ func main() {
 	hintCmd.Flags().BoolVar(&hintString, "string", false, "Mark data as string")
 	hintCmd.Flags().StringVar(&hintSegment, "segment", "", "For base-reg: limit the invariant to a specific segment")
 	hintCmd.Flags().StringVar(&hintFunction, "function", "", "For base-reg: limit the invariant to a specific function label")
+	hintCmd.Flags().StringVar(&hintBase, "base", "", "For jump-table: base address/label added to each relative offset (default: table_addr)")
+	hintCmd.Flags().IntVar(&hintCount, "count", 0, "Number of entries or bytes (alternative to positional [count])")
+	hintCmd.Flags().IntVar(&hintEntrySize, "entry-size", 2, "For jump-table: byte width of each signed offset entry (2 or 4)")
+	hintCmd.Flags().StringVar(&hintBatchFile, "batch", "", "Batch file of hint directives per line (use '-' for stdin)")
+	hintCmd.Flags().StringVarP(&hintBatchFile, "file", "f", "", "Alias for --batch")
 	rootCmd.AddCommand(hintCmd)
 
 	// --- rename ---
 	var renameFile string
+	var renameDelete bool
 	renameCmd := &cobra.Command{
 		Use:   "rename [args...]",
-		Short: "Rename one or more symbols",
+		Short: "Rename one or more symbols (or delete labels with --delete)",
 		RunE: func(_ *cobra.Command, args []string) error {
+			if renameDelete {
+				if len(args) == 0 {
+					return fmt.Errorf("expected `hunks rename --delete <addr_or_label>...`")
+				}
+				proj, err := loadTargetProject(getWorkspaceRoot(), moduleName)
+				if err != nil {
+					return err
+				}
+				seg, err := requireSegment(proj)
+				if err != nil {
+					return err
+				}
+				ctrl, err := db.New(seg.DB)
+				if err != nil {
+					return err
+				}
+				defer ctrl.Close()
+				proj.SyncDBScope(ctrl)
+				var deleted []uint32
+				if err := ctrl.WithTransaction(func() error {
+					for _, arg := range args {
+						addr, err := resolveAddrOrLabel(proj, ctrl, arg)
+						if err != nil {
+							return fmt.Errorf("cannot resolve address or label %q: %w", arg, err)
+						}
+						if err := ctrl.DeleteLabelAndRename(addr); err != nil {
+							return err
+						}
+						proj.Data.EntryPoints = slices.DeleteFunc(proj.Data.EntryPoints, func(ep project.EntryPoint) bool {
+							return ep.Addr == addr
+						})
+						deleted = append(deleted, addr)
+						fmt.Printf("Deleted label at 0x%X (%s)\n", addr, arg)
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
+				_ = proj.Save()
+				if an, err := analyzer.New(proj, ctrl); err == nil {
+					an.ReanalyzeXrefsBatch(deleted)
+				}
+				return nil
+			}
 			type pair struct{ oldName, newName string }
 			var pairs []pair
 
@@ -1163,6 +1655,8 @@ func main() {
 		},
 	}
 	renameCmd.Flags().StringVarP(&renameFile, "file", "f", "", "Batch file containing '<old_name> <new_name>' or '<old_name>=<new_name>' per line (use '-' for stdin)")
+	renameCmd.Flags().StringVar(&renameFile, "batch", "", "Alias for --file")
+	renameCmd.Flags().BoolVarP(&renameDelete, "delete", "d", false, "Delete the specified label(s) and any associated rename entry")
 	rootCmd.AddCommand(renameCmd)
 
 	// --- comment ---
@@ -1299,22 +1793,103 @@ func main() {
 	}
 	commentCmd.Flags().BoolVarP(&commentBlock, "block", "b", false, "Set block comment (above function/instruction) instead of inline comment")
 	commentCmd.Flags().StringVar(&commentBatchFile, "batch", "", "Batch file containing '<addr_or_label+off> = <comment>' per line (use '-' for stdin)")
-	commentCmd.Flags().StringVar(&commentBatchFile, "file", "", "Alias for --batch")
+	commentCmd.Flags().StringVarP(&commentBatchFile, "file", "f", "", "Alias for --batch")
 	rootCmd.AddCommand(commentCmd)
 
 	// --- operand ---
+	var operandBatchFile string
 	operandCmd := &cobra.Command{
-		Use:   "operand <addr> <HEX|DEC|BIN>",
-		Short: "Set immediate operand format at an address",
-		Args:  cobra.ExactArgs(2),
+		Use:   "operand [addr] [HEX|DEC|BIN]",
+		Short: "Set immediate operand format at one or more addresses (supports --batch/-f)",
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			addrStr := args[0]
-			format := args[1]
-			switch format {
-			case "HEX", "DEC", "BIN":
-			default:
-				return fmt.Errorf("invalid operand format %q (expected HEX, DEC, or BIN)", format)
+			type opEntry struct {
+				addrStr string
+				format  string
 			}
+			var entries []opEntry
+
+			if operandBatchFile != "" {
+				var r io.Reader
+				if operandBatchFile == "-" {
+					r = os.Stdin
+				} else {
+					fpath := resolveCallerPath(operandBatchFile)
+					f, err := os.Open(fpath)
+					if err != nil {
+						return fmt.Errorf("failed to open operand batch file '%s': %w", fpath, err)
+					}
+					defer f.Close()
+					r = f
+				}
+				scanner := bufio.NewScanner(r)
+				lineIdx := 0
+				for scanner.Scan() {
+					lineIdx++
+					line := scanner.Text()
+					trimmed := line
+					if idx := strings.IndexByte(trimmed, '#'); idx >= 0 {
+						trimmed = trimmed[:idx]
+					}
+					if idx := strings.IndexByte(trimmed, ';'); idx >= 0 {
+						trimmed = trimmed[:idx]
+					}
+					trimmed = strings.TrimSpace(trimmed)
+					if trimmed == "" {
+						continue
+					}
+					if aPart, fPart, ok := strings.Cut(trimmed, "="); ok {
+						entries = append(entries, opEntry{
+							addrStr: strings.TrimSpace(aPart),
+							format:  strings.ToUpper(strings.TrimSpace(fPart)),
+						})
+						continue
+					}
+					fields := strings.Fields(trimmed)
+					if len(fields) >= 2 {
+						entries = append(entries, opEntry{
+							addrStr: fields[0],
+							format:  strings.ToUpper(fields[1]),
+						})
+					} else {
+						return fmt.Errorf("invalid operand entry on line %d: %q (expected '<addr> <HEX|DEC|BIN>')", lineIdx, line)
+					}
+				}
+				if err := scanner.Err(); err != nil {
+					return err
+				}
+			}
+
+			for i := 0; i < len(args); {
+				if aPart, fPart, ok := strings.Cut(args[i], "="); ok {
+					entries = append(entries, opEntry{
+						addrStr: strings.TrimSpace(aPart),
+						format:  strings.ToUpper(strings.TrimSpace(fPart)),
+					})
+					i++
+					continue
+				}
+				if i+1 >= len(args) {
+					return fmt.Errorf("expected '<addr> <HEX|DEC|BIN>', '<addr>=<HEX|DEC|BIN>', or '--batch <file>'")
+				}
+				entries = append(entries, opEntry{
+					addrStr: args[i],
+					format:  strings.ToUpper(args[i+1]),
+				})
+				i += 2
+			}
+
+			if len(entries) == 0 {
+				return fmt.Errorf("no operand entries provided; pass '<addr> <HEX|DEC|BIN>' or '--batch <file>'")
+			}
+			for _, e := range entries {
+				switch e.format {
+				case "HEX", "DEC", "BIN":
+				default:
+					return fmt.Errorf("invalid operand format %q for %s (expected HEX, DEC, or BIN)", e.format, e.addrStr)
+				}
+			}
+
 			proj, err := loadTargetProject(getWorkspaceRoot(), moduleName)
 			if err != nil {
 				return err
@@ -1329,32 +1904,47 @@ func main() {
 			}
 			defer ctrl.Close()
 			proj.SyncDBScope(ctrl)
-			addrVal, err := resolveAddrOrLabel(proj, ctrl, addrStr)
-			if err != nil {
+
+			var resolvedAddrs []uint32
+			if err := ctrl.WithTransaction(func() error {
+				for _, e := range entries {
+					addrVal, err := resolveAddrOrLabel(proj, ctrl, e.addrStr)
+					if err != nil {
+						return err
+					}
+					if targetSeg := proj.SegmentAtAddr(addrVal); targetSeg != nil {
+						ctrl.SetActiveSeg(targetSeg.Name)
+					}
+					if err := ctrl.SetOperandFormat(addrVal, e.format); err != nil {
+						return err
+					}
+					resolvedAddrs = append(resolvedAddrs, addrVal)
+				}
+				return nil
+			}); err != nil {
 				return err
 			}
-			targetSeg := proj.SegmentAtAddr(addrVal)
-			if targetSeg != nil {
-				ctrl.SetActiveSeg(targetSeg.Name)
-			}
-			if err := ctrl.SetOperandFormat(addrVal, format); err != nil {
-				return err
-			}
-			var an *analyzer.Analyzer
-			if targetSeg != nil && !targetSeg.IsRelocatable() {
-				an, err = analyzer.NewForSegment(proj, ctrl, targetSeg.Name)
-			} else {
-				an, err = analyzer.New(proj, ctrl)
-			}
-			if err != nil {
-				return err
-			}
-			an.ReanalyzeInstruction(addrVal)
+
 			proj.SyncDBScope(ctrl)
-			fmt.Printf("Set operand format at $%X to %s\n", addrVal, format)
+			an, err := analyzer.New(proj, ctrl)
+			if err != nil {
+				return err
+			}
+			an.RefreshCaches()
+			for _, addrVal := range resolvedAddrs {
+				an.ReanalyzeInstruction(addrVal)
+			}
+			proj.SyncDBScope(ctrl)
+			if len(resolvedAddrs) == 1 {
+				fmt.Printf("Set operand format at $%X to %s\n", resolvedAddrs[0], entries[0].format)
+			} else {
+				fmt.Printf("Set operand format on %d instruction(s)\n", len(resolvedAddrs))
+			}
 			return nil
 		},
 	}
+	operandCmd.Flags().StringVar(&operandBatchFile, "batch", "", "Batch file containing '<addr> <HEX|DEC|BIN>' per line (use '-' for stdin)")
+	operandCmd.Flags().StringVarP(&operandBatchFile, "file", "f", "", "Alias for --batch")
 	rootCmd.AddCommand(operandCmd)
 
 	// --- callgraph / cg ---

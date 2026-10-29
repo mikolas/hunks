@@ -151,4 +151,42 @@ func TestAgentWorkflowCommands(t *testing.T) {
 	if !strings.Contains(dumpJSON, "\"scale X\"") || !strings.Contains(dumpJSON, "\"3D math kernel\"") {
 		t.Fatalf("expected user comments in dump JSON:\n%s", dumpJSON)
 	}
+
+	// 5. Test seg:offset without '+' in Project.ResolveTarget and CallGraph.ResolveTarget
+	if addr, ok := proj.ResolveTarget(ctrl, "main:0x0004"); !ok || addr != 0x10004 {
+		t.Fatalf("expected main:0x0004 -> 0x10004, got (%#x, %v)", addr, ok)
+	}
+	if addr, ok := cg.ResolveTarget(proj, "main:0x0004", ""); !ok || addr != 0x10000 {
+		t.Fatalf("expected cg.ResolveTarget(\"main:0x0004\") -> enclosing function 0x10000, got (%#x, %v)", addr, ok)
+	}
+
+	// 6. Test VerifyABI with callee-saved input register (no false-positive warning)
+	if warns := callgraph.VerifyABI("(a1:color_table_ptr, a6:globals_base) -> void", []string{"a6"}, []string{"d0"}, []string{"a1", "a5"}); len(warns) != 0 {
+		t.Fatalf("expected VerifyABI not to warn when claimed input a1 is in savedRegs, got %v", warns)
+	}
+
+	// 7. Test renderDisasmRange (with and without --try-code)
+	disasmOut, err := renderDisasmRange(proj, ctrl, cg, 0x10000, 3, 0, false, "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(disasmOut, "MathKernel:") || !strings.Contains(disasmOut, "muls.w") || !strings.Contains(disasmOut, "; scale X") {
+		t.Fatalf("unexpected renderDisasmRange output:\n%s", disasmOut)
+	}
+	tryCodeOut, err := renderDisasmRange(proj, ctrl, cg, 0x1000C, 1, 0, true, "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(tryCodeOut, "[TRY_CODE") {
+		t.Fatalf("expected [TRY_CODE annotation on data bytes in renderDisasmRange --try-code, got:\n%s", tryCodeOut)
+	}
+
+	// 8. Test DeleteLabelAndRename (`hunks label delete`)
+	_ = ctrl.SetLabel(0x10006, "LAB_10006", db.LabelLab, true)
+	if err := ctrl.DeleteLabelAndRename(0x10006); err != nil {
+		t.Fatal(err)
+	}
+	if lbl, _ := ctrl.GetLabelFull(0x10006); lbl != nil {
+		t.Fatalf("expected deleted label at 0x10006 to be nil, got %+v", lbl)
+	}
 }

@@ -1003,8 +1003,48 @@ func (c *Controller) DeleteCellAndEdges(addr uint32) error {
 
 func (c *Controller) DeleteLabelAt(addr uint32) error {
 	seg := c.SegOf(addr)
-	_, err := c.conn.Exec("DELETE FROM labels WHERE seg = ?1 AND addr = ?2", seg, addr)
+	_, err := c.conn.Exec("DELETE FROM labels WHERE (seg = ?1 OR seg = '') AND addr = ?2", seg, addr)
 	return err
+}
+
+func (c *Controller) DeleteEdgesFrom(sourceAddr uint32) error {
+	seg := c.SegOf(sourceAddr)
+	_, err := c.conn.Exec("DELETE FROM edges WHERE seg = ?1 AND source_addr = ?2", seg, sourceAddr)
+	return err
+}
+
+func (c *Controller) DeleteXrefsFrom(sourceAddr uint32) error {
+	seg := c.SegOf(sourceAddr)
+	_, err := c.conn.Exec("DELETE FROM xrefs WHERE seg = ?1 AND source_addr = ?2", seg, sourceAddr)
+	return err
+}
+
+func (c *Controller) DeleteEdgesAndXrefsTo(targetAddr uint32) error {
+	seg := c.SegOf(targetAddr)
+	_, _ = c.conn.Exec("DELETE FROM edges WHERE (seg = ?1 OR seg = '') AND target_addr = ?2", seg, targetAddr)
+	_, err := c.conn.Exec("DELETE FROM xrefs WHERE (seg = ?1 OR seg = '') AND target_addr = ?2", seg, targetAddr)
+	return err
+}
+
+func (c *Controller) DeleteFunctionAt(entryAddr uint32) error {
+	seg := c.SegOf(entryAddr)
+	_, err := c.conn.Exec("DELETE FROM functions WHERE (seg = ?1 OR seg = '') AND entry_addr = ?2", seg, entryAddr)
+	return err
+}
+
+func (c *Controller) DeleteLabelAndRename(addr uint32) error {
+	seg := c.SegOf(addr)
+	if lbl, err := c.GetLabelFull(addr); err == nil && lbl != nil {
+		_, _ = c.conn.Exec(
+			"DELETE FROM renames WHERE (seg = ?1 OR seg = '') AND (original = ?2 OR renamed = ?2)",
+			seg, lbl.Name,
+		)
+	}
+	if _, err := c.conn.Exec("DELETE FROM labels WHERE (seg = ?1 OR seg = '') AND addr = ?2", seg, addr); err != nil {
+		return err
+	}
+	_, _ = c.conn.Exec("DELETE FROM functions WHERE (seg = ?1 OR seg = '') AND entry_addr = ?2", seg, addr)
+	return nil
 }
 
 func (c *Controller) RenameLabelAt(addr uint32, name string) error {
@@ -1162,6 +1202,14 @@ func (c *Controller) FunctionLabelAddrs() []uint32 {
 		inClause, inClause, inEmpty, inEmpty, inClause, inEmpty,
 	)
 	return queryInto(sql1)
+}
+
+func (c *Controller) DataReadWriteTargets() []uint32 {
+	inClause := c.spaceSegInClause(false)
+	return c.queryUint32s(fmt.Sprintf(
+		"SELECT DISTINCT target_addr FROM xrefs WHERE seg IN (%s) AND type IN ('DATA_READ', 'DATA_WRITE')",
+		inClause,
+	))
 }
 
 func (c *Controller) searchBoundsAndClause(rng *AddrRange, col string, includeEmpty bool) (uint32, uint32, string) {
