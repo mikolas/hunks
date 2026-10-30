@@ -36,6 +36,7 @@ type emitSpaceCache struct {
 	sortedLabelAddrs []uint32
 	allRelocs        map[uint32]uint32
 	jmpBases         map[string]uint32
+	lvoMap           map[string]map[int32]db.JumpVectorSlot
 	vectoredXrefs    map[uint32][]db.AddrText
 	sortedVecTargets []uint32
 	cellSpans        []db.CellSpan
@@ -63,7 +64,7 @@ func (sc *emitSpaceCache) isCellAligned(addr uint32) bool {
 	return !ok || span.Addr == addr
 }
 
-func buildSpaceCache(ctrl *db.Controller) (*emitSpaceCache, error) {
+func buildSpaceCache(ctrl *db.Controller, autoLabel func(uint32) string) (*emitSpaceCache, error) {
 	allLabels, err := ctrl.GetAllLabelsResolved()
 	if err != nil {
 		return nil, err
@@ -74,7 +75,8 @@ func buildSpaceCache(ctrl *db.Controller) (*emitSpaceCache, error) {
 		allRelocs = make(map[uint32]uint32)
 	}
 	jmpBases := ctrl.DetectJumpVectorBases()
-	vecXrefs := ctrl.GetVectoredCallXrefs(0, ^uint32(0), jmpBases, allRelocs)
+	lvoMap := ctrl.BuildJumpVectorLVOMap(jmpBases, allRelocs, allLabels, autoLabel)
+	vecXrefs := ctrl.GetVectoredCallXrefs(0, ^uint32(0), jmpBases, allRelocs, lvoMap)
 	sortedVecTargets := slices.Sorted(maps.Keys(vecXrefs))
 	cellSpans, err := ctrl.GetSpaceCellSpans()
 	if err != nil {
@@ -85,6 +87,7 @@ func buildSpaceCache(ctrl *db.Controller) (*emitSpaceCache, error) {
 		sortedLabelAddrs: sortedLabelAddrs,
 		allRelocs:        allRelocs,
 		jmpBases:         jmpBases,
+		lvoMap:           lvoMap,
 		vectoredXrefs:    vecXrefs,
 		sortedVecTargets: sortedVecTargets,
 		cellSpans:        cellSpans,
@@ -106,7 +109,7 @@ func (e *Emitter) ensureSpaceCache() (*emitSpaceCache, error) {
 	if e.cache != nil {
 		return e.cache, nil
 	}
-	sc, err := buildSpaceCache(e.DB)
+	sc, err := buildSpaceCache(e.DB, e.Proj.AutoLabel)
 	if err != nil {
 		return nil, err
 	}
@@ -396,6 +399,18 @@ func (e *Emitter) GenerateItems(relocatable bool) error {
 		}
 	}
 
+	sc, err := e.ensureSpaceCache()
+	if err != nil {
+		return err
+	}
+	if lvoSlots := db.SortedJumpVectorSlots(sc.lvoMap); len(lvoSlots) > 0 {
+		e.addItem("", "", "", "")
+		e.addItem("", "", "", "; --- Jump Vector (_LVO) Equates ---")
+		for _, slot := range lvoSlots {
+			e.addItem(slot.LVOName, "equ", formatSignedEquHex(int64(slot.Disp)), "")
+		}
+	}
+
 	e.addItem("", "", "", "")
 	e.addItem("", "", "", "; --- External/BSS Equates ---")
 
@@ -409,10 +424,6 @@ func (e *Emitter) GenerateItems(relocatable bool) error {
 		}
 	}
 
-	sc, err := e.ensureSpaceCache()
-	if err != nil {
-		return err
-	}
 	allLabelsResolved := sc.allLabels
 	sortedAllLabelAddrs := sc.sortedLabelAddrs
 	for _, addr := range sortedAllLabelAddrs {
@@ -817,12 +828,13 @@ func (e *Emitter) PopulateCellsItems() error {
 			}
 		}
 
-		var mnem, opStr string
+		var mnem, opStr, rawOpStr string
 		if cell.Mnemonic != nil {
 			mnem = *cell.Mnemonic
 		}
 		if cell.OpStr != nil {
-			opStr = *cell.OpStr
+			rawOpStr = *cell.OpStr
+			opStr = rawOpStr
 			if cell.Type == db.CellCode {
 				opStr = e.Proj.ApplyStructAliasesToOpStr(opStr, curFuncLabel, curFuncAutoLabel)
 			}
@@ -893,20 +905,38 @@ func (e *Emitter) PopulateCellsItems() error {
 				}
 
 			case db.CellDataB:
-				var val byte
-				if len(raw) > 0 {
-					val = raw[0]
-				}
 				mnem = "dc.b"
-				opStr = fmt.Sprintf("$%02X", val)
+				if len(raw) <= 1 {
+					var val byte
+					if len(raw) > 0 {
+						val = raw[0]
+					}
+					opStr = fmt.Sprintf("$%02X", val)
+				} else {
+					parts := make([]string, len(raw))
+					for i, b := range raw {
+						parts[i] = fmt.Sprintf("$%02X", b)
+					}
+					opStr = strings.Join(parts, ",")
+				}
 
 			case db.CellDataW:
-				var val uint32
-				if len(raw) >= 2 {
-					val = uint32(raw[0])<<8 | uint32(raw[1])
-				}
 				mnem = "dc.w"
-				opStr = fmt.Sprintf("$%04X", val)
+				if len(raw) <= 2 {
+					var val uint32
+					if len(raw) >= 2 {
+						val = uint32(raw[0])<<8 | uint32(raw[1])
+					}
+					opStr = fmt.Sprintf("$%04X", val)
+				} else {
+					cnt := len(raw) / 2
+					parts := make([]string, cnt)
+					for i := range cnt {
+						val := uint32(raw[i*2])<<8 | uint32(raw[i*2+1])
+						parts[i] = fmt.Sprintf("$%04X", val)
+					}
+					opStr = strings.Join(parts, ",")
+				}
 
 			case db.CellDataL, db.CellPointer:
 				var val uint32
@@ -930,6 +960,14 @@ func (e *Emitter) PopulateCellsItems() error {
 					} else {
 						opStr = fmt.Sprintf("$%08X", val)
 					}
+				} else if len(raw) > 4 {
+					cnt := len(raw) / 4
+					parts := make([]string, cnt)
+					for i := range cnt {
+						v := uint32(raw[i*4])<<24 | uint32(raw[i*4+1])<<16 | uint32(raw[i*4+2])<<8 | uint32(raw[i*4+3])
+						parts[i] = fmt.Sprintf("$%08X", v)
+					}
+					opStr = strings.Join(parts, ",")
 				} else {
 					opStr = fmt.Sprintf("$%08X", val)
 				}
@@ -980,8 +1018,13 @@ func (e *Emitter) PopulateCellsItems() error {
 				)
 			}
 			op, _ := m68k.ParseMnemonic(mnem)
-			if (op == m68k.OpJSR || op == m68k.OpJMP || op == m68k.OpBSR) && strings.Contains(opStr, "(") && !strings.Contains(opStr, "pc") {
-				if _, realTgt, ok := e.DB.ResolveVectoredTarget(opStr, jmpBases, allRelocs); ok {
+			if (op == m68k.OpJSR || op == m68k.OpJMP || op == m68k.OpBSR) && strings.Contains(rawOpStr, "(") && !strings.Contains(rawOpStr, "pc") {
+				if _, realTgt, ok := e.DB.ResolveVectoredTarget(rawOpStr, jmpBases, allRelocs); ok {
+					if opStr == rawOpStr {
+						if lvoOp, _, ok := db.FormatVectoredOpStr(mnem, rawOpStr, sc.lvoMap); ok {
+							opStr = lvoOp
+						}
+					}
 					tgtLbl := getLabelStr(realTgt)
 					if tgtLbl == "" {
 						tgtLbl = e.Proj.AutoLabel(realTgt)
@@ -1053,7 +1096,7 @@ func (e *Emitter) PopulateCellsItems() error {
 			e.addItemSizedAt(addr, label, mnem, opStr, commentStr, cell.Size)
 		}
 
-		if cell.Size > 1 && cell.Type != db.CellCode {
+		if cell.Size > 1 {
 			idxStart, _ := slices.BinarySearch(allLabelAddrs, addr+1)
 			idxEnd, _ := slices.BinarySearch(allLabelAddrs, addr+cell.Size)
 			for _, intAddr := range allLabelAddrs[idxStart:idxEnd] {
@@ -1400,9 +1443,15 @@ func EmitAllAmiga(proj *project.Project, outDir string, force bool) error {
 	}
 
 	proj.SyncDBScope(sharedCtrl)
-	sharedCache, err := buildSpaceCache(sharedCtrl)
+	sharedCache, err := buildSpaceCache(sharedCtrl, proj.AutoLabel)
 	if err != nil {
 		return err
+	}
+	if lvoSlots := db.SortedJumpVectorSlots(sharedCache.lvoMap); len(lvoSlots) > 0 {
+		equatesLines = append(equatesLines, "", "; --- Jump Vector (_LVO) Equates ---")
+		for _, slot := range lvoSlots {
+			equatesLines = append(equatesLines, fmt.Sprintf("%s\tequ\t%s", slot.LVOName, formatSignedEquHex(int64(slot.Disp))))
+		}
 	}
 	var extEquates []string
 	for _, addr := range sharedCache.sortedLabelAddrs {
