@@ -111,10 +111,12 @@ func (a *App) OpenXrefs() {
 	sortedLabelAddrs := slices.Sorted(maps.Keys(allLabels))
 	rawRefs := a.DB.RefsTo(addr)
 
+	var lvoMap map[string]map[int32]db.JumpVectorSlot
 	jmpBases := a.DB.DetectJumpVectorBases()
 	if len(jmpBases) > 0 {
 		allRelocs, _ := a.DB.GetAllRelocs()
-		vecMap := a.DB.GetVectoredCallXrefs(addr, addr+1, jmpBases, allRelocs)
+		lvoMap = a.DB.BuildJumpVectorLVOMap(jmpBases, allRelocs, allLabels, a.Proj.AutoLabel)
+		vecMap := a.DB.GetVectoredCallXrefs(addr, addr+1, jmpBases, allRelocs, lvoMap)
 		if vecCallers, hasVec := vecMap[addr]; hasVec {
 			for _, vc := range vecCallers {
 				rawRefs = append(rawRefs, db.AddrText{Addr: vc.Addr, Text: "VEC_CALL"})
@@ -141,6 +143,9 @@ func (a *App) OpenXrefs() {
 			}
 			if cell.OpStr != nil {
 				ops = *cell.OpStr
+				if lvoOp, _, ok := db.FormatVectoredOpStr(mnem, ops, lvoMap); ok {
+					ops = lvoOp
+				}
 			}
 		}
 		if _, dup := seenSnapped[snappedSrc]; dup {

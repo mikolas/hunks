@@ -610,7 +610,8 @@ func buildListingRowsWithData(
 		allRelocs = make(map[uint32]uint32)
 	}
 	jmpBases := ctrl.DetectJumpVectorBases()
-	vecXrefs := ctrl.GetVectoredCallXrefs(baseAddr, queryEnd, jmpBases, allRelocs)
+	lvoMap := ctrl.BuildJumpVectorLVOMap(jmpBases, allRelocs, allLabels, proj.AutoLabel)
+	vecXrefs := ctrl.GetVectoredCallXrefs(baseAddr, queryEnd, jmpBases, allRelocs, lvoMap)
 	cellSpans, _ := ctrl.GetSpaceCellSpans()
 	allCells, err := ctrl.CellsInRange(baseAddr, queryEnd)
 	if err != nil {
@@ -1000,7 +1001,8 @@ func buildListingRowsWithData(
 		switch cell.Type {
 		case db.CellCode:
 			mnem := cell.MnemonicStr()
-			opStr := proj.ApplyStructAliasesToOpStr(cell.OpStrVal(), curFuncLabel, curFuncAutoLabel)
+			rawOpStr := cell.OpStrVal()
+			opStr := proj.ApplyStructAliasesToOpStr(rawOpStr, curFuncLabel, curFuncAutoLabel)
 			var timing m68k.Timing
 			var isTerm bool
 			if insn, ok := m68k.Decode(raw, addr); ok {
@@ -1026,8 +1028,13 @@ func buildListingRowsWithData(
 			}
 
 			op, _ := m68k.ParseMnemonic(mnem)
-			if (op == m68k.OpJSR || op == m68k.OpJMP || op == m68k.OpBSR) && strings.Contains(opStr, "(") && !strings.Contains(opStr, "pc") {
-				if _, realTgt, ok := ctrl.ResolveVectoredTarget(opStr, jmpBases, allRelocs); ok {
+			if (op == m68k.OpJSR || op == m68k.OpJMP || op == m68k.OpBSR) && strings.Contains(rawOpStr, "(") && !strings.Contains(rawOpStr, "pc") {
+				if _, realTgt, ok := ctrl.ResolveVectoredTarget(rawOpStr, jmpBases, allRelocs); ok {
+					if opStr == rawOpStr {
+						if lvoOp, _, ok := db.FormatVectoredOpStr(mnem, rawOpStr, lvoMap); ok {
+							opStr = lvoOp
+						}
+					}
 					tgtLbl := getLabelStr(realTgt)
 					if tgtLbl == "" {
 						tgtLbl = proj.AutoLabel(realTgt)

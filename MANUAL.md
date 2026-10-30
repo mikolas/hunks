@@ -521,11 +521,11 @@ hunks -m frontier cg hunk3:LAB_3_2649E --code
 Output:
 ```text
 === Incoming Callers (up to depth 2) ===
-  ◄── hunk5:LAB_5_2A71A (+2A79E, via jsr 402(a5))
-    ◄── hunk5:LAB_5_24BE8 (+24EB8, via jsr 498(a5))
+  ◄── hunk5:LAB_5_2A71A (+2A79E, via jsr _LVO_LAB_3_2649E(a5))
+    ◄── hunk5:LAB_5_24BE8 (+24EB8, via jsr _LVO_LAB_5_2A71A(a5))
     ◄── hunk6:LAB_6_0020C (+0020C, via jmp)
   ◄── hunk6:LAB_6_001AC (+001AC, via jmp)
-  ◄── hunk9:LAB_9_068F8 (+069A2, via jsr 402(a5))
+  ◄── hunk9:LAB_9_068F8 (+069A2, via jsr _LVO_LAB_3_2649E(a5))
 
 === Target Function ===
   hunk3:LAB_3_2649E [UNRENAMED] [+2649E] — 15 insts, 56 bytes [XDEF]
@@ -544,16 +544,16 @@ LAB_3_2649E:
   +264D2  rts      
 
 === Caller Site Snippets ===
-  From hunk5:LAB_5_2A71A (+2A79E, via jsr 402(a5)):
+  From hunk5:LAB_5_2A71A (+2A79E, via jsr _LVO_LAB_3_2649E(a5)):
      +2A792: move.w   12(a2),d0
      +2A796: moveq    #4,d1
      +2A798: moveq    #64,d2
-  >> +2A79E: jsr      402(a5) ; -> hunk3:LAB_3_2649E
+  >> +2A79E: jsr      _LVO_LAB_3_2649E(a5) ; -> hunk3:LAB_3_2649E
      +2A7A2: movem.l  (a7)+,d7/a0-a4
 ```
 Notice how `--code` reveals:
 1. `LAB_3_2649E` calls the Paula audio routine `LAB_3_0005E` (`HW: AUD0LCH..AUD3LCH`).
-2. Every caller across `hunk5`, `hunk6`, and `hunk9` invokes it via `jsr 402(a5)`.
+2. Every caller across `hunk5`, `hunk6`, and `hunk9` invokes it via `jsr _LVO_LAB_3_2649E(a5)` (offset `402`).
 3. The caller snippet at `+2A79E` shows the exact register arguments (`d0` = pitch/period, `d1` = sound effect ID `< $0F`, `d2` = volume `64`).
 
 #### 4. Edit `src/<target>/*.asm` Directly & Track Bottom-Up Progress
@@ -655,15 +655,15 @@ hunks -m frontier tui
 2. Press `g`, type `+2503E` (or `hunk5:LAB_5_25036`), and press `Enter`.
 3. Cursor lands on:
    ```text
-   +2503E                  jsr   498(a5)  ; → hunk5:LAB_5_2A71A
+   +2503E                  jsr   _LVO_LAB_5_2A71A(a5)  ; → hunk5:LAB_5_2A71A
    ```
-4. Press `Enter` on that line: the TUI resolves `498(a5)` through the `hunk6` vector table and jumps directly to `LAB_5_2A71A` (`+2A71A`).
-5. Press `x` on `LAB_5_2A71A`: the **XREFs** popup opens listing every direct and `jsr 498(a5)` caller across `hunk5`, `hunk6`, `hunk8`, and `hunk9`:
+4. Press `Enter` on that line: the TUI resolves `_LVO_LAB_5_2A71A(a5)` (`498(a5)`) through the `hunk6` vector table and jumps directly to `LAB_5_2A71A` (`+2A71A`).
+5. Press `x` on `LAB_5_2A71A`: the **XREFs** popup opens listing every direct and `jsr _LVO_LAB_5_2A71A(a5)` caller across `hunk5`, `hunk6`, `hunk8`, and `hunk9`:
    ```text
-   hunk5 +24EB8 VEC_CALL     (in LAB_5_24E84)  jsr 498(a5)
-   hunk5 +2503E VEC_CALL     (in LAB_5_25036)  jsr 498(a5)
+   hunk5 +24EB8 VEC_CALL     (in LAB_5_24E84)  jsr _LVO_LAB_5_2A71A(a5)
+   hunk5 +2503E VEC_CALL     (in LAB_5_25036)  jsr _LVO_LAB_5_2A71A(a5)
    hunk6 +0020C CODE_BRANCH  (in LAB_6_0001A)  jmp LAB_5_2A71A.l
-   hunk8 +007EE VEC_CALL     (in LAB_8_007EA)  jsr 498(a5)
+   hunk8 +007EE VEC_CALL     (in LAB_8_007EA)  jsr _LVO_LAB_5_2A71A(a5)
    ```
 6. Select any caller and press `Enter` to jump to it (automatically switching segments if in another hunk), or press `Backspace` / `-` to return.
 
@@ -696,15 +696,15 @@ This guarantees zero symbol collisions across hunks (even when two hunks have la
 Emitted `; XREF:` comments above labels list the **enclosing caller label** and **instruction mnemonic** (deduplicated and wrapped at 4 callers per line), never synthetic memory addresses:
 - **Same-hunk reference:** `; XREF: LAB_0_00000 (beq.b), LAB_0_00046 (bsr.b)`
 - **Cross-hunk reference:** `; XREF: hunk5:LAB_5_27772 (addi.l)`
-- **Jump-vector reference:** `; XREF: hunk5:LAB_5_24E84 (jsr 498(a5)), hunk6:LAB_6_0001A (jmp)`
+- **Jump-vector reference:** `; XREF: hunk5:LAB_5_24E84 (jsr _LVO_LAB_5_2A71A(a5)), hunk6:LAB_6_0001A (jmp)`
 
 Every caller listed in `; XREF:` can be jumped to immediately in `src/hunk*.asm` via `rg "^<label>:"`.
 
-### 3. Cross-Hunk, Jump-Vector & Hardware Register Bitfield Auto-Comments
-Instructions that jump/call across hunks or through a register jump-vector table automatically receive a trailing target comment, and immediate `.w` / `.l` writes to key Amiga custom registers (`DMACON`, `INTENA`, `INTREQ`, `ADKCON`, `BPLCON0`, `BLTCON0`, `BLTCON1`, `BLTSIZE`) automatically decode their bitfields into persistent auto-comments that survive `emit`:
+### 3. Cross-Hunk, Jump-Vector (`_LVO_`) & Hardware Register Bitfield Auto-Comments
+Instructions that jump/call across hunks or through a register jump-vector table automatically resolve non-zero vector offsets into symbolic `_LVO_<Target>` equates (emitted in `src/equates.i`) with a trailing target comment, and immediate `.w` / `.l` writes to key Amiga custom registers (`DMACON`, `INTENA`, `INTREQ`, `ADKCON`, `BPLCON0`, `BLTCON0`, `BLTCON1`, `BLTSIZE`) automatically decode their bitfields into persistent auto-comments that survive `emit`:
 ```asm
 	jmp	LAB_5_2810E.l	; -> hunk5
-	jsr	414(a5)	; -> hunk3:LAB_3_26432
+	jsr	_LVO_LAB_3_26432(a5)	; -> hunk3:LAB_3_26432
 	move.w	#$83C0,_custom+DMACON	; SET|DMAEN|BPLEN|COPEN|BLTEN
 	move.l	#$09F00002,BLTCON0(a5)	; BLTCON0: USEA|USED|LF=$F0 (D=A) | BLTCON1: DESC
 	move.w	#$1004,BLTSIZE(a5)	; 64x64 px (4w x 64h)
@@ -720,7 +720,7 @@ Instructions that jump/call across hunks or through a register jump-vector table
 ┌─ Space: default │ Segment: hunk5 (CODE, 184.2 KB) ───────────────────────────┐
 │ [?]Help  [S]Segments  [f]Funcs  [x]XRefs  [/]Search  [m]MemMap  ...          │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│  +2503E  4EAD 01F2               jsr     498(a5)       ; -> hunk5:LAB_5_2A71A↑│
+│  +2503E  4EAD 01F2               jsr     _LVO_LAB_5_2A71A(a5) ; -> hunk5:LAB_5_2A71A↑│
 │  +25042  301F                    move.w  (a7)+,d0                            █│
 │  +25044  1E29 005D               move.b  93(a1),d7                           ║│
 │  +25048  ; XREF: LAB_5_24E84+1C(J), LAB_5_25010+08(J)                        ║│
@@ -886,7 +886,7 @@ The TUI uses a built-in dark truecolor palette out of the box. You can override 
 | `work/<target>/hunk*.bin` | Extracted binary payloads for each `CODE`/`DATA` hunk of `<target>` |
 | `disasm/<target>.asm` | Master assembly file (`opt o-,a-` + `include "src/equates.i"` + `include "src/<target>/hunk*.asm"`, or flat binary output) |
 | `src/<target>/hunk*.asm` | Modular per-hunk assembly files (`SECTION S_N,code/data/bss[,chip/fast]` + `XDEF` exports) |
-| `src/equates.i` | Shared Amiga custom chip (`$DFFxxx`) and CIA (`$BFExxx`/`$BFDxxx`) equates |
+| `src/equates.i` | Shared Amiga custom chip (`$DFFxxx`), CIA (`$BFExxx`/`$BFDxxx`), and jump-vector (`_LVO_<Target>`) equates |
 
 ### 3-Stage Analysis Pipeline
 

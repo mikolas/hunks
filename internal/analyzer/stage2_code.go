@@ -251,7 +251,9 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 						_ = a.DB.InsertXref(addr, target, db.XrefDataRead)
 						if shouldLabel {
 							a.AddLabel(&src, target)
-							dataReadTargets[target] = struct{}{}
+							if op.Mode != m68k.EAPCIndex {
+								dataReadTargets[target] = struct{}{}
+							}
 						}
 
 					case RefDataWrite:
@@ -392,14 +394,17 @@ func (a *Analyzer) stage2DiscoverCode(initialEntries []uint32, jumpTable map[uin
 		break
 	}
 
-	// 6. Verify no CODE cell swallows an interior label in `labels`
+	// 6. Verify no CODE cell swallows an interior relocation target
 	allLabelAddrs := a.DB.LabelAddrs(nil)
 	var invalidCodeAddrs []uint32
 	codeCells.Ascend(func(cell db.Cell) bool {
 		cEnd := cell.Addr + cell.Size
 		idx, _ := slices.BinarySearch(allLabelAddrs, cell.Addr+1)
-		if idx < len(allLabelAddrs) && allLabelAddrs[idx] < cEnd {
-			invalidCodeAddrs = append(invalidCodeAddrs, cell.Addr)
+		for i := idx; i < len(allLabelAddrs) && allLabelAddrs[i] < cEnd; i++ {
+			if _, isReloc := a.RelocTargets[allLabelAddrs[i]]; isReloc {
+				invalidCodeAddrs = append(invalidCodeAddrs, cell.Addr)
+				break
+			}
 		}
 		return true
 	})

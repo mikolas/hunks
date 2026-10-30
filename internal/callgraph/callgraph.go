@@ -254,7 +254,20 @@ type CallGraph struct {
 	CellsTree     *btree.BTreeG[db.Cell]
 	Labels        map[uint32]string
 	RawLabels     map[uint32]string
+	LVOMap        map[string]map[int32]db.JumpVectorSlot
 	IndirectSites []IndirectSiteInfo
+}
+
+// FormatOpStr formats an instruction operand string by applying struct field aliases first,
+// and falling back to jump-vector _LVO_ resolution when no explicit struct alias overrides it.
+func (cg *CallGraph) FormatOpStr(proj *project.Project, mnem, rawOpStr, fnName, fnRaw string) string {
+	opStr := proj.ApplyStructAliasesToOpStr(rawOpStr, fnName, fnRaw)
+	if opStr == rawOpStr && cg != nil {
+		if lvoOp, _, ok := db.FormatVectoredOpStr(mnem, rawOpStr, cg.LVOMap); ok {
+			return lvoOp
+		}
+	}
+	return opStr
 }
 
 type Options struct {
@@ -306,6 +319,8 @@ func Build(proj *project.Project) (*CallGraph, error) {
 	xrefsBySrc := make(map[uint32][]xrefTarget)
 	pointerTargets := make(map[uint32]bool)
 	jmpTableBases := make(map[string]uint32)
+	allRelocs := make(map[uint32]uint32)
+	lvoMap := make(map[string]map[int32]db.JumpVectorSlot)
 
 	seenDBs := make(map[string]bool)
 	for _, seg := range proj.ActiveSegments() {
@@ -340,6 +355,9 @@ func Build(proj *project.Project) (*CallGraph, error) {
 			if resolvedMap, err := ctrl.GetAllLabelsResolved(); err == nil {
 				maps.Copy(labels, resolvedMap)
 			}
+			if relMap, err := ctrl.GetAllRelocs(); err == nil {
+				maps.Copy(allRelocs, relMap)
+			}
 			if cmts, err := ctrl.GetAllTargetComments(); err == nil {
 				maps.Copy(comments, cmts)
 			}
@@ -363,6 +381,12 @@ func Build(proj *project.Project) (*CallGraph, error) {
 				})
 			}
 			maps.Copy(jmpTableBases, ctrl.DetectJumpVectorBases())
+			for reg, byDisp := range ctrl.BuildJumpVectorLVOMap(jmpTableBases, allRelocs, labels, proj.AutoLabel) {
+				if lvoMap[reg] == nil {
+					lvoMap[reg] = make(map[int32]db.JumpVectorSlot, len(byDisp))
+				}
+				maps.Copy(lvoMap[reg], byDisp)
+			}
 			return nil
 		}(seg.DB); err != nil {
 			return nil, err
@@ -786,9 +810,10 @@ func Build(proj *project.Project) (*CallGraph, error) {
 	for _, funcAddr := range funcAddrs {
 		insns := functions[funcAddr].InsnAddrs
 		for _, ia := range insns {
-			var cellMnem string
+			var cellMnem, cellOpStr string
 			if c, ok := cells[ia]; ok {
 				cellMnem = c.MnemonicStr()
+				cellOpStr = c.OpStrVal()
 			}
 			if outEdges, hasEdges := edgesBySrc[ia]; hasEdges {
 				for _, outEdge := range outEdges {
@@ -807,7 +832,11 @@ func Build(proj *project.Project) (*CallGraph, error) {
 						if kind == db.EdgeCall {
 							via := "via jsr"
 							if cellMnem != "" {
-								via = fmt.Sprintf("via %s", cellMnem)
+								if lvoOp, _, ok := db.FormatVectoredOpStr(cellMnem, cellOpStr, lvoMap); ok {
+									via = fmt.Sprintf("via %s %s", cellMnem, lvoOp)
+								} else {
+									via = fmt.Sprintf("via %s", cellMnem)
+								}
 							}
 							allCallSites = append(allCallSites, CallSite{
 								CallerFunc: funcAddr,
@@ -819,7 +848,11 @@ func Build(proj *project.Project) (*CallGraph, error) {
 							if _, isEntry := functions[tgt]; isEntry {
 								via := "via jmp"
 								if cellMnem != "" {
-									via = fmt.Sprintf("via %s", cellMnem)
+									if lvoOp, _, ok := db.FormatVectoredOpStr(cellMnem, cellOpStr, lvoMap); ok {
+										via = fmt.Sprintf("via %s %s", cellMnem, lvoOp)
+									} else {
+										via = fmt.Sprintf("via %s", cellMnem)
+									}
 								}
 								allCallSites = append(allCallSites, CallSite{
 									CallerFunc: funcAddr,
@@ -846,11 +879,15 @@ func Build(proj *project.Project) (*CallGraph, error) {
 							hasTF = true
 						}
 						if hasTF {
+							via := fmt.Sprintf("via %s %d(%s)", mnem, disp, reg)
+							if lvoOp, _, ok := db.FormatVectoredOpStr(mnem, opStr, lvoMap); ok {
+								via = fmt.Sprintf("via %s %s", mnem, lvoOp)
+							}
 							allCallSites = append(allCallSites, CallSite{
 								CallerFunc: funcAddr,
 								CallInsn:   ia,
 								TargetFunc: tf,
-								Kind:       fmt.Sprintf("via %s %d(%s)", mnem, disp, reg),
+								Kind:       via,
 							})
 						}
 					}
@@ -1014,13 +1051,17 @@ func Build(proj *project.Project) (*CallGraph, error) {
 		if len(targets) > 0 {
 			status = "resolved"
 		}
+		dispOp := opStr
+		if lvoOp, _, ok := db.FormatVectoredOpStr(mnem, opStr, lvoMap); ok {
+			dispOp = lvoOp
+		}
 		indirectSites = append(indirectSites, IndirectSiteInfo{
 			Addr:        ia,
 			Segment:     segName,
 			OffsetInSeg: offInSeg,
 			FuncName:    fnName,
 			FnOffset:    fnOff,
-			InsnText:    strings.TrimSpace(mnem + " " + opStr),
+			InsnText:    strings.TrimSpace(mnem + " " + dispOp),
 			Status:      status,
 			Targets:     targets,
 		})
@@ -1035,6 +1076,7 @@ func Build(proj *project.Project) (*CallGraph, error) {
 		CellsTree:     cellsTree,
 		Labels:        labels,
 		RawLabels:     rawLabels,
+		LVOMap:        lvoMap,
 		IndirectSites: indirectSites,
 	}, nil
 }
@@ -1320,7 +1362,7 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 					if ia < f.EntryAddr {
 						fnOffStr = fmt.Sprintf("-%03X", f.EntryAddr-ia)
 					}
-					ops := proj.ApplyStructAliasesToOpStr(c.OpStrVal(), f.Name, f.RawName)
+					ops := cg.FormatOpStr(proj, c.MnemonicStr(), c.OpStrVal(), f.Name, f.RawName)
 					cmt := cg.Comments[ia].EffectiveComment()
 					for _, site := range f.Callees {
 						if site.CallInsn == ia {
@@ -1503,7 +1545,7 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 				if mnem == "" {
 					mnem = "?"
 				}
-				ops := proj.ApplyStructAliasesToOpStr(cell.OpStrVal(), f.Name, f.RawName)
+				ops := cg.FormatOpStr(proj, mnem, cell.OpStrVal(), f.Name, f.RawName)
 				var cmt string
 				if eff := cg.Comments[ia].EffectiveComment(); eff != "" {
 					cmt = fmt.Sprintf(" ; %s", eff)
@@ -1588,13 +1630,17 @@ func (cg *CallGraph) renderTarget(proj *project.Project, funcAddr uint32, opts *
 							if eff := cg.Comments[ca].EffectiveComment(); eff != "" {
 								cmt = fmt.Sprintf(" ; %s", eff)
 							}
+							ops := cg.FormatOpStr(proj, cell.MnemonicStr(), cell.OpStrVal(), cf.Name, cf.RawName)
+							if ca == site.CallInsn && cmt == "" && strings.Contains(ops, "(") {
+								cmt = fmt.Sprintf(" ; -> %s", f.Name)
+							}
 							fmt.Fprintf(
 								&out,
 								"  %s +%05X: %-8s %s%s\n",
 								marker,
 								ca-cfSegBase,
 								cell.MnemonicStr(),
-								cell.OpStrVal(),
+								ops,
 								cmt,
 							)
 						}

@@ -786,3 +786,137 @@ func TestOutOfSegmentEquPrefixAndStaticVectorEquates(t *testing.T) {
 		t.Errorf("ResolveTarget(Level_3_Interrupt) = ($%X, %v), want ($6C, true)", addr, ok)
 	}
 }
+
+func TestEmitJumpVectorLVOsAndMultiByteData(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+	ctrl, err := db.New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrl.Close()
+
+	bin := make([]byte, 0x100)
+	// Multi-byte DATA_B at 0x1080: $11, $22, $33
+	bin[0x80] = 0x11
+	bin[0x81] = 0x22
+	bin[0x82] = 0x33
+	binPath := filepath.Join(tmpDir, "main.bin")
+	if err := os.WriteFile(binPath, bin, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sz := uint32(len(bin))
+	proj := project.New(filepath.Join(tmpDir, "project.json"))
+	proj.Data.Segments = []project.Segment{{
+		Name:        "main",
+		File:        &binPath,
+		FileDataLen: &sz,
+		Base:        0x1000,
+		AllocSize:   sz,
+		HunkType:    hunk.HunkTypeCode,
+		HunkIndex:   0,
+		DB:          dbPath,
+		Relocatable: true,
+	}}
+	proj.Data.Spaces = []project.Space{{Name: "default", Segments: []string{"main"}}}
+	proj.Data.ActiveSpace = "default"
+	proj.ActiveSegmentName = "main"
+	proj.SyncDBScope(ctrl)
+
+	mkCode := func(addr, size uint32, mnem, op string) *db.Cell {
+		m := mnem
+		o := op
+		return &db.Cell{
+			Seg:        "main",
+			Addr:       addr,
+			Size:       size,
+			Type:       db.CellCode,
+			Confidence: 100,
+			Mnemonic:   &m,
+			OpStr:      &o,
+			RawBytes:   make([]byte, size),
+		}
+	}
+
+	// Setup lea $1020,a5 at 0x1000 and 4 contiguous 6-byte jmp slots at 0x1020..0x1038
+	_ = ctrl.InsertCell(mkCode(0x1000, 6, "lea.l", "LAB_0_00020,a5"))
+	_ = ctrl.InsertReloc(0x1002, 0x1020)
+
+	// Slot 0 (disp 0): Math_Sqrt
+	_ = ctrl.InsertCell(mkCode(0x1020, 6, "jmp", "Math_Sqrt.l"))
+	_ = ctrl.InsertReloc(0x1022, 0x1050)
+	// Slot 1 (disp 6): Audio_Command
+	_ = ctrl.InsertCell(mkCode(0x1026, 6, "jmp", "Audio_Command.l"))
+	_ = ctrl.InsertReloc(0x1028, 0x1054)
+	// Slot 2 (disp 12): Audio_SetParam (custom trampoline label JmpVec_Audio_SetParam_A)
+	_ = ctrl.InsertCell(mkCode(0x102C, 6, "jmp", "Audio_SetParam.l"))
+	_ = ctrl.InsertReloc(0x102E, 0x1058)
+	// Slot 3 (disp 18): Audio_SetParam (custom trampoline label JmpVec_Audio_SetParam_B)
+	_ = ctrl.InsertCell(mkCode(0x1032, 6, "jmp", "Audio_SetParam.l"))
+	_ = ctrl.InsertReloc(0x1034, 0x1058)
+
+	// Call sites at 0x1006..0x1014
+	_ = ctrl.InsertCell(mkCode(0x1006, 2, "jsr", "(a5)"))
+	_ = ctrl.InsertCell(mkCode(0x1008, 4, "jsr", "6(a5)"))
+	_ = ctrl.InsertCell(mkCode(0x100C, 4, "jsr", "12(a5)"))
+	_ = ctrl.InsertCell(mkCode(0x1010, 4, "jmp", "18(a5)"))
+
+	// Targets + mid-instruction label inside 0x1058 (4-byte move.l)
+	_ = ctrl.InsertCell(mkCode(0x1050, 2, "rts", ""))
+	_ = ctrl.InsertCell(mkCode(0x1054, 2, "rts", ""))
+	_ = ctrl.InsertCell(mkCode(0x1058, 4, "move.l", "(a7)+,d0"))
+	_ = ctrl.InsertCell(mkCode(0x105C, 2, "rts", ""))
+
+	// Multi-byte DATA_B cell at 0x1080 (size 3)
+	_ = ctrl.InsertCell(&db.Cell{
+		Seg:        "main",
+		Addr:       0x1080,
+		Size:       3,
+		Type:       db.CellDataB,
+		Confidence: 100,
+		RawBytes:   []byte{0x11, 0x22, 0x33},
+	})
+
+	_ = ctrl.SetLabel(0x1020, "LAB_0_00020", db.LabelLab, true)
+	_ = ctrl.SetLabel(0x102C, "LAB_0_0002C", db.LabelLab, true)
+	_ = ctrl.SetRename("LAB_0_0002C", "JmpVec_Audio_SetParam_A")
+	_ = ctrl.SetLabel(0x1032, "LAB_0_00032", db.LabelLab, true)
+	_ = ctrl.SetRename("LAB_0_00032", "JmpVec_Audio_SetParam_B")
+	_ = ctrl.SetLabel(0x1050, "LAB_0_00050", db.LabelLab, true)
+	_ = ctrl.SetRename("LAB_0_00050", "Math_Sqrt")
+	_ = ctrl.SetLabel(0x1054, "LAB_0_00054", db.LabelLab, true)
+	_ = ctrl.SetRename("LAB_0_00054", "Audio_Command")
+	_ = ctrl.SetLabel(0x1058, "LAB_0_00058", db.LabelLab, true)
+	_ = ctrl.SetRename("LAB_0_00058", "Audio_SetParam")
+	// Mid-instruction label at 0x105A (2 bytes inside Audio_SetParam)
+	_ = ctrl.SetLabel(0x105A, "LAB_0_0005A", db.LabelLab, true)
+
+	em, err := New(proj, ctrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := em.GenerateItems(true); err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Join(em.FormatLines(), "\n")
+	for _, want := range []string{
+		"; --- Jump Vector (_LVO) Equates ---",
+		"_LVO_Audio_Command\tequ\t$6",
+		"_LVO_Audio_SetParam_A\tequ\t$C",
+		"_LVO_Audio_SetParam_B\tequ\t$12",
+		"jsr\t(a5)",
+		"jsr\t_LVO_Audio_Command(a5)\t; -> main:Audio_Command",
+		"jsr\t_LVO_Audio_SetParam_A(a5)\t; -> main:Audio_SetParam",
+		"jmp\t_LVO_Audio_SetParam_B(a5)\t; -> main:Audio_SetParam",
+		"LAB_0_0005A\tequ\tAudio_SetParam+$2",
+		"dc.b\t$11,$22,$33",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in emitted output:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "_LVO_Math_Sqrt") {
+		t.Errorf("disp == 0 slot should not emit _LVO_Math_Sqrt:\n%s", text)
+	}
+}

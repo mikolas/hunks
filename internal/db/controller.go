@@ -1,6 +1,7 @@
 package db
 
 import (
+	"cmp"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -2276,6 +2277,275 @@ func ParseVectoredOperand(opStr string) (reg string, disp int32, ok bool) {
 	return strings.TrimSpace(opStr[openIdx+1 : closeIdx]), int32(disp64), true
 }
 
+type JumpVectorSlot struct {
+	Reg        string // e.g. "a5"
+	Disp       int32  // signed 16-bit byte offset from baseAddr (never 0)
+	TrampAddr  uint32 // address of the 6-byte `jmp target.l` slot (e.g. hunk6:0x01B8)
+	TargetAddr uint32 // resolved destination function address (e.g. hunk5:0x2959C)
+	TargetName string // resolved label at TargetAddr (e.g. "Audio_Command")
+	LVOName    string // unique equate symbol (e.g. "_LVO_Audio_Command")
+}
+
+// FormatVectoredOpStr rewrites a numeric register-displacement call/jump operand
+// like "414(a5)" into "_LVO_Audio_Command(a5)" when mnem is jsr, jmp, or bsr
+// and (reg, disp) exists in lvoMap (with disp != 0).
+func FormatVectoredOpStr(
+	mnem string,
+	rawOpStr string,
+	lvoMap map[string]map[int32]JumpVectorSlot,
+) (formattedOp string, slot JumpVectorSlot, ok bool) {
+	if len(lvoMap) == 0 {
+		return rawOpStr, JumpVectorSlot{}, false
+	}
+	switch strings.ToLower(strings.TrimSpace(mnem)) {
+	case "jsr", "jmp", "bsr", "bsr.w", "bsr.l":
+	default:
+		return rawOpStr, JumpVectorSlot{}, false
+	}
+	reg, disp, parsed := ParseVectoredOperand(rawOpStr)
+	if !parsed || disp == 0 {
+		return rawOpStr, JumpVectorSlot{}, false
+	}
+	byDisp, found := lvoMap[reg]
+	if !found {
+		return rawOpStr, JumpVectorSlot{}, false
+	}
+	slot, found = byDisp[disp]
+	if !found || slot.LVOName == "" {
+		return rawOpStr, JumpVectorSlot{}, false
+	}
+	return fmt.Sprintf("%s(%s)", slot.LVOName, reg), slot, true
+}
+
+// SortedJumpVectorSlots returns all JumpVectorSlot entries from lvoMap ordered by (Reg, Disp).
+func SortedJumpVectorSlots(lvoMap map[string]map[int32]JumpVectorSlot) []JumpVectorSlot {
+	if len(lvoMap) == 0 {
+		return nil
+	}
+	var out []JumpVectorSlot
+	for _, reg := range slices.Sorted(maps.Keys(lvoMap)) {
+		byDisp := lvoMap[reg]
+		for _, disp := range slices.Sorted(maps.Keys(byDisp)) {
+			out = append(out, byDisp[disp])
+		}
+	}
+	return out
+}
+
+func isAutoSlotLabel(name string, addr uint32, autoLabel func(uint32) string) bool {
+	if name == "" || strings.HasPrefix(name, "LAB_") || strings.HasPrefix(name, "EQU_") ||
+		strings.HasPrefix(name, "DAT_") || strings.HasPrefix(name, "SUB_") {
+		return true
+	}
+	if autoLabel != nil && name == autoLabel(addr) {
+		return true
+	}
+	return false
+}
+
+// BuildJumpVectorLVOMap constructs a map[reg][disp]JumpVectorSlot for all non-zero
+// 6-byte `jmp <target>.l` slots reachable from jmpBases.
+func (c *Controller) BuildJumpVectorLVOMap(
+	jmpBases map[string]uint32,
+	allRelocs map[uint32]uint32,
+	allLabels map[uint32]string,
+	autoLabel func(uint32) string,
+) map[string]map[int32]JumpVectorSlot {
+	result := make(map[string]map[int32]JumpVectorSlot)
+	if len(jmpBases) == 0 {
+		return result
+	}
+
+	usedNames := make(map[string]bool, len(allLabels))
+	for _, lbl := range allLabels {
+		if lbl != "" {
+			usedNames[lbl] = true
+		}
+	}
+
+	// Collect any explicit d16(reg) displacements referenced by jsr/jmp/bsr in the space.
+	referencedDisps := make(map[string]map[int32]bool)
+	inClause := c.spaceSegInClause(false)
+	refRows, err := c.conn.Query(fmt.Sprintf(
+		"SELECT op_str FROM cells WHERE seg IN (%s) AND type = 'CODE' AND mnemonic IN ('jsr', 'jmp', 'bsr') AND op_str LIKE '%%(a%%)'",
+		inClause,
+	))
+	if err == nil {
+		for refRows.Next() {
+			var opStr sql.NullString
+			if refRows.Scan(&opStr) == nil && opStr.Valid {
+				if reg, disp, ok := ParseVectoredOperand(opStr.String); ok && disp != 0 {
+					if _, hasBase := jmpBases[reg]; hasBase {
+						if referencedDisps[reg] == nil {
+							referencedDisps[reg] = make(map[int32]bool)
+						}
+						referencedDisps[reg][disp] = true
+					}
+				}
+			}
+		}
+		refRows.Close()
+	}
+
+	for _, reg := range slices.Sorted(maps.Keys(jmpBases)) {
+		baseAddr := jmpBases[reg]
+		baseSeg := c.SegOf(baseAddr)
+		var minQueryAddr uint32
+		if baseAddr > 32768 {
+			minQueryAddr = baseAddr - 32768
+		}
+		maxQueryAddr := baseAddr + 32767
+
+		rows, err := c.conn.Query(
+			`SELECT c.addr, COALESCE(
+				(SELECT e.target_addr FROM edges e WHERE e.seg = c.seg AND e.source_addr = c.addr AND e.type IN ('UNCOND', 'CALL') LIMIT 1),
+				0
+			)
+			FROM cells c
+			WHERE c.seg = ?1 AND c.addr >= ?2 AND c.addr <= ?3 AND c.type = 'CODE' AND c.mnemonic = 'jmp' AND c.size = 6
+			ORDER BY c.addr ASC`,
+			baseSeg, minQueryAddr, maxQueryAddr,
+		)
+		if err != nil {
+			continue
+		}
+
+		jmpEdgeTarget := make(map[uint32]uint32)
+		var jmpAddrs []uint32
+		for rows.Next() {
+			var addr, edgeTgt uint32
+			if rows.Scan(&addr, &edgeTgt) == nil {
+				jmpEdgeTarget[addr] = edgeTgt
+				jmpAddrs = append(jmpAddrs, addr)
+			}
+		}
+		rows.Close()
+
+		resolveTrampTarget := func(trampAddr uint32) (uint32, bool) {
+			edgeTgt, isJmpCell := jmpEdgeTarget[trampAddr]
+			if !isJmpCell {
+				return 0, false
+			}
+			if relTgt, ok := allRelocs[trampAddr+2]; ok {
+				return relTgt, true
+			}
+			if edgeTgt != 0 {
+				return edgeTgt, true
+			}
+			return 0, false
+		}
+
+		seenDisp := make(map[int32]bool)
+		var slots []JumpVectorSlot
+
+		// 1. Contiguous 6-byte jmp table scan starting at baseAddr.
+		expectedAddr := baseAddr
+		for _, addr := range jmpAddrs {
+			if addr < baseAddr {
+				continue
+			}
+			if addr != expectedAddr {
+				break
+			}
+			expectedAddr += 6
+			disp := int32(int64(addr) - int64(baseAddr))
+			if disp == 0 {
+				continue // Parity guard: disp == 0 ((a5)) is 2-byte EAAddrInd, never rewritten to _LVO_
+			}
+			if disp > 32767 {
+				break
+			}
+			if tgtAddr, ok := resolveTrampTarget(addr); ok {
+				seenDisp[disp] = true
+				slots = append(slots, JumpVectorSlot{
+					Reg:        reg,
+					Disp:       disp,
+					TrampAddr:  addr,
+					TargetAddr: tgtAddr,
+				})
+			}
+		}
+
+		// 2. Also include any explicitly called d16(reg) slots targeting a verified 6-byte jmp cell.
+		for disp := range referencedDisps[reg] {
+			if disp == 0 || seenDisp[disp] || disp < -32768 || disp > 32767 {
+				continue
+			}
+			trampAddr := uint32(int64(baseAddr) + int64(disp))
+			if tgtAddr, ok := resolveTrampTarget(trampAddr); ok {
+				seenDisp[disp] = true
+				slots = append(slots, JumpVectorSlot{
+					Reg:        reg,
+					Disp:       disp,
+					TrampAddr:  trampAddr,
+					TargetAddr: tgtAddr,
+				})
+			}
+		}
+
+		if len(slots) == 0 {
+			continue
+		}
+
+		slices.SortFunc(slots, func(a, b JumpVectorSlot) int {
+			return cmp.Compare(a.Disp, b.Disp)
+		})
+
+		targetCounts := make(map[string]int, len(slots))
+		for i := range slots {
+			tgtName := allLabels[slots[i].TargetAddr]
+			if tgtName == "" && autoLabel != nil {
+				tgtName = autoLabel(slots[i].TargetAddr)
+			}
+			if tgtName == "" {
+				tgtName = fmt.Sprintf("LAB_%05X", slots[i].TargetAddr)
+			}
+			tgtName = strings.TrimLeft(tgtName, ".")
+			slots[i].TargetName = tgtName
+			targetCounts[tgtName]++
+		}
+
+		byDisp := make(map[int32]JumpVectorSlot, len(slots))
+		for i := range slots {
+			slot := &slots[i]
+			cand := "_LVO_" + slot.TargetName
+			slotLbl := allLabels[slot.TrampAddr]
+			hasCustomSlotLbl := !isAutoSlotLabel(slotLbl, slot.TrampAddr, autoLabel)
+
+			if targetCounts[slot.TargetName] > 1 && hasCustomSlotLbl {
+				trimmed := strings.TrimPrefix(slotLbl, "JmpVec_")
+				trimmed = strings.TrimPrefix(trimmed, "_LVO_")
+				trimmed = strings.TrimLeft(trimmed, ".")
+				if trimmed != "" {
+					cand = "_LVO_" + trimmed
+				}
+			}
+			if usedNames[cand] {
+				if hasCustomSlotLbl {
+					trimmed := strings.TrimPrefix(slotLbl, "JmpVec_")
+					trimmed = strings.TrimPrefix(trimmed, "_LVO_")
+					trimmed = strings.TrimLeft(trimmed, ".")
+					if trimmed != "" {
+						cand = "_LVO_" + trimmed
+					}
+				}
+				if usedNames[cand] {
+					cand = fmt.Sprintf("_LVO_%s_%X", slot.TargetName, uint16(slot.Disp))
+				}
+			}
+			for usedNames[cand] {
+				cand = fmt.Sprintf("%s_%X", cand, uint16(slot.Disp))
+			}
+			usedNames[cand] = true
+			slot.LVOName = cand
+			byDisp[slot.Disp] = *slot
+		}
+		result[reg] = byDisp
+	}
+
+	return result
+}
+
 func (c *Controller) ResolveVectoredTarget(opStr string, jmpBases map[string]uint32, allRelocs map[uint32]uint32) (trampAddr, realTarget uint32, ok bool) {
 	regStr, disp, ok := ParseVectoredOperand(opStr)
 	if !ok {
@@ -2299,10 +2569,19 @@ func (c *Controller) ResolveVectoredTarget(opStr string, jmpBases map[string]uin
 	return 0, 0, false
 }
 
-func (c *Controller) GetVectoredCallXrefs(startAddr, endAddr uint32, jmpBases map[string]uint32, allRelocs map[uint32]uint32) map[uint32][]AddrText {
+func (c *Controller) GetVectoredCallXrefs(
+	startAddr, endAddr uint32,
+	jmpBases map[string]uint32,
+	allRelocs map[uint32]uint32,
+	lvoMaps ...map[string]map[int32]JumpVectorSlot,
+) map[uint32][]AddrText {
 	m := make(map[uint32][]AddrText)
 	if len(jmpBases) == 0 {
 		return m
+	}
+	var lvoMap map[string]map[int32]JumpVectorSlot
+	if len(lvoMaps) > 0 {
+		lvoMap = lvoMaps[0]
 	}
 	inClause := c.spaceSegInClause(false)
 	query := fmt.Sprintf(
@@ -2322,9 +2601,13 @@ func (c *Controller) GetVectoredCallXrefs(startAddr, endAddr uint32, jmpBases ma
 		}
 		if _, realTgt, ok := c.ResolveVectoredTarget(opStr.String, jmpBases, allRelocs); ok {
 			if realTgt >= startAddr && realTgt < endAddr {
+				dispOp := opStr.String
+				if lvoOp, _, ok := FormatVectoredOpStr(mnem.String, dispOp, lvoMap); ok {
+					dispOp = lvoOp
+				}
 				m[realTgt] = append(m[realTgt], AddrText{
 					Addr: srcAddr,
-					Text: fmt.Sprintf("%s %s", mnem.String, opStr.String),
+					Text: fmt.Sprintf("%s %s", mnem.String, dispOp),
 				})
 			}
 		}

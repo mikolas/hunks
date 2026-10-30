@@ -616,6 +616,29 @@ func dispatchControllerSearch(proj *project.Project, ctrl *db.Controller, cg *ca
 		}
 	}
 
+	searchFormattedOps := func(needle string) {
+		if len(cg.LVOMap) == 0 && (len(proj.Data.RegisterAliases) == 0 || len(proj.Data.Structs) == 0) {
+			return
+		}
+		needleLower := strings.ToLower(needle)
+		for addr, cell := range cg.Cells {
+			if cell.Type != db.CellCode {
+				continue
+			}
+			var fnName, fnRaw string
+			if fAddr, ok := cg.InsnToFunc[addr]; ok {
+				if f, ok := cg.Functions[fAddr]; ok {
+					fnName = f.Name
+					fnRaw = f.RawName
+				}
+			}
+			formatted := cg.FormatOpStr(proj, cell.MnemonicStr(), cell.OpStrVal(), fnName, fnRaw)
+			if strings.Contains(strings.ToLower(formatted), needleLower) {
+				out = append(out, addr)
+			}
+		}
+	}
+
 	switch {
 	case strings.HasPrefix(qLower, "m:"):
 		add(ctrl.SearchCode("m", strings.TrimSpace(q[2:]), nil, maxDBLimit))
@@ -624,25 +647,7 @@ func dispatchControllerSearch(proj *project.Project, ctrl *db.Controller, cg *ca
 		add(ctrl.SearchCode("o", needle, nil, maxDBLimit))
 		// Also match auto/inline comments (e.g. resolved hardware or base-reg targets).
 		add(ctrl.SearchComments(needle, nil, maxDBLimit))
-		if len(proj.Data.RegisterAliases) > 0 && len(proj.Data.Structs) > 0 {
-			needleLower := strings.ToLower(needle)
-			for addr, cell := range cg.Cells {
-				if cell.Type != db.CellCode {
-					continue
-				}
-				var fnName, fnRaw string
-				if fAddr, ok := cg.InsnToFunc[addr]; ok {
-					if f, ok := cg.Functions[fAddr]; ok {
-						fnName = f.Name
-						fnRaw = f.RawName
-					}
-				}
-				aliased := proj.ApplyStructAliasesToOpStr(cell.OpStrVal(), fnName, fnRaw)
-				if strings.Contains(strings.ToLower(aliased), needleLower) {
-					out = append(out, addr)
-				}
-			}
-		}
+		searchFormattedOps(needle)
 	case strings.HasPrefix(qLower, "s:"):
 		add(ctrl.SearchStrings(strings.TrimSpace(q[2:]), nil, maxDBLimit))
 	case strings.HasPrefix(qLower, "c:"):
@@ -683,6 +688,7 @@ func dispatchControllerSearch(proj *project.Project, ctrl *db.Controller, cg *ca
 		add(ctrl.SearchCode("o", q, nil, maxDBLimit))
 		add(ctrl.SearchComments(q, nil, maxDBLimit))
 		add(ctrl.SearchStrings(q, nil, maxDBLimit))
+		searchFormattedOps(q)
 	}
 	return out
 }
@@ -810,7 +816,7 @@ func runSearchCommand(
 			mnem := cell.MnemonicStr()
 			ops := cell.OpStrVal()
 			if cell.Type == db.CellCode {
-				ops = proj.ApplyStructAliasesToOpStr(ops, fnName, fnRaw)
+				ops = cg.FormatOpStr(proj, mnem, ops, fnName, fnRaw)
 			}
 			if mnem != "" {
 				insnText = strings.TrimSpace(fmt.Sprintf("%-8s %s", mnem, ops))
@@ -2288,7 +2294,13 @@ func renderDisasmRange(
 
 		if hasCell && cell.Type == db.CellCode {
 			mnem := cell.MnemonicStr()
-			opStr := proj.ApplyStructAliasesToOpStr(cell.OpStrVal(), fnName, fnAuto)
+			rawOpStr := cell.OpStrVal()
+			opStr := cg.FormatOpStr(proj, mnem, rawOpStr, fnName, fnAuto)
+			if cmt == "" {
+				if _, slot, ok := db.FormatVectoredOpStr(mnem, rawOpStr, cg.LVOMap); ok {
+					cmt = fmt.Sprintf("-> %s", proj.QualifiedLabel(slot.TargetAddr, slot.TargetName))
+				}
+			}
 			items = append(items, disasmItemJSON{
 				Offset:   fmt.Sprintf("+%05X", off),
 				FnOffset: fnOffStr,
@@ -2311,8 +2323,13 @@ func renderDisasmRange(
 		if tryCode {
 			rem := min(10, len(segBytes)-bIdx)
 			if insn, ok := m68k.Decode(segBytes[bIdx:bIdx+rem], cur); ok && insn.Size > 0 && cur+uint32(insn.Size) <= segEnd {
-				mnem, opStr := formatReadOnlyTryInsn(proj, cg, relocs, cur, &insn)
-				opStr = proj.ApplyStructAliasesToOpStr(opStr, fnName, fnAuto)
+				mnem, rawOpStr := formatReadOnlyTryInsn(proj, cg, relocs, cur, &insn)
+				opStr := cg.FormatOpStr(proj, mnem, rawOpStr, fnName, fnAuto)
+				if cmt == "" {
+					if _, slot, ok := db.FormatVectoredOpStr(mnem, rawOpStr, cg.LVOMap); ok {
+						cmt = fmt.Sprintf("-> %s", proj.QualifiedLabel(slot.TargetAddr, slot.TargetName))
+					}
+				}
 				cellTag := "TRY_CODE"
 				if hasCell {
 					cellTag = fmt.Sprintf("TRY_CODE (was %s)", cell.Type.AsStr())
@@ -2358,14 +2375,32 @@ func renderDisasmRange(
 				if cell.OpStr != nil && *cell.OpStr != "" {
 					opStr = *cell.OpStr
 				} else if bIdx+4 <= len(segBytes) {
-					opStr = fmt.Sprintf("$%08X", binary.BigEndian.Uint32(segBytes[bIdx:bIdx+4]))
+					cnt := min(int(cell.Size)/4, (len(segBytes)-bIdx)/4)
+					if cnt <= 1 {
+						opStr = fmt.Sprintf("$%08X", binary.BigEndian.Uint32(segBytes[bIdx:bIdx+4]))
+					} else {
+						parts := make([]string, cnt)
+						for i := range cnt {
+							parts[i] = fmt.Sprintf("$%08X", binary.BigEndian.Uint32(segBytes[bIdx+i*4:bIdx+i*4+4]))
+						}
+						opStr = strings.Join(parts, ",")
+					}
 				}
 			case db.CellDataW:
 				mnem = "dc.w"
 				if cell.OpStr != nil && *cell.OpStr != "" {
 					opStr = *cell.OpStr
 				} else if bIdx+2 <= len(segBytes) {
-					opStr = fmt.Sprintf("$%04X", binary.BigEndian.Uint16(segBytes[bIdx:bIdx+2]))
+					cnt := min(int(cell.Size)/2, (len(segBytes)-bIdx)/2)
+					if cnt <= 1 {
+						opStr = fmt.Sprintf("$%04X", binary.BigEndian.Uint16(segBytes[bIdx:bIdx+2]))
+					} else {
+						parts := make([]string, cnt)
+						for i := range cnt {
+							parts[i] = fmt.Sprintf("$%04X", binary.BigEndian.Uint16(segBytes[bIdx+i*2:bIdx+i*2+2]))
+						}
+						opStr = strings.Join(parts, ",")
+					}
 				}
 			case db.CellStr:
 				mnem = "dc.b"
@@ -2373,7 +2408,20 @@ func renderDisasmRange(
 				opStr = fmt.Sprintf("%q,0", strings.TrimRight(string(segBytes[bIdx:endC]), "\x00"))
 			default:
 				mnem = "dc.b"
-				opStr = fmt.Sprintf("$%02X", segBytes[bIdx])
+				if cell.OpStr != nil && *cell.OpStr != "" {
+					opStr = *cell.OpStr
+				} else {
+					cnt := min(int(cell.Size), len(segBytes)-bIdx)
+					if cnt <= 1 {
+						opStr = fmt.Sprintf("$%02X", segBytes[bIdx])
+					} else {
+						parts := make([]string, cnt)
+						for i := range cnt {
+							parts[i] = fmt.Sprintf("$%02X", segBytes[bIdx+i])
+						}
+						opStr = strings.Join(parts, ",")
+					}
+				}
 			}
 			items = append(items, disasmItemJSON{
 				Offset:   fmt.Sprintf("+%05X", off),
