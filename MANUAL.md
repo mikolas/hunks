@@ -661,7 +661,41 @@ guard does not apply and you may carve freely.
 
 ---
 
-### Walkthrough 5: Interactive TUI Recipes (`hunks tui`)
+### Walkthrough 5: Live Amiberry GDB Snapshot & Trace-Seeded Analysis (`init --gdb`)
+
+Many trackloaded Amiga games and demos unpack or relocate themselves in RAM at boot, overwrite the AmigaOS executive, and drive execution through custom VBlank/Copper/CIA interrupts and indirect state machines. With Amiberry's built-in GDB Remote Serial Protocol server (`gdb_server=true`, default port `2345`), `hunks init --gdb` captures the complete live machine state in one command.
+
+#### Step 1: Capture the Live Snapshot
+```bash
+# Connect to a running Amiberry instance (halts cleanly, dumps state, and detaches):
+hunks init --gdb localhost:2345 -m lotus2
+
+# Or arm an AmigaDOS process load breakpoint before booting the disk/executable:
+hunks init --gdb localhost:2345 --process-break lotus2 -m lotus2
+```
+
+During `init --gdb`, `hunks`:
+1. Connects to Amiberry's GDB stub, halts the CPU (`?` $\rightarrow$ `S05`), or arms `monitor process-break <name>` and waits for the target process to stop at its entry point.
+2. Queries `monitor memory-map` (with `qXfer:memory-map:read` XML fallback) and dumps **all** active `"type": "ram"` regions (`chip.bin` at `$000000`, `slow.bin` at `$C00000`, `fast*.bin`) in 16 KiB chunks into `work/<target>/`.
+3. Reads the 512-byte custom chip aperture `$DFF000–$DFF1FF` (`mdff000,200`) into `work/<target>/custom.bin`. Because Amiberry routes `$DFF000–$DFF1FF` GDB reads through `save_custom`, this captures the live values of write-only hardware registers (`DMACON`, `INTENA`, `INTREQ`, `ADKCON`, `COP1LC`, `COP2LC`, `BPL1PT..8PT`, `BPLCON0..2`, `BPL1MOD`/`BPL2MOD`, `SPR0PT..7PT`, and `COLOR00..31`).
+4. Reads all M68000 registers (`D0..D7`, `A0..A7`, `SR`, `PC`) and optional AmigaDOS hunk segments (`monitor segments`), records them under `"snapshot"` in `work/<target>/project.json`, and sends `D` (detach) so Amiberry resumes running cleanly.
+
+#### Step 2: Run Snapshot-Seeded & Trace-Seeded Analysis
+```bash
+hunks -m lotus2 analyze --trace
+```
+When a project contains a `"snapshot"` block:
+- **Static Snapshot Seeding (`SeedFromSnapshot`)** automatically:
+  - Seeds `Entry_PC` at the captured `PC`.
+  - Reads the 68000 exception/interrupt vector table in Chip RAM (`$64..$7C` Level 1–7 autovectors and `$80..$BC` `TRAP #0..#15`) and seeds every valid handler (`Vec_Level3_VBlank_Copper_Blit`, `Vec_Level2_CIAA`, etc.).
+  - Walks the active stack (`A7` up to +256 bytes) for return addresses immediately following a `BSR` or `JSR` instruction, seeding both the caller return site and any direct callee target.
+  - Detects address registers (`A0..A6`) holding `$00DFF000` and registers `$DFF000` base-register hints.
+  - Labels active chipset DMA pointers from `custom.bin` (`COP1LC_Main`, `COP2LC_List`, `BPL1_Screen..BPLn_Screen`, `SPR0_Data..SPR7_Data`).
+- **Trace-Seeded Resume (`analyze --trace`)** preloads `D0..D7`, `A0..A7`, `PC`, `SR`, `custom.bin` chipset state (`DMACON`, `INTENA`, `COP1LC`, `BPLxPT`, `COLOR00..31`), and multi-segment RAM (`chip.bin` + `$C00000` `slow.bin` Ranger RAM) into the `m68kemu` sandbox and steps forward from the exact halted instruction to observe runtime indirect calls, jump tables, and interrupt service routines.
+
+---
+
+### Walkthrough 6: Interactive TUI Recipes (`hunks tui`)
 
 Launch the TUI on a target:
 ```bash
@@ -822,6 +856,7 @@ The viewer manages a single image at a time with up to 7 bitplanes (including AG
   1. **`BPU:        1  2  3  4  5  6  7`**: Sequential active bitplane count in `BPLCON0` (bits 14–12). Digits $1..BPU$ are highlighted in bright cyan (`#7AA2F7 bold`); inactive digits in legible slate gray (`#65728A`).
   2. **`Synced:     1  2  3  4  5  6  7`**: Independent pointer adjustment group (`BPL1PT`–`BPL7PT`). Armed numbers are rendered in bright warm gold (`#E0AF68 bold`); unarmed numbers in legible slate gray (`#65728A`).
   3. **`Pal`**: Active color mode and live truecolor RGB swatches.
+- **Automatic GDB Snapshot Preloading (`custom.bin`)**: When a project was initialized via `hunks init --gdb` (or has a captured `work/<target>/custom.bin` custom chipset snapshot), pressing `B` automatically pre-populates the active bitplane depth ($BPU$), `HIRES` / `HAM` mode flags, `BPL1MOD` row modulo, `BPL1PT..BPLnPT` starting pointers, and the 32-color `$DFF180..$DFF1BE` hardware palette (`Snapshot@$DFF180`).
 
 The viewer queries the terminal text area pixel dimensions at startup via the cross-platform `XTWINOPS` escape sequence (`\x1b[14t` $\rightarrow$ `\x1b[4;<height>;<width>t`) to automatically select the optimal integer scaling factor ($1\times..8\times$) and clip oversized bitmaps to the canvas, ensuring native Amiga bitmaps (320×200, 320×256, 640×512) fit cleanly with crisp, square device pixels on Linux, macOS, and Windows.
 
@@ -899,9 +934,11 @@ The TUI uses a built-in dark truecolor palette out of the box. You can override 
 
 | File | Purpose |
 |------|---------|
-| `work/<target>/project.json` | Target metadata (`target_name`, segments, entry points, spaces, structs, register aliases, function ABIs, memory regions) |
+| `work/<target>/project.json` | Target metadata (`target_name`, segments, entry points, spaces, structs, register aliases, function ABIs, memory regions, and optional GDB `snapshot` CPU/chipset state) |
 | `work/<target>/project.db` | Target SQLite database (`cells`, `labels`, `relocs`, `xrefs`, `edges`, `renames`, `operand_formats`) |
 | `work/<target>/hunk*.bin` | Extracted binary payloads for each `CODE`/`DATA` hunk of `<target>` |
+| `work/<target>/chip.bin`, `slow.bin`, `fast*.bin` | Dumped RAM region payloads captured by `hunks init --gdb` |
+| `work/<target>/custom.bin` | 512-byte custom chip register aperture (`$DFF000–$DFF1FF`) captured by `hunks init --gdb` |
 | `disasm/<target>.asm` | Master assembly file (`opt o-,a-` + `include "src/equates.i"` + `include "src/<target>/hunk*.asm"`, or flat binary output) |
 | `src/<target>/hunk*.asm` | Modular per-hunk assembly files (`SECTION S_N,code/data/bss[,chip/fast]` + `XDEF` exports) |
 | `src/equates.i` | Shared Amiga custom chip (`$DFFxxx`), CIA (`$BFExxx`/`$BFDxxx`), and jump-vector (`_LVO_<Target>`) equates |
