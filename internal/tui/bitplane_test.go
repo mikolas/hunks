@@ -1,8 +1,11 @@
 package tui
 
 import (
+	"encoding/binary"
 	"image/color"
 	"testing"
+
+	"github.com/mikolas/hunks/internal/amiga"
 )
 
 func TestBitplaneStateGeometry(t *testing.T) {
@@ -501,5 +504,38 @@ func TestAddPlanesConsecutiveAfterSteppingPlane1(t *testing.T) {
 	if st.BPL[1] != 0x0C00+planeSize || st.BPL[2] != 0x0C00+2*planeSize {
 		t.Fatalf("expected consecutive BPL[1]=0x%X BPL[2]=0x%X, got 0x%X 0x%X",
 			0x0C00+planeSize, 0x0C00+2*planeSize, st.BPL[1], st.BPL[2])
+	}
+}
+
+func TestApplyCustomSnapshot(t *testing.T) {
+	var snap amiga.CustomSnapshot
+	binary.BigEndian.PutUint16(snap[0x08E:0x090], 0x2C81) // DIWSTRT (vstart=44)
+	binary.BigEndian.PutUint16(snap[0x090:0x092], 0x2CC1) // DIWSTOP (vstop=300 -> height 256)
+	binary.BigEndian.PutUint16(snap[0x092:0x094], 0x0038) // DDFSTRT
+	binary.BigEndian.PutUint16(snap[0x094:0x096], 0x00D0) // DDFSTOP (20 words -> 40 bytes/row)
+	binary.BigEndian.PutUint32(snap[0x0E0:0x0E4], 0x00028000)
+	binary.BigEndian.PutUint32(snap[0x0E4:0x0E8], 0x0002A800)
+	binary.BigEndian.PutUint32(snap[0x0E8:0x0EC], 0x0002D000)
+	binary.BigEndian.PutUint32(snap[0x0EC:0x0F0], 0x0002F800)
+	binary.BigEndian.PutUint16(snap[0x100:0x102], 0x4200) // BPLCON0: 4 planes, COLOR
+	binary.BigEndian.PutUint16(snap[0x108:0x10A], 0x0004) // BPL1MOD: 4
+	binary.BigEndian.PutUint16(snap[0x10A:0x10C], 0x0004) // BPL2MOD: 4
+	binary.BigEndian.PutUint16(snap[0x180:0x182], 0x0123) // COLOR00
+	binary.BigEndian.PutUint16(snap[0x182:0x184], 0x0F80) // COLOR01
+
+	st := NewBitplaneState(0)
+	st.ApplyCustomSnapshot(&snap, 0, 0)
+
+	if st.BPU() != 4 {
+		t.Fatalf("expected BPU 4, got %d", st.BPU())
+	}
+	if st.BPL[0] != 0x28000 || st.BPL[3] != 0x2F800 {
+		t.Fatalf("unexpected BPL pointers: %#x .. %#x", st.BPL[0], st.BPL[3])
+	}
+	if st.Modulo != 4 {
+		t.Fatalf("expected Modulo=4, got %d", st.Modulo)
+	}
+	if st.PaletteMode != PaletteCustom || st.CustomPalette[1] != Convert0RGBToRGBA(0x0F80) {
+		t.Fatalf("expected custom palette with COLOR01=$0F80, got mode=%d col1=%v", st.PaletteMode, st.CustomPalette[1])
 	}
 }

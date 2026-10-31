@@ -46,6 +46,23 @@ vasmm68k_mot -m68000 -no-opt -Fbin -o build/disk_1.bin disasm/disk_1.asm
 cmp -l assets/disk.1 build/disk_1.bin   # 0 differences
 ```
 
+### C. Live Amiberry GDB Snapshot (`init --gdb`)
+
+```bash
+# 1. Capture live CPU registers, custom chipset ($DFF000-$DFF1FF), and all RAM regions (chip/slow/fast)
+#    from a running Amiberry instance (gdb_server=true on port 2345) into work/lotus2/
+hunks init --gdb localhost:2345 -m lotus2
+
+# Or arm a process load breakpoint first and capture at the entry point:
+hunks init --gdb localhost:2345 --process-break lotus2 -m lotus2
+
+# 2. Run static + snapshot-seeded + trace-seeded analysis from the captured machine state
+hunks -m lotus2 analyze --trace
+
+# 3. Inspect in TUI (Bitplane Viewer 'B' automatically pre-loads captured BPLxPT, BPLCON0, and COLOR00..31)
+hunks -m lotus2 tui
+```
+
 ---
 
 ## CLI Commands & Workspace Model
@@ -58,6 +75,7 @@ cmp -l assets/disk.1 build/disk_1.bin   # 0 differences
 |---------|-------------|
 | `init --hunk-file PATH [--force]` | Initialize multi-hunk AmigaOS module in `<root>/work/<module>/` (auto-extracts `hunk*.bin`, relocations, and `XDEF`s into `project.db`) |
 | `init --binary PATH --base HEX [--output FILE] [--force]` | Initialize flat binary module in `<root>/work/<module>/` loaded at `base` |
+| `init --gdb [HOST:PORT] [--process-break NAME] -m MODULE [--force]` | Connect to a live Amiberry GDB RSP server (default `localhost:2345`), optionally wait for `--process-break`, dump all active RAM regions (`chip.bin`, `slow.bin`, `fast*.bin`) + custom register snapshot (`custom.bin`) + CPU registers into `<root>/work/<module>/`, and detach cleanly |
 | `-m <module> entry [SEG:]ADDR --name NAME` | Add a segment-qualified code entry point (resolved to owning segment in active space, or explicit `SEG:ADDR`) |
 | `-m <module> analyze [--all \| -s, --segment NAME]` | Run unified 3-stage analysis across all module segments (whole hunk set for relocatable executables; standalone per-segment for flat binaries), or analyze a single segment with `-s/--segment NAME` |
 | `-m <module> analyze --trace [--budget N]` | Trace-driven analysis: run the binary from its entry point in the built-in sandboxed M68000 interpreter (`m68kemu`) + minimal Amiga chipset, then resolve indirect dispatch (trampolines, `d16(An)`/indexed computed calls), self-installed interrupt/trap handlers, and hardware-register accesses **by observation** and seed them into recursive descent. Opt-in, for **flat self-booting binaries** (games/demos); default `analyze` is unchanged. `--budget` caps the instruction count (default 20,000,000). All facts are non-byte-affecting (labels/edges/comments) — parity is preserved. |

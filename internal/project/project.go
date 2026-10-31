@@ -314,6 +314,15 @@ type AnalysisData struct {
 	IndirectAddressing []string `json:"indirect_addressing"`
 }
 
+type SnapshotState struct {
+	PC         uint32            `json:"pc"`
+	SR         uint16            `json:"sr"`
+	D          [8]uint32         `json:"d"`
+	A          [8]uint32         `json:"a"`
+	CustomFile string            `json:"custom_file,omitempty"`
+	CustomInfo map[string]string `json:"custom_info,omitempty"`
+}
+
 type ProjectData struct {
 	TargetName      string                       `json:"target_name"`
 	Segments        []Segment                    `json:"segments"`
@@ -325,6 +334,7 @@ type ProjectData struct {
 	Structs         map[string]map[string]string `json:"structs"`
 	RegisterAliases map[string]string            `json:"register_aliases"`
 	FunctionABIs    map[string]string            `json:"function_abis,omitempty"`
+	Snapshot        *SnapshotState               `json:"snapshot,omitempty"`
 	Analysis        AnalysisData                 `json:"_analysis"`
 }
 
@@ -858,4 +868,23 @@ func (p *Project) ResolveTarget(ctrl *db.Controller, input string) (uint32, bool
 		return v, true
 	}
 	return 0, false
+}
+
+// LoadCustomSnapshot loads the 512-byte ($DFF000..$DFF1FF) custom chip snapshot
+// from `Snapshot.CustomFile` if present.
+func (p *Project) LoadCustomSnapshot() (*amiga.CustomSnapshot, bool) {
+	if p == nil || p.Data.Snapshot == nil || p.Data.Snapshot.CustomFile == "" {
+		return nil, false
+	}
+	cf := p.Data.Snapshot.CustomFile
+	if !filepath.IsAbs(cf) && p.Filepath != "" {
+		cf = filepath.Join(filepath.Dir(p.Filepath), cf)
+	}
+	raw, err := os.ReadFile(cf)
+	if err != nil || len(raw) < amiga.CustomSnapshotLen {
+		return nil, false
+	}
+	var snap amiga.CustomSnapshot
+	copy(snap[:], raw[:amiga.CustomSnapshotLen])
+	return &snap, true
 }
