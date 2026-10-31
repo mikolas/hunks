@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/term"
+	"github.com/mikolas/hunks/internal/amiga"
 	"github.com/mikolas/hunks/internal/project"
 	"github.com/muesli/cancelreader"
 )
@@ -68,6 +69,59 @@ func NewBitplaneState(base uint32) *BitplaneState {
 		s.BPL[p] = base + uint32(p)*planeSize
 	}
 	return s
+}
+
+// ApplyCustomSnapshot populates the bitplane state's palette, depth, hires/HAM flags,
+// and bitplane pointers from a captured 512-byte ($DFF000..$DFF1FF) custom chip snapshot.
+func (s *BitplaneState) ApplyCustomSnapshot(snap *amiga.CustomSnapshot, baseAddr, cursorOff uint32) {
+	if s == nil || snap == nil {
+		return
+	}
+	pal12 := snap.Palette12()
+	hasNonZeroColor := false
+	for i, c := range pal12 {
+		if c != 0 {
+			hasNonZeroColor = true
+		}
+		s.CustomPalette[i] = Convert0RGBToRGBA(c)
+	}
+	if hasNonZeroColor {
+		s.CustomPalName = "Snapshot@$DFF180"
+		s.PaletteMode = PaletteCustom
+	}
+
+	bpu := snap.ActivePlanes()
+	if bpu >= 1 && bpu <= 7 {
+		s.SetBPU(bpu)
+		s.Hires = snap.Hires()
+		s.HAM = snap.HAM()
+		if s.Hires && s.RowBytes == 40 {
+			s.RowBytes = 80
+		}
+		if mod := snap.BPL1MOD(); mod != 0 {
+			s.Modulo = int(mod)
+		}
+		mask := uint8((1 << bpu) - 1)
+		s.ControlMask = mask
+		s.VisibleMask = mask
+		bpl := snap.BPLPT()
+		// Use the captured BPL1PT..BPLnPT pointers when opening at the start of the segment
+		// or directly on one of the captured bitplane addresses.
+		matchesBPL := cursorOff == 0
+		for i := 0; i < bpu; i++ {
+			if bpl[i] >= baseAddr && bpl[i]-baseAddr == cursorOff {
+				matchesBPL = true
+				break
+			}
+		}
+		if matchesBPL {
+			for i := 0; i < bpu; i++ {
+				if bpl[i] >= baseAddr {
+					s.BPL[i] = bpl[i] - baseAddr
+				}
+			}
+		}
+	}
 }
 
 // DetectOptimalScale calculates the optimal integer scaling factor (1x..8x)

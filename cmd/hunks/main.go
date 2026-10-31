@@ -9,12 +9,14 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/mikolas/hunks/internal/analyzer"
 	"github.com/mikolas/hunks/internal/callgraph"
 	"github.com/mikolas/hunks/internal/db"
 	"github.com/mikolas/hunks/internal/emitter"
+	"github.com/mikolas/hunks/internal/gdb"
 	"github.com/mikolas/hunks/internal/hunk"
 	"github.com/mikolas/hunks/internal/m68k"
 	"github.com/mikolas/hunks/internal/modules"
@@ -254,42 +256,54 @@ func runTraceAnalysis(proj *project.Project, ctrl *db.Controller, budget uint64)
 	if len(segs) == 0 {
 		return fmt.Errorf("no segments to trace")
 	}
-	base := segs[0].Base
-	var top uint32
-	for _, s := range segs {
-		if s.Base < base {
-			base = s.Base
-		}
-		sz := s.AllocSize
-		if sz == 0 {
-			sz = uint32(len(s.LoadBinaryData()))
-		}
-		if s.Base+sz > top {
-			top = s.Base + sz
-		}
-	}
-	image := make([]byte, top-base)
-	for _, s := range segs {
-		data := s.LoadBinaryData()
-		off := int(s.Base - base)
-		end := min(off+len(data), len(image))
-		if off < end {
-			copy(image[off:end], data[:end-off])
-		}
-	}
-	entry := base
-	if len(proj.Data.EntryPoints) > 0 {
-		entry = proj.Data.EntryPoints[0].Addr
+	if proj.Data.Snapshot != nil {
+		analyzer.SeedFromSnapshot(proj, ctrl)
 	}
 
 	opts := analyzer.DefaultTraceOptions()
 	if budget > 0 {
 		opts.Budget = budget
 	}
+	opts.Snapshot = proj.Data.Snapshot
+	if customSnap, ok := proj.LoadCustomSnapshot(); ok {
+		opts.CustomSnap = customSnap
+	}
+
+	var base, top uint32
+	var image []byte
+	if len(segs) == 1 {
+		base = segs[0].Base
+		image = segs[0].LoadBinaryData()
+		top = base + uint32(len(image))
+	} else {
+		base = segs[0].Base
+		image = segs[0].LoadBinaryData()
+		top = base + uint32(len(image))
+		for _, s := range segs {
+			data := s.LoadBinaryData()
+			opts.Segments = append(opts.Segments, analyzer.TraceSegment{
+				Base: s.Base,
+				Data: data,
+			})
+			if s.Base < base {
+				base = s.Base
+			}
+			if s.Base+uint32(len(data)) > top {
+				top = s.Base + uint32(len(data))
+			}
+		}
+	}
+
+	entry := base
+	if proj.Data.Snapshot != nil && proj.Data.Snapshot.PC != 0 {
+		entry = proj.Data.Snapshot.PC & 0x00FFFFFF
+	} else if len(proj.Data.EntryPoints) > 0 {
+		entry = proj.Data.EntryPoints[0].Addr
+	}
 
 	fmt.Printf("Trace-driven analysis for module '%s':\n", proj.Data.TargetName)
-	fmt.Printf("  image %#08X..%#08X (%d bytes), entry %#08X, budget %d\n",
-		base, top, len(image), entry, opts.Budget)
+	fmt.Printf("  image %#08X..%#08X (%d segment(s)), entry %#08X, budget %d\n",
+		base, top, len(segs), entry, opts.Budget)
 
 	report := analyzer.RunTrace(image, base, entry, opts)
 	fmt.Printf("\n  stop reason     : %s\n", report.Stop)
@@ -353,6 +367,9 @@ func runTraceAnalysis(proj *project.Project, ctrl *db.Controller, budget uint64)
 }
 
 func runProjectAnalysis(proj *project.Project, ctrl *db.Controller, segFilter string) error {
+	if proj.Data.Snapshot != nil {
+		analyzer.SeedFromSnapshot(proj, ctrl)
+	}
 	isReloc := false
 	for i := range proj.Data.Segments {
 		if proj.Data.Segments[i].IsRelocatable() {
@@ -360,13 +377,15 @@ func runProjectAnalysis(proj *project.Project, ctrl *db.Controller, segFilter st
 			break
 		}
 	}
-	if isReloc && segFilter == "" {
+	useUnified := isReloc || (proj.Data.Snapshot != nil && len(proj.Data.Segments) > 1)
+	if useUnified && segFilter == "" {
 		fmt.Printf("Running unified multi-stage analysis for module '%s' across %d segment(s)...\n", proj.Data.TargetName, len(proj.Data.Segments))
 		an, err := analyzer.New(proj, ctrl)
 		if err != nil {
 			return err
 		}
 		an.Analyze(nil)
+		proj.RefreshCoverageStats(ctrl)
 		if err := proj.Save(); err != nil {
 			return err
 		}
@@ -472,12 +491,16 @@ func main() {
 	rootCmd.AddCommand(ripCmd)
 
 	// --- init ---
-	var initBinary, initBase, initOutput, initHunkFile string
+	var initBinary, initBase, initOutput, initHunkFile, initGDB, initProcessBreak string
 	var initForce bool
 	initCmd := &cobra.Command{
 		Use:   "init",
-		Short: "Initialize a module workspace from an AmigaDOS hunk file or raw binary",
-		RunE: func(_ *cobra.Command, _ []string) error {
+		Short: "Initialize a module workspace from an AmigaDOS hunk file, raw binary, or live Amiberry GDB snapshot",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			gdbEnabled := cmd.Flags().Changed("gdb")
+			if gdbEnabled && (initGDB == "" || initGDB == gdb.DefaultAddr) && len(args) == 1 {
+				initGDB = args[0]
+			}
 			workspaceRoot := getWorkspaceRoot()
 			var rawTarget string
 			switch {
@@ -487,8 +510,12 @@ func main() {
 				rawTarget = project.DeduceTargetName(initHunkFile)
 			case initBinary != "":
 				rawTarget = project.DeduceTargetName(initBinary)
+			case gdbEnabled && initProcessBreak != "":
+				rawTarget = project.DeduceTargetName(initProcessBreak)
+			case gdbEnabled:
+				rawTarget = "snapshot"
 			default:
-				return fmt.Errorf("must provide either --hunk-file <path> or both --binary <path> and --base <hex>")
+				return fmt.Errorf("must provide --hunk-file <path>, --binary <path> --base <hex>, or --gdb [host:port]")
 			}
 			targetName := strings.TrimPrefix(rawTarget, "work/")
 			targetName = strings.TrimSuffix(targetName, "/")
@@ -813,14 +840,169 @@ func main() {
 				}
 				fmt.Printf("Initialized module '%s' (work/%s/) for %s at base 0x%X\n", targetName, targetName, initBinary, baseVal)
 				return nil
+			} else if gdbEnabled {
+				gdbAddr := gdb.NormalizeAddr(initGDB)
+				fmt.Printf("Connecting to Amiberry GDB server at %s...\n", gdbAddr)
+				client, err := gdb.Dial(gdbAddr, 10*time.Second)
+				if err != nil {
+					return err
+				}
+				defer func() { _ = client.Detach() }()
+
+				if initProcessBreak != "" {
+					fmt.Printf("Waiting for AmigaDOS process %q to start...\n", initProcessBreak)
+					if err := client.WaitProcessBreak(initProcessBreak, 60*time.Second); err != nil {
+						return err
+					}
+				}
+
+				regs, err := client.ReadRegisters()
+				if err != nil {
+					return err
+				}
+				regions, err := client.MemoryMap()
+				if err != nil {
+					return err
+				}
+				customSnap, err := client.ReadCustomSnapshot()
+				if err != nil {
+					return err
+				}
+
+				customFilename := "custom.bin"
+				if err := os.WriteFile(customFilename, customSnap[:], 0o644); err != nil {
+					return err
+				}
+
+				sharedDBName := "project.db"
+				_ = os.Remove(sharedDBName)
+				ctrl, err := db.New(sharedDBName)
+				if err != nil {
+					return err
+				}
+				defer ctrl.Close()
+
+				var chipIdx, slowIdx, fastIdx int
+				var spaceSegs []string
+				var segIdx int
+				for _, r := range regions {
+					if !strings.EqualFold(r.Type, "ram") || r.Size == 0 {
+						continue
+					}
+					var segName string
+					switch {
+					case r.Chip || r.Address == 0:
+						chipIdx++
+						if chipIdx == 1 {
+							segName = "chip"
+						} else {
+							segName = fmt.Sprintf("chip%d", chipIdx)
+						}
+					case r.Address >= 0x00C00000 && r.Address < 0x00D80000:
+						slowIdx++
+						if slowIdx == 1 {
+							segName = "slow"
+						} else {
+							segName = fmt.Sprintf("slow%d", slowIdx)
+						}
+					default:
+						fastIdx++
+						if fastIdx == 1 {
+							segName = "fast"
+						} else {
+							segName = fmt.Sprintf("fast%d", fastIdx)
+						}
+					}
+
+					fmt.Printf("  Dumping %s (%s): 0x%06X..0x%06X (%d KB)...\n",
+						segName, r.Name, r.Address, r.Address+r.Size, r.Size/1024)
+					rawRAM, err := client.ReadMemory(r.Address, r.Size)
+					if err != nil {
+						return err
+					}
+					binFilename := fmt.Sprintf("%s.bin", segName)
+					if err := os.WriteFile(binFilename, rawRAM, 0o644); err != nil {
+						return err
+					}
+					fileDataLen := r.Size
+					memType := hunk.MemoryFast
+					if r.Chip || r.Address == 0 {
+						memType = hunk.MemoryChip
+					}
+					proj.Data.Segments = append(proj.Data.Segments, project.Segment{
+						Name:        segName,
+						HunkIndex:   segIdx,
+						HunkType:    hunk.HunkTypeCode,
+						MemoryType:  memType,
+						AllocSize:   r.Size,
+						FileDataLen: &fileDataLen,
+						File:        &binFilename,
+						Base:        r.Address,
+						DB:          sharedDBName,
+						Relocatable: false,
+					})
+					spaceSegs = append(spaceSegs, segName)
+					segIdx++
+				}
+				if len(proj.Data.Segments) == 0 {
+					return fmt.Errorf("no RAM regions returned by Amiberry memory-map")
+				}
+
+				proj.Data.Spaces = append(proj.Data.Spaces, project.Space{
+					Name:     "default",
+					Segments: spaceSegs,
+				})
+				proj.Data.ActiveSpace = "default"
+				proj.Data.Snapshot = &project.SnapshotState{
+					PC:         regs.PC & 0x00FFFFFF,
+					SR:         regs.SR,
+					D:          regs.D,
+					A:          regs.A,
+					CustomFile: customFilename,
+					CustomInfo: customSnap.SummaryMap(),
+				}
+				if pcSeg := proj.SegmentAtAddr(regs.PC & 0x00FFFFFF); pcSeg != nil {
+					proj.ActiveSegmentName = pcSeg.Name
+				}
+
+				proj.SyncDBScope(ctrl)
+				ctrl.Begin()
+				seedSummary := analyzer.SeedFromSnapshot(proj, ctrl)
+				ctrl.Commit()
+
+				if err := proj.Save(); err != nil {
+					return err
+				}
+
+				fmt.Printf("Initialized GDB snapshot module '%s' (work/%s/):\n", targetName, targetName)
+				fmt.Printf("  RAM segments : %d (%s)\n", len(spaceSegs), strings.Join(spaceSegs, ", "))
+				fmt.Printf("  CPU state    : PC=0x%06X  SR=0x%04X  SP(A7)=0x%06X\n", regs.PC&0x00FFFFFF, regs.SR, regs.A[7]&0x00FFFFFF)
+				fmt.Printf("  Custom chips : DMACON=0x%04X  INTENA=0x%04X  COP1LC=0x%06X  BPLCON0=0x%04X\n",
+					customSnap.DMACON(), customSnap.INTENA(), customSnap.COP1LC(), customSnap.BPLCON0())
+				if len(seedSummary.VectorSeeds) > 0 {
+					fmt.Printf("  IRQ/Trap vecs: %s\n", strings.Join(seedSummary.VectorSeeds, ", "))
+				}
+				if len(seedSummary.StackSeeds) > 0 {
+					fmt.Printf("  Stack seeds  : %d return address(es) discovered\n", len(seedSummary.StackSeeds))
+				}
+				if len(seedSummary.BaseRegHints) > 0 {
+					fmt.Printf("  Base regs    : %s\n", strings.Join(seedSummary.BaseRegHints, ", "))
+				}
+				if len(seedSummary.CustomLabels) > 0 {
+					fmt.Printf("  DMA pointers : %s\n", strings.Join(seedSummary.CustomLabels, ", "))
+				}
+				return nil
 			}
-			return fmt.Errorf("must provide either --hunk-file <path> or both --binary <path> and --base <hex>")
+			return fmt.Errorf("must provide --hunk-file <path>, --binary <path> --base <hex>, or --gdb [host:port]")
 		},
 	}
 	initCmd.Flags().StringVar(&initBinary, "binary", "", "Path to flat binary file")
 	initCmd.Flags().StringVar(&initBase, "base", "", "Base address in hex (for --binary)")
 	initCmd.Flags().StringVar(&initOutput, "output", "", "Output assembly file path")
 	initCmd.Flags().StringVar(&initHunkFile, "hunk-file", "", "Path to AmigaOS multi-hunk executable")
+	initCmd.Flags().StringVar(&initGDB, "gdb", "", "Snapshot a live Amiberry GDB server (default 127.0.0.1:2345)")
+	initCmd.Flags().Lookup("gdb").NoOptDefVal = gdb.DefaultAddr
+	initCmd.Flags().StringVar(&initProcessBreak, "process-break", "", "Arm a one-shot AmigaDOS process entry break before snapshotting (--gdb)")
 	initCmd.Flags().BoolVar(&initForce, "force", false, "Overwrite existing target workspace if already initialized")
 	rootCmd.AddCommand(initCmd)
 

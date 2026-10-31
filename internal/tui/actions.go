@@ -564,6 +564,11 @@ func (a *App) OpenBitplaneViewer() {
 	}
 	if st == nil {
 		st = NewBitplaneState(baseOff)
+		if a.Proj != nil {
+			if snap, ok := a.Proj.LoadCustomSnapshot(); ok {
+				st.ApplyCustomSnapshot(snap, a.BaseAddr, baseOff)
+			}
+		}
 	}
 	proto := DetectProtocol()
 

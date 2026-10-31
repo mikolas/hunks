@@ -10,9 +10,14 @@ import (
 	"github.com/mikolas/hunks/internal/amiga"
 	"github.com/mikolas/hunks/internal/db"
 	"github.com/mikolas/hunks/internal/m68k"
+	"github.com/mikolas/hunks/internal/project"
 )
 
-const traceRAMLen uint32 = 0x00800000
+const (
+	traceRAMLen     uint32 = 0x00800000
+	traceRangerBase uint32 = 0x00C00000
+	traceRangerLen  uint32 = 0x00180000
+)
 
 // traceDevice implements m68kemu.Device over an 8 MiB flat RAM window plus a minimal
 // Amiga 24-bit MMIO bus (Custom chips at $DFF000, CIAs at $BF0000, Ranger RAM at
@@ -21,20 +26,37 @@ const traceRAMLen uint32 = 0x00800000
 // address in `fault` so the trace loop can stop cleanly with `StopFault`.
 type traceDevice struct {
 	mem     []byte
+	ranger  []byte
 	fault   *uint32
 	chipset *Chipset
 }
 
 func newTraceDevice(image []byte, base uint32) *traceDevice {
-	mem := make([]byte, traceRAMLen)
-	b := int(base)
-	if b < len(mem) {
-		end := min(b+len(image), len(mem))
-		copy(mem[b:end], image[:end-b])
-	}
-	return &traceDevice{
-		mem:     mem,
+	d := &traceDevice{
+		mem:     make([]byte, traceRAMLen),
 		chipset: NewChipset(),
+	}
+	d.loadSegment(base, image)
+	return d
+}
+
+func (d *traceDevice) loadSegment(base uint32, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	b := base & 0x00FFFFFF
+	if b >= traceRangerBase && b < traceRangerBase+traceRangerLen {
+		if d.ranger == nil {
+			d.ranger = make([]byte, traceRangerLen)
+		}
+		off := int(b - traceRangerBase)
+		end := min(off+len(data), len(d.ranger))
+		copy(d.ranger[off:end], data[:end-off])
+		return
+	}
+	if int(b) < len(d.mem) {
+		end := min(int(b)+len(data), len(d.mem))
+		copy(d.mem[b:end], data[:end-int(b)])
 	}
 }
 
@@ -70,6 +92,9 @@ func (d *traceDevice) readByte(a uint32) uint8 {
 	if a >= 0x00BF0000 && a <= 0x00BFFFFF {
 		return d.chipset.ReadCIAByte(a)
 	}
+	if d.ranger != nil && a >= traceRangerBase && a < traceRangerBase+traceRangerLen {
+		return d.ranger[a-traceRangerBase]
+	}
 	if isTraceMMIO(a) {
 		return 0
 	}
@@ -86,6 +111,10 @@ func (d *traceDevice) readWord(a uint32) uint16 {
 	}
 	if a >= 0x00BF0000 && a <= 0x00BFFFFF {
 		return (uint16(d.readByte(a)) << 8) | uint16(d.readByte(a+1))
+	}
+	if d.ranger != nil && a >= traceRangerBase && a+2 <= traceRangerBase+traceRangerLen {
+		off := a - traceRangerBase
+		return binary.BigEndian.Uint16(d.ranger[off : off+2])
 	}
 	if isTraceMMIO(a) {
 		return 0
@@ -104,6 +133,10 @@ func (d *traceDevice) writeByte(a uint32, v uint8) {
 	a &= 0x00FFFFFF
 	if a >= 0x00BF0000 && a <= 0x00BFFFFF {
 		d.chipset.WriteCIAByte(a, v)
+		return
+	}
+	if d.ranger != nil && a >= traceRangerBase && a < traceRangerBase+traceRangerLen {
+		d.ranger[a-traceRangerBase] = v
 		return
 	}
 	if isTraceMMIO(a) {
@@ -265,10 +298,19 @@ type TraceReport struct {
 	Vectors      []VectorEntry
 }
 
+// TraceSegment represents an additional RAM segment loaded into the trace bus.
+type TraceSegment struct {
+	Base uint32
+	Data []byte
+}
+
 // TraceOptions configures a trace run.
 type TraceOptions struct {
-	Budget uint64
-	StuckN uint64
+	Budget     uint64
+	StuckN     uint64
+	Snapshot   *project.SnapshotState
+	CustomSnap *amiga.CustomSnapshot
+	Segments   []TraceSegment
 }
 
 // DefaultTraceOptions returns the default trace options.
@@ -337,21 +379,47 @@ func RunTrace(image []byte, base, entry uint32, opts TraceOptions) TraceReport {
 	}
 
 	dev := newTraceDevice(image, base)
+	for _, seg := range opts.Segments {
+		dev.loadSegment(seg.Base, seg.Data)
+	}
+	if opts.CustomSnap != nil {
+		dev.chipset.LoadCustomSnapshot(opts.CustomSnap)
+	}
+
 	stackTop := uint32(0x00700000)
 	if base >= 0x2000 {
 		stackTop = (base - 0x1000) &^ 1
 	}
-	dev.writeLong(0, stackTop)
-	dev.writeLong(4, entry)
 
 	bus := m68kemu.NewBus(dev)
 	cpu, _ := m68kemu.NewCPU(bus)
 	initRegs := cpu.Registers()
-	initRegs.A[7] = stackTop
-	initRegs.SSP = stackTop
-	initRegs.USP = stackTop
-	initRegs.PC = entry
-	initRegs.SR = 0x2000
+	if opts.Snapshot != nil {
+		initRegs.D = opts.Snapshot.D
+		initRegs.A = opts.Snapshot.A
+		if initRegs.A[7] == 0 {
+			initRegs.A[7] = stackTop
+		}
+		initRegs.SSP = initRegs.A[7]
+		initRegs.USP = initRegs.A[7]
+		if opts.Snapshot.PC != 0 {
+			entry = opts.Snapshot.PC & 0x00FFFFFF
+		}
+		initRegs.PC = entry
+		if opts.Snapshot.SR != 0 {
+			initRegs.SR = opts.Snapshot.SR
+		} else {
+			initRegs.SR = 0x2000
+		}
+	} else {
+		dev.writeLong(0, stackTop)
+		dev.writeLong(4, entry)
+		initRegs.A[7] = stackTop
+		initRegs.SSP = stackTop
+		initRegs.USP = stackTop
+		initRegs.PC = entry
+		initRegs.SR = 0x2000
+	}
 	cpu.SetRegisters(initRegs)
 	cpu.SetPC(entry)
 
@@ -364,6 +432,17 @@ func RunTrace(image []byte, base, entry uint32, opts TraceOptions) TraceReport {
 	})
 
 	imgEnd := uint64(base) + uint64(len(image))
+	isAddrInLoadedSegments := func(addr uint32) bool {
+		if uint64(addr) >= uint64(base) && uint64(addr) < imgEnd {
+			return true
+		}
+		for _, seg := range opts.Segments {
+			if uint64(addr) >= uint64(seg.Base) && uint64(addr) < uint64(seg.Base)+uint64(len(seg.Data)) {
+				return true
+			}
+		}
+		return false
+	}
 	var steps uint64
 	var servicedInts [6]uint64
 	var servicedExcs uint64
@@ -395,13 +474,14 @@ func RunTrace(image []byte, base, entry uint32, opts TraceOptions) TraceReport {
 		}
 		curRegs := cpu.Registers()
 		pc := curRegs.PC & 0x00FFFFFF
-		inImage := uint64(pc) >= uint64(base) && uint64(pc) < imgEnd
+		inImage := isAddrInLoadedSegments(pc)
 		if !inImage {
 			if outsideSteps == 0 {
 				trampFirstOutPC = pc
 			}
 			outsideSteps++
-			if outsideSteps > 8 || pc%2 != 0 || uint64(pc) >= uint64(traceRAMLen) || dev.readWord(pc) == 0 {
+			validRAM := uint64(pc) < uint64(traceRAMLen) || (dev.ranger != nil && pc >= traceRangerBase && pc < traceRangerBase+traceRangerLen)
+			if outsideSteps > 8 || pc%2 != 0 || !validRAM || dev.readWord(pc) == 0 {
 				stop = StopReason{Kind: StopLeftImage, To: trampFirstOutPC, AtPC: trampFirstOutPC, Step: steps}
 				break
 			}
@@ -486,7 +566,7 @@ func RunTrace(image []byte, base, entry uint32, opts TraceOptions) TraceReport {
 			}
 		}
 
-		newInImage := uint64(newPC) >= uint64(base) && uint64(newPC) < imgEnd
+		newInImage := isAddrInLoadedSegments(newPC)
 		if inImage {
 			if newInImage {
 				hasTrampOrigin = false

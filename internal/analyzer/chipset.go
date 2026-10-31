@@ -1,6 +1,10 @@
 package analyzer
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	"github.com/mikolas/hunks/internal/amiga"
+)
 
 // --- Paula INTENA / INTREQ bit definitions ----------------------------------
 const (
@@ -697,6 +701,26 @@ func NewChipset() *Chipset {
 		CIAA:    newCIA(),
 		CIAB:    newCIA(),
 		Blitter: newBlitter(),
+	}
+}
+
+// LoadCustomSnapshot hydrates the chipset state machine from a captured 512-byte
+// ($DFF000..$DFF1FF) Amiberry custom register snapshot.
+func (cs *Chipset) LoadCustomSnapshot(snap *amiga.CustomSnapshot) {
+	if cs == nil || snap == nil {
+		return
+	}
+	cs.Agnus.DMACON = snap.DMACON()
+	cs.Paula.INTENA = snap.INTENA()
+	cs.Paula.INTREQ = snap.INTREQ()
+	cs.Paula.ADKCON = snap.ADKCON()
+	if cop1 := snap.COP1LC(); cop1 != 0 {
+		cs.Agnus.COP1LC = cop1
+		cs.Agnus.COP1LCWritten = true
+	}
+	if cop2 := snap.COP2LC(); cop2 != 0 {
+		cs.Agnus.COP2LC = cop2
+		cs.Agnus.COP2LCWritten = true
 	}
 }
 
